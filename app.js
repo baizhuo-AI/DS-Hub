@@ -7,14 +7,105 @@
     app.innerHTML = '<div style="max-width:760px;margin:80px auto;padding:24px;border:1px solid #fecaca;border-radius:14px;background:#fff;color:#991b1b">真实配置快照未加载。请先运行 <code>node scripts/sync-dsh-snapshot.mjs</code>。</div>';
     return;
   }
+  const SNAPSHOT_IDENTITY = [SNAPSHOT.schemaVersion, SNAPSHOT.capturedAt, SNAPSHOT.source?.packageVersion, SNAPSHOT.source?.hostVersion].join('|');
+  const PENDING_REFRESH_META = Object.freeze({
+    reasoningEffort: { target: '默认模型的推理强度', targetId: 'settings:agent-default-model#/reasoningEffort' },
+    busyEnter: { target: '忙时新消息', targetId: 'settings:ui-conversation#/busyEnter' },
+    defaultPresetId: { target: '新会话默认角色卡', targetId: 'settings:agent-presets#/default' },
+    webSearchMaxUses: { target: '网页搜索上限', targetId: 'settings:web-search-deepseek#/maxUses' },
+    permissionDefault: { target: '新会话默认权限', targetId: 'settings:permission#/defaultPreset' },
+    pluginInstall: { target: '社区插件安装', targetIdPrefix: 'plugins:web:' },
+  });
+  const PENDING_REFRESH_KEYS = new Set(Object.keys(PENDING_REFRESH_META));
+
+  function canonicalMarkerTarget(key, packageName = '') {
+    const meta = PENDING_REFRESH_META[key];
+    if (!meta) return null;
+    if (key !== 'pluginInstall') return { target: meta.target, targetId: meta.targetId };
+    const safePackage = String(packageName || '').trim().slice(0, 200);
+    if (!/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i.test(safePackage)) return null;
+    return { target: `${meta.target} · ${safePackage}`, targetId: `${meta.targetIdPrefix}${safePackage}`, packageName: safePackage };
+  }
+
+  function normalizeStoredRefreshMarker(item) {
+    if (!item || typeof item !== 'object') return null;
+    const key = String(item.key || '');
+    const packageName = String(item.packageName || '').trim().slice(0, 200);
+    const canonical = canonicalMarkerTarget(key, packageName);
+    const targetId = String(item.targetId || '').trim().slice(0, 300);
+    if (!canonical || targetId !== canonical.targetId || (key !== 'pluginInstall' && packageName)) return null;
+    if (item.markerType === 'unknown-write') {
+      const attemptedAt = String(item.attemptedAt || '').trim();
+      if (item.trust !== 'untrusted_browser_hint' || !Number.isFinite(Date.parse(attemptedAt))) return null;
+      return { markerType: 'unknown-write', key, ...canonical, attemptedAt, trust: 'untrusted_browser_hint', restored: true };
+    }
+    const readbackTargetRevision = String(item.readbackTargetRevision ?? '').trim().slice(0, 128);
+    const readbackAt = String(item.readbackAt || '').trim();
+    if (!readbackTargetRevision || !Number.isFinite(Date.parse(readbackAt))) return null;
+    return { markerType: 'pending-refresh', key, ...canonical, readbackTargetRevision, readbackAt, restored: true };
+  }
+
+  function persistedRefreshMarker(item) {
+    const canonical = canonicalMarkerTarget(item?.key, item?.packageName);
+    if (!canonical || item?.targetId !== canonical.targetId) return null;
+    if (item.markerType === 'unknown-write') {
+      const attemptedAt = String(item.attemptedAt || '').trim();
+      if (!Number.isFinite(Date.parse(attemptedAt))) return null;
+      return { markerType: 'unknown-write', key: item.key, ...canonical, attemptedAt, trust: 'untrusted_browser_hint' };
+    }
+    const readbackTargetRevision = String(item?.readbackTargetRevision ?? '').trim().slice(0, 128);
+    const readbackAt = String(item?.readbackAt || '').trim();
+    if (!readbackTargetRevision || !Number.isFinite(Date.parse(readbackAt))) return null;
+    return { markerType: 'pending-refresh', key: item.key, ...canonical, readbackTargetRevision, readbackAt };
+  }
+
+  function markerBlocksSnapshot(item) {
+    return Boolean(item && (item.markerType === 'unknown-write' || item.restored === true));
+  }
+
+  function historicalPlanSummary(item) {
+    if (!item || typeof item !== 'object') return null;
+    const key = String(item.key || '');
+    const meta = PENDING_REFRESH_META[key];
+    if (!meta) return null;
+    const title = String(item.title || '历史方案').replace(/\s+/g, ' ').trim().slice(0, 80) || '历史方案';
+    const id = String(item.id || `history-${key}`).replace(/[^a-zA-Z0-9._:-]/g, '').slice(0, 120) || `history-${key}`;
+    return { id, key, title, target: meta.target, status: 'historical', valuesWithheld: true };
+  }
+
+  const snapshotWebSearchMaxUses = Number(SNAPSHOT.config.webSearch.maxUses);
+  const SNAPSHOT_WEB_SEARCH_MAX_USES = Number.isInteger(snapshotWebSearchMaxUses) && snapshotWebSearchMaxUses > 0
+    ? snapshotWebSearchMaxUses
+    : 5;
 
   function readAgentName() {
     try { return window.localStorage?.getItem('ds-hub-agent-name') || 'Deepseek Agent'; }
     catch (_) { return 'Deepseek Agent'; }
   }
 
+  function readOptimizationState() {
+    try {
+      const raw = window.localStorage?.getItem('ds-hub-optimization-state-v1');
+      if (!raw || raw.length > 1_000_000) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.schemaVersion !== 1) return {};
+      const historicalPlans = Array.isArray(parsed.assistantPlans)
+        ? parsed.assistantPlans.slice(-20).map(historicalPlanSummary).filter(Boolean)
+        : [];
+      const pendingRefreshRecords = parsed.snapshotIdentity === SNAPSHOT_IDENTITY && Array.isArray(parsed.pendingRefreshRecords)
+        ? parsed.pendingRefreshRecords.map(normalizeStoredRefreshMarker).filter(Boolean).slice(-20)
+        : [];
+      // Browser storage is a convenience history, never evidence. Verified comparison,
+      // adoption, observation, overrides and installed-plugin state are not restored.
+      // A value-free marker only prevents an older snapshot being presented as current.
+      return { assistantPlans: historicalPlans, pendingRefreshRecords };
+    } catch (_) { return {}; }
+  }
+
+  const storedOptimization = readOptimizationState();
+
   const state = {
-    view: 'workshop',
+    view: 'quick',
     module: null,
     capability: null,
     componentDetail: null,
@@ -32,18 +123,46 @@
     assistantConversationId: `ds-hub-${Date.now().toString(36)}`,
     assistantMessages: [],
     assistantProposal: null,
-    assistantPlans: [],
+    assistantPlans: Array.isArray(storedOptimization.assistantPlans) ? storedOptimization.assistantPlans.slice(-20) : [],
+    assistantTask: null,
     assistantConfirming: false,
     assistantApplying: false,
     assistantThinking: false,
+    regressionConfirming: false,
+    regressionRunning: false,
+    adoptionConfirming: false,
     assistantAIStatus: 'idle',
+    assistantEnvironment: {
+      status: 'snapshot',
+      selection: {
+        provider: SNAPSHOT.config.model.provider,
+        model: SNAPSHOT.config.model.model,
+        reasoningEffort: SNAPSHOT.config.model.reasoningEffort,
+      },
+    },
     appliedOverrides: {},
+    quickDrafts: {
+      reasoningEffort: SNAPSHOT.config.model.reasoningEffort ?? 'medium',
+      busyEnter: SNAPSHOT.config.conversation.busyEnter ?? 'queue',
+      defaultPresetId: SNAPSHOT.config.defaultPresetId ?? SNAPSHOT.config.activePreset.id,
+      webSearchMaxUses: SNAPSHOT_WEB_SEARCH_MAX_USES,
+    },
+    verifiedInstalls: {},
+    pendingRefreshRecords: Array.isArray(storedOptimization.pendingRefreshRecords) ? storedOptimization.pendingRefreshRecords : [],
+    restoredPendingRefresh: Boolean(storedOptimization.pendingRefreshRecords?.some(markerBlocksSnapshot)),
+    snapshotRefreshTargets: Array.isArray(storedOptimization.pendingRefreshRecords) ? storedOptimization.pendingRefreshRecords.map((item) => item.target) : [],
+    lastReadbackAt: null,
     agentName: readAgentName(),
     agentNameEditing: false,
   };
   let lastAvatarTapAt = 0;
   let lastAvatarTouchToggleAt = 0;
   let proposalCounter = 0;
+  let assistantTaskCounter = 0;
+  let candidateCounter = 0;
+  let testSuiteCounter = 0;
+  let assistantRequestCounter = 0;
+  let observationRequestCounter = 0;
   let assistantRequestControl = null;
   let dialogReturnSelector = null;
   let lastAssistantMobileSheet = null;
@@ -66,13 +185,39 @@
   const PROPOSAL_POLICIES = {
     permissionDefault: {
       target: '网页配置 → 新会话默认权限',
+      targetId: 'settings:permission#/defaultPreset',
       allowedValues: ['workspace-write'],
+      configArea: 'action', targetModule: 'action', targetCapability: 'permission',
       checks: ['确认目标是新会话默认权限', '既有会话保持不变', '写入后重新读取默认权限', '新建隔离会话验证实际边界'],
     },
     reasoningEffort: {
       target: '网页配置 → 默认模型 → 推理强度',
+      targetId: 'settings:agent-default-model#/reasoningEffort',
       allowedValues: ['low', 'medium', 'high', 'xhigh', 'max'],
+      configArea: 'model', targetModule: 'mind', targetCapability: 'model',
       checks: ['固定同一测试任务与模型版本', '记录质量、耗时和模型用量', '写入后重新读取推理强度', '只让新任务切换'],
+    },
+    busyEnter: {
+      target: '网页配置 → 会话与上下文 → 忙时新消息',
+      targetId: 'settings:ui-conversation#/busyEnter',
+      allowedValues: ['queue', 'steer'],
+      configArea: 'context', targetModule: 'memory', targetCapability: 'conversation',
+      checks: ['固定同一段进行中的会话', '分别验证排队和引导当前任务', '确认消息没有丢失或重复', '写入后重新读取 busyEnter'],
+    },
+    defaultPresetId: {
+      target: '网页配置 → 新会话默认角色卡',
+      targetId: 'settings:agent-presets#/default',
+      allowedValues: SNAPSHOT.config.presets.map((item) => item.id),
+      configArea: 'prompt', targetModule: 'mind', targetCapability: 'identity',
+      checks: ['确认目标是新会话默认角色卡', '当前运行会话保持不变', '核对身份、项目说明与工具入口', '新建隔离会话回读实际角色卡'],
+    },
+    webSearchMaxUses: {
+      target: '网页配置 → 网页搜索 → 每任务最大次数',
+      targetId: 'settings:web-search-deepseek#/maxUses',
+      allowedValues: [...new Set([1, 3, 5, 10, SNAPSHOT_WEB_SEARCH_MAX_USES])],
+      valueType: 'positive-integer',
+      configArea: 'tools', targetModule: 'tools', targetCapability: 'web',
+      checks: ['固定同一组需要检索的任务', '记录搜索次数、结果完整性和用量', '超过上限时应明确停止或补问', '写入后重新读取 maxUses'],
     },
   };
 
@@ -161,13 +306,13 @@
       id: 'context', moduleKey: 'memory', capabilityId: 'context',
       name: '上下文透视', packageName: 'dsh-context',
       desc: '查看上下文组成、增长、压缩、剪枝和注入变化。',
-      downloads: 31212, license: 'Apache-2.0', version: '0.34.1',
+      downloads: 31212, license: 'Apache-2.0', version: '0.35.0',
       repo: 'https://github.com/bowenliang123/dsh-context',
       risk: '会展示上下文和提示词内容；共享截图或日志前需要做隐私检查。',
     },
     {
       id: 'agent-teams', moduleKey: 'action', capabilityId: 'delegate',
-      name: 'Agent Teams', packageName: '@nanmicoder/dsh-agent-teams',
+      name: '多 Agent 团队协作', packageName: '@nanmicoder/dsh-agent-teams',
       desc: '组织多 Agent 团队、依赖任务、消息协作与活动面板。',
       downloads: 21288, license: 'MIT', version: '0.1.14',
       repo: 'https://github.com/NanmiCoder/dsh-agent-teams',
@@ -247,20 +392,119 @@
     [/typert/, '类型与远程接口'],
   ];
 
+  // Loader entries are mounting records, not user-facing plugin identities.
+  // Prefer a stable package/family name, then keep every raw entry in details.
+  const GENERIC_PLUGIN_NAMES = new Set([
+    'Web 界面组件', '浏览器端组件', '设置管理', 'Cordis 运行组件', '后台任务', '本地存储',
+    '模型注册中心', '类型与远程接口', 'API 服务入口', '会话标题', '附件处理', '权限方案',
+    '子 Agent 委派', '大内容暂存', '消息反馈', '工作区管理', '插件清单',
+  ]);
+
+  const PLUGIN_PACKAGE_NAMES = {
+    '@deepseek-ai/dsh-agent': 'Agent 核心服务',
+    '@deepseek-ai/dsh-agent-presets': 'Agent 角色卡管理',
+    '@deepseek-ai/dsh-api-remotes': '远程 API 连接',
+    '@deepseek-ai/dsh-code-runtime-worker-thread': 'Code Mode 工作线程',
+    '@deepseek-ai/dsh-command-compact': '压缩命令',
+    '@deepseek-ai/dsh-command-feedback': '反馈命令',
+    '@deepseek-ai/dsh-command-goal': '目标命令',
+    '@deepseek-ai/dsh-commands': '命令系统',
+    '@deepseek-ai/dsh-fs-observation-policy': '文件观察策略',
+    '@deepseek-ai/dsh-fs-sandbox': '文件系统沙箱',
+    '@deepseek-ai/dsh-goal': '目标管理',
+    '@deepseek-ai/dsh-goal-round-driver': '目标轮次驱动',
+    '@deepseek-ai/dsh-host-directory-picker-auto': '自动目录选择器',
+    '@deepseek-ai/dsh-host-directory-picker-native': '原生目录选择器',
+    '@deepseek-ai/dsh-host-webserver': 'Web 服务宿主',
+    '@deepseek-ai/dsh-repeat-tool-reminder': '重复工具调用提醒',
+    '@deepseek-ai/dsh-sandbox-local': '本地沙箱',
+    '@deepseek-ai/dsh-session': '会话核心服务',
+    '@deepseek-ai/dsh-session-log-export': '会话日志导出',
+    '@deepseek-ai/dsh-session-projection': '会话投影',
+    '@deepseek-ai/dsh-shell-env': 'Shell 环境',
+    '@deepseek-ai/dsh-skill': 'Skill 核心服务',
+    '@deepseek-ai/dsh-skill-badge': 'Skill 状态标识',
+    '@deepseek-ai/dsh-subagent': '子 Agent 协作核心',
+    '@deepseek-ai/dsh-subagent-spawn-in-process': '进程内创建运行器',
+    '@deepseek-ai/dsh-subagent-fork-in-process': '进程内派生运行器',
+    '@deepseek-ai/dsh-tool-subagent-control': '子 Agent 管理工具',
+    '@deepseek-ai/dsh-tool-subagent': '子任务委派工具',
+    '@deepseek-ai/dsh-tool-subagent-report': '子任务结果回传',
+    '@deepseek-ai/dsh-client-ui-subagent': '子 Agent 操作界面',
+    '@deepseek-ai/dsh-tool-call-timeout-policy': '工具调用超时策略',
+    '@deepseek-ai/dsh-tool-str-replace-editor': '文本替换编辑工具',
+    '@deepseek-ai/dsh-tools': '工具注册中心',
+    '@deepseek-ai/dsh-user-questions': '用户补问服务',
+    '@deepseek-ai/dsh-web': 'Web 核心服务',
+    '@deepseek-ai/dsh-web-app': 'Web 应用运行时',
+  };
+
+  const PLUGIN_TOKEN_NAMES = {
+    agent: 'Agent', ai: 'AI', api: 'API', apiproxy: 'API 代理', app: '应用', approval: '确认', ask: '补问',
+    attachment: '附件', auto: '自动', badge: '标识', bash: 'Bash', basic: '基础', brand: '品牌', cache: '缓存',
+    call: '调用', checkpoint: '检查点', client: '客户端', code: '代码', command: '命令', commands: '命令系统',
+    compact: '压缩', compaction: '上下文压缩', connection: '连接', control: '控制', conversation: '会话界面',
+    cordis: 'Cordis', credentials: '凭据', deepseek: 'DeepSeek', default: '默认', deliverables: '交付物', demo: '演示',
+    dimension: '维度', directory: '目录', domain: '领域', driver: '驱动', editor: '编辑器', env: '环境', export: '导出',
+    feedback: '反馈', file: '文件', filesystem: '文件系统', first: '首轮', fork: '派生', fs: '文件系统', gateway: '网关',
+    general: '通用', goal: '目标', hmr: '热更新', host: '主机', in: '进程内', include: '加载入口', input: '输入',
+    instructions: '项目说明', inventory: '清单', jobs: '后台任务', json: 'JSON', jsonl: 'JSONL', layout: '布局', llm: '模型',
+    loader: '加载器', local: '本地', locale: '语言', log: '日志', loop: '循环', message: '消息', meter: '计量', mode: '模式',
+    model: '模型', models: '模型列表', modules: '模块', native: '原生', observation: '观察', official: '官方', otel: '可观测采集',
+    permission: '权限', persistence: '持久化', persona: '身份', pi: 'Pi AI', picker: '选择器', plan: '计划', plugin: '插件',
+    plugins: '插件列表', policy: '策略', preset: '角色卡', presets: '角色卡', process: '进程', projection: '投影', prompt: '提示词',
+    pruner: '裁剪器', pwsh: 'PowerShell', query: '查询', questions: '补问', ralph: '迭代执行', reference: '引用', registry: '注册中心',
+    reminder: '提醒', remotes: '远程连接', renderer: '渲染器', repeat: '重复', replace: '替换', report: '结果回传', result: '结果',
+    retry: '重试', round: '轮次', run: '运行', runner: '运行器', runtime: '运行时', sandbox: '沙箱', search: '搜索',
+    selection: '选择', session: '会话', settings: '设置', shell: 'Shell', sidebar: '侧栏', skill: 'Skill', spawn: '创建', spill: '大内容暂存',
+    sqlite: 'SQLite', stats: '统计', storage: '存储', str: '文本', subagent: '子 Agent', subprocess: '子进程', system: '系统',
+    telemetry: '遥测', theme: '主题', thread: '线程', timeout: '超时', timer: '定时器', title: '标题', todo: '待办', token: 'Token',
+    tool: '工具', tools: '工具', trajectory: '运行轨迹', trigger: '触发器', typert: '类型系统', ui: '界面', user: '用户', web: 'Web',
+    webserver: 'Web 服务', worker: '工作', workflow: '工作流', workspace: '工作区',
+  };
+
   function esc(value) {
     return String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+  }
+
+  function stableContentHash(value) {
+    const text = JSON.stringify(value);
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}`;
   }
 
   function shortTech(moduleName) {
     return moduleName.replace(/^@deepseek-ai\//, '');
   }
 
+  function pluginPackageName(moduleName) {
+    const parts = String(moduleName || '').split('/');
+    return String(moduleName || '').startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
+  }
+
+  function pluginFamilyId(packageName) {
+    return packageName;
+  }
+
+  function translatePluginPackage(packageName) {
+    const exact = PLUGIN_PACKAGE_NAMES[packageName];
+    if (exact) return exact;
+    const slug = shortTech(packageName).replace(/^dsh-/, '').replace(/^cordis:/, 'cordis-');
+    const translated = slug.split(/[-_:]+/).filter(Boolean).map((token) => PLUGIN_TOKEN_NAMES[token] || '扩展').join('');
+    return translated || '未命名 DSH 组件';
+  }
+
   function humanPluginName(row) {
+    const packageName = row.packageName || pluginPackageName(row.moduleName);
+    if (PLUGIN_PACKAGE_NAMES[packageName]) return PLUGIN_PACKAGE_NAMES[packageName];
     const text = `${row.moduleName} ${row.entryId}`.toLowerCase();
     const found = PLUGIN_NAMES.find(([pattern]) => pattern.test(text));
-    if (found) return found[1];
-    const slug = shortTech(row.moduleName).replace(/^dsh-/, '').replace(/[-_/]+/g, ' ');
-    return slug ? `运行组件 · ${slug}` : 'DSH 运行组件';
+    if (found && !GENERIC_PLUGIN_NAMES.has(found[1])) return found[1];
+    return translatePluginPackage(packageName);
   }
 
   function componentScope(row) {
@@ -271,6 +515,46 @@
     if (row.entryId.startsWith('include:')) return 'Web Profile / Host';
     return '运行时注入';
   }
+
+  function groupPluginRows(rows) {
+    const groups = new Map();
+    for (const row of rows) {
+      const packageName = pluginPackageName(row.moduleName);
+      const familyId = pluginFamilyId(packageName);
+      const group = groups.get(familyId) || { familyId, packageName, packages: new Set(), entries: [] };
+      group.packages.add(packageName);
+      group.entries.push({
+        entryId: row.entryId,
+        moduleName: row.moduleName,
+        enabled: Boolean(row.enabled),
+        fiberPhase: row.fiberPhase,
+        scope: componentScope(row),
+      });
+      groups.set(familyId, group);
+    }
+    return [...groups.values()].map((group) => {
+      const enabledEntryCount = group.entries.filter((entry) => entry.enabled).length;
+      const activeEntryCount = group.entries.filter((entry) => entry.enabled && entry.fiberPhase === 'active').length;
+      const scopes = [...new Set(group.entries.map((entry) => entry.scope))];
+      const phases = [...new Set(group.entries.map((entry) => entry.fiberPhase).filter(Boolean))];
+      return {
+        ...group,
+        packages: [...group.packages],
+        moduleName: group.packageName,
+        entryId: group.entries.map((entry) => entry.entryId).join(' '),
+        entryIds: group.entries.map((entry) => entry.entryId),
+        entryCount: group.entries.length,
+        enabledEntryCount,
+        activeEntryCount,
+        enabled: enabledEntryCount > 0,
+        active: activeEntryCount > 0,
+        fiberPhase: phases.join(' + ') || null,
+        scope: scopes.join(' + '),
+      };
+    });
+  }
+
+  const PLUGIN_GROUPS = groupPluginRows(SNAPSHOT.plugins);
 
   function classifyPlugin(row) {
     const s = `${row.moduleName} ${row.entryId}`.toLowerCase();
@@ -289,11 +573,11 @@
     if (/tool-web/.test(s)) return ['tools', 'web'];
     if (/tool-fs|file-reference/.test(s)) return ['tools', 'files'];
     if (/bash|pwsh|subprocess|code-runtime|tool-presentation|shell-env/.test(s)) return ['tools', 'code'];
-    if (/skill|plugin|typert|cordis|client|api-|webserver|settings/.test(s)) return ['tools', 'extensions'];
     if (/permission|approval|credential/.test(s)) return ['action', 'permission'];
     if (/sandbox|policy/.test(s)) return ['action', 'sandbox'];
     if (/subagent/.test(s)) return ['action', 'delegate'];
     if (/jobs|timer|timeout|schedule/.test(s)) return ['action', 'background'];
+    if (/skill|plugin|typert|cordis|client|api-|webserver|settings/.test(s)) return ['tools', 'extensions'];
     return ['action', 'recovery'];
   }
 
@@ -305,15 +589,109 @@
     return state.appliedOverrides.reasoningEffort ?? SNAPSHOT.config.model.reasoningEffort ?? '未记录';
   }
 
+  function effectiveBusyEnter() {
+    return state.appliedOverrides.busyEnter ?? SNAPSHOT.config.conversation.busyEnter ?? '未记录';
+  }
+
+  function effectiveDefaultPreset() {
+    const id = state.appliedOverrides.defaultPresetId ?? SNAPSHOT.config.defaultPresetId ?? SNAPSHOT.config.activePreset.id;
+    return SNAPSHOT.config.presets.find((item) => item.id === id) || SNAPSHOT.config.activePreset;
+  }
+
+  function pendingRefreshFor(key, packageName = null) {
+    if (!state.restoredPendingRefresh) return null;
+    return state.pendingRefreshRecords.find((item) => markerBlocksSnapshot(item) && item.key === key && (key !== 'pluginInstall' || item.packageName === packageName)) || null;
+  }
+
+  function hasRestoredPendingRefresh(key, packageName = null) {
+    return Boolean(pendingRefreshFor(key, packageName));
+  }
+
+  function hasUnknownWriteMarker(key = null, packageName = null) {
+    return state.pendingRefreshRecords.some((item) => item.markerType === 'unknown-write'
+      && (!key || item.key === key)
+      && (item.key !== 'pluginInstall' || packageName == null || item.packageName === packageName));
+  }
+
+  function syncRefreshMarkerState() {
+    state.restoredPendingRefresh = state.pendingRefreshRecords.some(markerBlocksSnapshot);
+    state.snapshotRefreshTargets = [...new Set(state.pendingRefreshRecords.map((item) => item.target).filter(Boolean))];
+  }
+
+  function presetRowsAreCurrent() {
+    if (hasRestoredPendingRefresh('defaultPresetId')) return false;
+    const snapshotPresetId = SNAPSHOT.config.defaultPresetId ?? SNAPSHOT.config.activePreset.id;
+    return effectiveDefaultPreset().id === snapshotPresetId;
+  }
+
+  function fullConfigEvidenceAvailable() {
+    return !state.restoredPendingRefresh && presetRowsAreCurrent();
+  }
+
+  function renderPresetRefreshGate() {
+    if (state.restoredPendingRefresh) {
+      const unknownCopy = hasUnknownWriteMarker()
+        ? '浏览器记录到一次已发起但未获得可信回读的写入尝试，真实状态未知。'
+        : '浏览器检测到与这份快照绑定的待刷新标记。';
+      return `<section class="card honest-empty"><div class="empty-mark">↻</div><h1 id="config-refresh-gate" tabindex="-1">完整能力等待重新同步</h1><p>${unknownCopy}标记本身不包含配置值，也不能证明发生过修改、安装或成功回读；它只负责阻止旧快照被冒充成当前状态。完成 live readback 或重新同步本机 DSH 后再继续。</p><div class="empty-actions"><button type="button" onclick="goQuick()">查看已遮蔽的快速配置</button><button type="button" onclick="openAssistant()">让助手说明核验范围</button></div></section>`;
+    }
+    const current = effectiveDefaultPreset();
+    const snapshotPreset = SNAPSHOT.config.presets.find((item) => item.id === SNAPSHOT.config.defaultPresetId) || SNAPSHOT.config.activePreset;
+    return `<section class="card honest-empty"><div class="empty-mark">↻</div><h1 id="config-refresh-gate" tabindex="-1">${esc(current.name)} 已切换，组件清单等待刷新</h1><p>角色卡切换已经写入并回读，但这份快照里的工具、提示词和能力组件仍属于 ${esc(snapshotPreset.name)}。为了不把旧清单冒充成新配置，完整能力暂不展示；重新同步本机快照后会自动恢复。</p><div class="empty-actions"><button type="button" onclick="goQuick()">返回快速配置</button><button type="button" onclick="openAssistant()">让助手说明刷新范围</button></div></section>`;
+  }
+
+  function effectiveWebSearchMaxUses() {
+    return state.appliedOverrides.webSearchMaxUses ?? SNAPSHOT.config.webSearch.maxUses ?? '未记录';
+  }
+
+  function quickPermissionLabel(value) {
+    const labels = {
+      'danger-full-access': '完全访问（高权限）',
+      'workspace-write': '仅工作区写入',
+      'read-only': '只读',
+    };
+    return labels[value] || value || '未记录';
+  }
+
+  function quickReasoningLabel(value) {
+    const labels = {
+      none: '关闭', minimal: '极简', low: '较低', medium: '中等', high: '较高', xhigh: '很高', max: '最高',
+    };
+    return labels[value] ? `${labels[value]}（${value}）` : value || '未记录';
+  }
+
+  function quickInputModalities(modalities) {
+    const labels = { text: '文本', image: '图片', audio: '音频', video: '视频' };
+    return (modalities || []).map((item) => labels[item] || item).join(' + ') || '未记录';
+  }
+
+  function quickInstructionStatus(row) {
+    if (!row?.enabled) return '未读取';
+    const maxBytes = Number(row.config?.maxBytes);
+    return Number.isFinite(maxBytes) && maxBytes > 0 ? `已读取 · 最多约 ${Math.round(maxBytes / 1024)} KB` : '已读取';
+  }
+
+  function quickPresetDescription(preset) {
+    if (preset?.id === 'code') return '完整工作模式：可以分析问题、读取项目说明、调用工具并推进多步骤任务。';
+    return shortSentence(preset?.description, 80);
+  }
+
   function pluginDescription(row, ability) {
     const tech = row.moduleName;
+    if (tech.includes('dsh-subagent-spawn-in-process')) return '让子 Agent 在当前进程内创建和运行，减少额外进程开销。';
+    if (tech.includes('dsh-subagent-fork-in-process')) return '从当前任务上下文派生子 Agent，并在同一进程内运行。';
+    if (tech.includes('dsh-subagent')) return '组织子 Agent 的生命周期、状态和协作关系。';
+    if (tech.includes('dsh-tool-subagent-control')) return '提供查看与控制子 Agent 的动作入口。';
+    if (tech.includes('dsh-tool-subagent-report')) return '把子 Agent 的执行结果安全回传给主 Agent。';
+    if (tech.includes('dsh-tool-subagent')) return '提供创建、派生和外部编码 Agent 等委派方式。';
+    if (tech.includes('dsh-client-ui-subagent')) return '在网页中展示并操作子 Agent，不直接增加推理能力。';
     if (tech.includes('dsh-persona')) return '为默认 Agent 注入“编码 Agent”身份，以及实际模型与工作目录占位。';
     if (tech.includes('dsh-agent-instructions')) return '从当前项目读取 AGENTS.md 等工作说明；当前 Preset 上限为 65,536 字节。';
-    if (tech.includes('dsh-web-search-deepseek')) return `使用 DeepSeek 搜索模型；当前每次任务最多 ${SNAPSHOT.config.webSearch.maxUses ?? '未记录'} 次。`;
+    if (tech.includes('dsh-web-search-deepseek')) return `使用 DeepSeek 搜索模型；当前每次任务最多 ${effectiveWebSearchMaxUses()} 次。`;
     if (tech.includes('dsh-permission-presets')) return `默认权限方案是 ${effectivePermissionDefault()}。`;
     if (tech.includes('dsh-agent-default-model')) return `默认使用 ${SNAPSHOT.config.model.model}，推理强度 ${effectiveReasoningEffort()}。`;
     if (tech.includes('client-ui')) return '这是 Web 界面的实际功能组件，不直接增加 Agent 的推理能力。';
-    return `为“${ability.name}”提供运行支持；状态来自当前 DSH Loader 回读。`;
+    return `为“${ability.name}”提供运行支持；${row.entryCount > 1 ? `${row.entryCount} 条加载记录已归并，` : ''}状态来自当前 DSH Loader 回读。`;
   }
 
   const toolNames = {
@@ -336,6 +714,7 @@
     'tool-workflow': '运行工作流',
     'tool-ralph': '按轮次持续推进',
     'tool-presentation': '用 Code Mode 组合工具',
+    'tool-result-pruner': '执行工具结果裁剪',
   };
 
   function classifyTool(row) {
@@ -352,6 +731,38 @@
     return ['tools', 'extensions'];
   }
 
+  function groupPresetToolRows(rows) {
+    const groups = new Map();
+    for (const row of rows.filter((item) => item.id.startsWith('tool-'))) {
+      const packageName = pluginPackageName(row.moduleName);
+      const group = groups.get(packageName) || { packageName, entries: [] };
+      group.entries.push(row);
+      groups.set(packageName, group);
+    }
+    return [...groups.values()].map((group) => {
+      const first = group.entries[0];
+      const enabledEntryCount = group.entries.filter((entry) => entry.enabled).length;
+      const groupedName = group.packageName === '@deepseek-ai/dsh-tool-subagent-control' ? '管理子 Agent'
+        : group.packageName === '@deepseek-ai/dsh-tool-subagent' ? '委派子任务'
+          : toolNames[first.id] || humanPluginName({ moduleName: first.moduleName, entryId: first.id });
+      return {
+        ...first,
+        name: groupedName,
+        packageName: group.packageName,
+        entryCount: group.entries.length,
+        enabledEntryCount,
+        enabled: enabledEntryCount > 0,
+        entries: group.entries.map((entry) => ({
+          entryId: entry.id,
+          moduleName: entry.moduleName,
+          enabled: Boolean(entry.enabled),
+          scope: '默认 Agent Preset',
+          config: entry.config || {},
+        })),
+      };
+    });
+  }
+
   function buildCapabilities() {
     const result = {};
     for (const [moduleKey, defs] of Object.entries(ABILITY_DEFS)) {
@@ -362,19 +773,54 @@
       if (ability) ability.components.push({ ...component, path: `${MODULES[moduleKey].name} → ${ability.name}` });
     };
 
-    for (const row of SNAPSHOT.plugins) {
+    for (const row of PLUGIN_GROUPS) {
       const [moduleKey, capabilityId] = classifyPlugin(row);
       const ability = result[moduleKey].find((item) => item.id === capabilityId);
       add(moduleKey, capabilityId, {
         type: 'plugin',
         name: humanPluginName(row),
-        tech: row.moduleName,
-        entryId: row.entryId,
+        tech: row.packages.join(' + '),
+        familyId: row.familyId,
+        entryId: row.entryIds[0],
+        entryIds: row.entryIds,
+        entries: row.entries,
+        entryCount: row.entryCount,
+        enabledEntryCount: row.enabledEntryCount,
+        activeEntryCount: row.activeEntryCount,
         desc: pluginDescription(row, ability),
-        status: row.enabled ? 'using' : 'off',
+        status: row.active ? 'using' : row.enabled ? 'error' : 'off',
         phase: row.fiberPhase,
-        scope: componentScope(row),
-        evidence: '运行实例回读',
+        scope: row.scope,
+        evidence: row.entryCount > 1 ? `${row.entryCount} 条 Loader 记录归并回读` : 'Loader 记录回读',
+      });
+    }
+
+    for (const installed of Object.values(state.verifiedInstalls)) {
+      const catalogItem = COMMUNITY_COMPONENTS.find((item) => item.packageName === installed.packageName);
+      if (!catalogItem || PLUGIN_GROUPS.some((item) => item.packageName === installed.packageName)) continue;
+      const entries = installed.manifestEntries.map((entry) => ({
+        entryId: entry.entryId,
+        moduleName: entry.moduleName,
+        enabled: entry.moduleName === installed.inventory.moduleName && entry.entryId === installed.inventory.entryId,
+        fiberPhase: entry.moduleName === installed.inventory.moduleName && entry.entryId === installed.inventory.entryId ? installed.inventory.fiberPhase : null,
+        scope: '本次采用回读',
+      }));
+      add(catalogItem.moduleKey, catalogItem.capabilityId, {
+        type: 'plugin',
+        name: catalogItem.name,
+        tech: `${installed.packageName}@${installed.version}`,
+        familyId: installed.packageName,
+        entryId: installed.inventory.entryId,
+        entryIds: entries.map((entry) => entry.entryId),
+        entries,
+        entryCount: entries.length,
+        enabledEntryCount: entries.filter((entry) => entry.enabled).length,
+        activeEntryCount: entries.filter((entry) => entry.enabled && entry.fiberPhase === 'active').length,
+        desc: catalogItem.desc,
+        status: 'using',
+        phase: installed.inventory.fiberPhase,
+        scope: '本次采用回读',
+        evidence: '安装清单与活动 Inventory 双重回读',
       });
     }
 
@@ -383,23 +829,30 @@
         type: 'skill',
         name: skill.name,
         tech: skill.name,
-        desc: skill.description,
+        desc: skill.description || skill.whenToUse || '当前项目会话可以发现这项 Skill；公开快照未保存其详细说明。',
         status: skill.modelInvocable ? 'using' : 'off',
-        evidence: '当前 code 会话回读',
-        scope: '默认 Agent Preset',
+        evidence: '目标项目会话快照',
+        scope: '目标项目',
       });
     }
 
-    for (const row of SNAPSHOT.config.presetRows.filter((item) => item.id.startsWith('tool-'))) {
+    for (const row of groupPresetToolRows(SNAPSHOT.config.presetRows)) {
       const [moduleKey, capabilityId] = classifyTool(row);
       add(moduleKey, capabilityId, {
         type: 'tool',
-        name: toolNames[row.id] || humanPluginName({ moduleName: row.moduleName, entryId: row.id }),
-        tech: row.config.toolName || row.id,
-        provider: row.moduleName,
-        desc: `由默认 ${SNAPSHOT.config.activePreset.name} Preset 组装的工具入口。`,
+        name: row.name,
+        tech: row.entryCount > 1 ? row.entries.map((entry) => entry.config.toolName || entry.entryId).join(' · ') : row.config.toolName || row.id,
+        provider: row.packageName,
+        entryId: row.entries[0].entryId,
+        entryIds: row.entries.map((entry) => entry.entryId),
+        entries: row.entries,
+        entryCount: row.entryCount,
+        enabledEntryCount: row.enabledEntryCount,
+        desc: row.entryCount > 1
+          ? `由当前角色卡组装的 ${row.entryCount} 个相关动作入口；逐项状态保留在详情中。`
+          : `由当前角色卡组装的动作入口。`,
         status: row.enabled ? 'using' : 'off',
-        config: row.config,
+        config: row.entryCount === 1 ? row.config : {},
         evidence: 'Preset 组装文件',
         scope: '默认 Agent Preset',
       });
@@ -408,7 +861,7 @@
     const pluginState = (fragment) => SNAPSHOT.plugins.some((row) => row.enabled && row.moduleName.includes(fragment));
     const rowState = (id) => SNAPSHOT.config.presetRows.find((row) => row.id === id)?.enabled !== false;
     add('mind', 'identity', {
-      type: 'prompt', name: '系统提示组装', tech: '@deepseek-ai/dsh-system-prompt',
+      type: 'prompt', name: '当前系统提示内容', tech: '@deepseek-ai/dsh-system-prompt',
       desc: '按实际作用域把身份、项目说明和运行规则组装成系统提示。',
       status: pluginState('dsh-system-prompt') ? 'using' : 'off', evidence: '运行实例回读', scope: 'Web Profile / Host',
     });
@@ -472,14 +925,31 @@
 
   function componentStatusLabel(component) {
     const active = component.status === 'using';
-    if (component.type === 'plugin') return active ? '已启用' : '未启用';
+    const total = Number(component.entryCount || 0);
+    const enabled = Number(component.enabledEntryCount || 0);
+    if (component.type === 'plugin') {
+      const activeCount = Number(component.activeEntryCount || 0);
+      if (enabled > activeCount) return activeCount ? `运行异常 · ${activeCount}/${enabled} 已激活` : '已配置 · 运行未激活';
+      if (total > 1 && enabled > 0 && enabled < total) return `部分启用 ${enabled}/${total}`;
+      return active ? '已启用' : '未启用';
+    }
     if (component.type === 'skill') return active ? 'AI 可调用' : 'AI 不可主动调用';
-    if (component.type === 'tool') return active ? '已组装' : '未组装';
+    if (component.type === 'tool') {
+      if (total > 1 && enabled > 0 && enabled < total) return `${enabled}/${total} 个入口可用`;
+      return active ? '已组装' : '未组装';
+    }
     if (component.type === 'prompt') return active ? '已注入' : '未注入';
     return active ? '当前生效' : '未生效';
   }
 
+  function componentTypeLabel(component) {
+    const base = TYPE_META[component.type].label;
+    if (!component.entryCount || component.entryCount < 2) return base;
+    return component.type === 'plugin' ? `${base} · ${component.entryCount} 条记录` : `${base} · ${component.entryCount} 个入口`;
+  }
+
   function buildRecommendations() {
+    if (state.restoredPendingRefresh) return [];
     const project = SNAPSHOT.sessions.project;
     const permissionName = 'danger-full-access';
     const permissionSessions = project.permissionCounts?.[permissionName] || 0;
@@ -490,24 +960,28 @@
     const recommendations = [];
     if (permissionDefault === permissionName) recommendations.push({
         id: 'permission', moduleKey: 'action', capabilityId: 'permission', confidence: '高可信', level: 'high',
+        sourceKind: '配置与会话记录',
         title: '收窄普通任务的默认权限',
-        summary: `新会话默认 ${permissionDefault || '未记录'}；当前项目 ${permissionSessions}/${project.total} 个会话也使用该档位。普通研究任务可先用 workspace-write，越界时再确认。`,
+        summary: `新会话默认“${quickPermissionLabel(permissionDefault)}”；当前项目 ${permissionSessions}/${project.total} 个会话也使用完全访问。普通任务可先用“仅工作区写入”，越界时再确认。`,
         evidence: `Settings + ${project.total} 个项目会话`,
       });
     else if (permissionSessions > 0) recommendations.push({
       id: 'permission', moduleKey: 'action', capabilityId: 'permission', confidence: '高可信', level: 'high',
+      sourceKind: '会话记录',
       title: '复核仍在使用高权限的旧会话',
-      summary: `新会话默认权限已不是 danger-full-access，但当前项目仍有 ${permissionSessions}/${project.total} 个既有会话使用它。逐个确认是否需要保留。`,
+      summary: `新会话默认权限已收窄，但当前项目仍有 ${permissionSessions}/${project.total} 个既有会话使用“完全访问”。逐个确认是否需要保留。`,
       evidence: `${project.total} 个项目会话`,
     });
     if (recordedMs > 0 && llmShare >= 70) recommendations.push({
         id: 'model', moduleKey: 'mind', capabilityId: 'model', confidence: '中可信', level: 'medium',
+        sourceKind: '运行统计',
         title: '先检查模型与上下文开销',
         summary: `项目记录里模型耗时占 LLM + 工具耗时的 ${llmShare}%。先检查长上下文、压缩时机和推理档位，再考虑增加工具。`,
         evidence: `${project.stats.turns} 轮 / ${project.stats.steps} 步的运行统计`,
       });
-    if (SNAPSHOT.skills.length >= 20 && larkSkills / Math.max(1, SNAPSHOT.skills.length) >= .6) recommendations.push({
+    if (SNAPSHOT.skillInventory?.status !== 'unavailable' && SNAPSHOT.skills.length >= 20 && larkSkills / Math.max(1, SNAPSHOT.skills.length) >= .6) recommendations.push({
         id: 'skills', moduleKey: 'tools', capabilityId: 'extensions', confidence: '中可信', level: 'medium',
+        sourceKind: '配置清单',
         title: '为当前项目收窄 Skill 清单',
         summary: `当前会话可发现 ${SNAPSHOT.skills.length} 个 Skill，其中 ${larkSkills} 个属于飞书能力。若本项目很少操作飞书，可用更轻的项目配置减少选择噪音。`,
         evidence: '当前会话可用 Skill 清单',
@@ -534,6 +1008,67 @@
     setTimeout(() => el.remove(), 2600);
   }
 
+  function persistOptimizationState() {
+    try {
+      if (!window.localStorage || typeof window.localStorage.setItem !== 'function') return false;
+      window.localStorage.setItem('ds-hub-optimization-state-v1', JSON.stringify({
+        schemaVersion: 1,
+        snapshotIdentity: SNAPSHOT_IDENTITY,
+        updatedAt: new Date().toISOString(),
+        assistantPlans: state.assistantPlans.slice(-20).map(historicalPlanSummary).filter(Boolean),
+        pendingRefreshRecords: state.pendingRefreshRecords.slice(-20).map(persistedRefreshMarker).filter(Boolean),
+      }));
+      return true;
+    } catch (_) {
+      // A write must not cross the mutation boundary unless its uncertainty
+      // marker can survive a reload.
+      return false;
+    }
+  }
+
+  function upsertPendingRefreshRecord(proposal, readbackTargetRevision, readbackAt) {
+    if (!proposal || !PENDING_REFRESH_KEYS.has(proposal.key) || !proposal.target || !proposal.baseTarget?.targetId) return;
+    const marker = {
+      markerType: 'pending-refresh',
+      key: proposal.key,
+      ...canonicalMarkerTarget(proposal.key, proposal.packageName),
+      readbackTargetRevision: String(readbackTargetRevision),
+      readbackAt,
+      restored: false,
+    };
+    if (!marker.targetId || marker.targetId !== String(proposal.baseTarget.targetId)) return;
+    const sameMarker = (item) => item.key === marker.key && (marker.key !== 'pluginInstall' || item.packageName === marker.packageName);
+    state.pendingRefreshRecords = [...state.pendingRefreshRecords.filter((item) => !sameMarker(item)), marker].slice(-20);
+    syncRefreshMarkerState();
+    state.lastReadbackAt = readbackAt;
+  }
+
+  function upsertUnknownWriteMarker(proposal, attemptedAt = new Date().toISOString()) {
+    if (!proposal || !PENDING_REFRESH_KEYS.has(proposal.key) || !proposal.baseTarget?.targetId) return false;
+    const canonical = canonicalMarkerTarget(proposal.key, proposal.packageName);
+    if (!canonical || canonical.targetId !== String(proposal.baseTarget.targetId) || !Number.isFinite(Date.parse(attemptedAt))) return false;
+    const marker = {
+      markerType: 'unknown-write',
+      key: proposal.key,
+      ...canonical,
+      attemptedAt,
+      trust: 'untrusted_browser_hint',
+      restored: false,
+    };
+    const sameMarker = (item) => item.key === marker.key && (marker.key !== 'pluginInstall' || item.packageName === marker.packageName);
+    state.pendingRefreshRecords = [...state.pendingRefreshRecords.filter((item) => !sameMarker(item)), marker].slice(-20);
+    syncRefreshMarkerState();
+    return true;
+  }
+
+  function clearUnknownWriteMarker(proposal) {
+    if (!proposal) return;
+    state.pendingRefreshRecords = state.pendingRefreshRecords.filter((item) => !(item.markerType === 'unknown-write'
+      && item.key === proposal.key
+      && (item.key !== 'pluginInstall' || item.packageName === proposal.packageName)));
+    syncRefreshMarkerState();
+  }
+
   function bc(items) {
     return `<div class="crumbs">${items.map((item, index) => {
       const node = item.fn ? `<button type="button" onclick="${item.fn}">${esc(item.t)}</button>` : `<b>${esc(item.t)}</b>`;
@@ -542,16 +1077,79 @@
   }
 
   function renderTopbar() {
+    const snapshotDate = String(SNAPSHOT.capturedAt || '').slice(5, 10).replace('-', '/');
     return `<div class="topbar">
       <div class="logo"><span class="lg-ico"><img src="assets/dsh-icon.svg" alt="" width="19" height="19"></span>DS <em>Hub</em></div>
       <div class="top-sep"></div>
-      <span class="build-pill" title="DSH 版本 · 当前使用网页配置">DSH ${esc(SNAPSHOT.source.packageVersion)} · 网页配置</span>
-      <div class="main-tabs" aria-label="主要功能">
-        <button class="${state.view !== 'trial' && state.view !== 'observe' ? 'on' : ''}" onclick="goWorkshop()">能力配置</button>
-        <button class="${state.view === 'observe' ? 'on' : ''}" onclick="goObserve()">运行观测</button>
-        <button class="${state.view === 'trial' ? 'on' : ''}" onclick="goTrial()">效果测试</button>
-      </div>
+      <span class="build-pill" title="DSH 版本 · 本机配置快照时间">DSH ${esc(SNAPSHOT.source.packageVersion)} · 本机快照 ${esc(snapshotDate)}</span>
+      <nav class="main-tabs" aria-label="主要功能">
+        <button class="${state.view !== 'trial' && state.view !== 'observe' ? 'on' : ''}" aria-current="${state.view !== 'trial' && state.view !== 'observe' ? 'page' : 'false'}" onclick="goQuick()">Agent 配置</button>
+        <button class="${state.view === 'observe' ? 'on' : ''}" aria-current="${state.view === 'observe' ? 'page' : 'false'}" onclick="goObserve()">运行观测</button>
+        <button class="${state.view === 'trial' ? 'on' : ''}" aria-current="${state.view === 'trial' ? 'page' : 'false'}" onclick="goTrial()">效果测试</button>
+      </nav>
     </div>`;
+  }
+
+  function renderConfigSwitch(active) {
+    return `<nav class="config-mode-switch" aria-label="Agent 配置方式"><button type="button" class="${active === 'quick' ? 'on' : ''}" aria-pressed="${active === 'quick'}" onclick="goQuick()"><b>个性化快速配置</b><span>四块关键设置，适合日常调整</span></button><button type="button" class="${active === 'full' ? 'on' : ''}" aria-pressed="${active === 'full'}" onclick="goWorkshop()"><b>完整能力配置</b><span>模块、能力与全部底层组件</span></button></nav>`;
+  }
+
+  function renderSnapshotFreshnessNotice() {
+    if (!state.snapshotRefreshTargets.length) return '';
+    const targets = [...new Set(state.snapshotRefreshTargets)].map((item) => esc(item)).join('、');
+    const readbackAt = state.lastReadbackAt ? String(state.lastReadbackAt).slice(0, 16).replace('T', ' ') : '上次采用时';
+    if (state.restoredPendingRefresh) {
+      const markerTitle = hasUnknownWriteMarker() ? '写入状态未知，已停止继续操作。' : '检测到待刷新标记。';
+      return `<div class="snapshot-freshness" role="status"><b>${markerTitle}</b><span>${targets} 的当前状态尚未核验；浏览器标记不证明发生过修改、安装、写入或成功回读。页面已遮蔽受影响的旧快照内容，请先完成 live readback 或重新同步本机 DSH。</span></div>`;
+    }
+    return `<div class="snapshot-freshness" role="status"><b>本次会话已显示可信回读。</b><span>${targets} 的最后回读时间为 ${esc(readbackAt)}；其余组件清单和运行统计仍来自 ${esc(String(SNAPSHOT.capturedAt).slice(0, 10))} 的快照。重新同步后才能合并成一份新的当前状态。</span></div>`;
+  }
+
+  function presetRow(id) {
+    return SNAPSHOT.config.presetRows.find((row) => row.id === id);
+  }
+
+  function quickConfigCard({ id, title, desc, rows, moduleKey, capabilityId, control }) {
+    const number = { model: '01', context: '02', prompt: '03', tools: '04' }[id] || '·';
+    const quickControl = !control ? '' : control.blocked
+      ? `<div class="qc-quick-edit qc-pending-control" role="status"><div><span>${esc(control.label)}</span><b>当前值待核验，刷新快照后再调整</b></div><button type="button" disabled>等待核验</button></div>`
+      : `<div class="qc-quick-edit"><label for="quick-${esc(control.key)}"><span>${esc(control.label)}</span><select id="quick-${esc(control.key)}" onchange="updateQuickDraft('${esc(control.key)}',this.value)">${control.options.map((option) => `<option value="${esc(option.value)}"${String(option.value) === String(control.value) ? ' selected' : ''}>${esc(option.label)}</option>`).join('')}</select></label><button type="button" onclick="prepareQuickCandidate('${esc(control.key)}')">生成候选</button></div>`;
+    return `<section class="quick-config-card"><div class="qc-head"><span>${number}</span><div><h2>${esc(title)}</h2><p>${esc(desc)}</p></div></div><div class="qc-rows">${rows.map((row) => `<div><span>${esc(row.label)}</span><b title="${esc(row.value)}">${esc(row.value)}</b></div>`).join('')}</div>${quickControl}<div class="qc-actions"><button type="button" onclick="quickConfigAsk('${id}')">让助手分析</button><button type="button" onclick="jumpToCapability('${moduleKey}','${capabilityId}')">查看完整配置</button></div></section>`;
+  }
+
+  function renderQuickConfig() {
+    const model = SNAPSHOT.config.model;
+    const defaultPreset = effectiveDefaultPreset();
+    const presetRowsCurrent = presetRowsAreCurrent();
+    const reasoningPending = hasRestoredPendingRefresh('reasoningEffort');
+    const busyPending = hasRestoredPendingRefresh('busyEnter');
+    const presetPending = hasRestoredPendingRefresh('defaultPresetId');
+    const searchPending = hasRestoredPendingRefresh('webSearchMaxUses');
+    const permissionPending = hasRestoredPendingRefresh('permissionDefault');
+    const pendingValue = '当前值待核验';
+    const awaitingPresetRefresh = presetPending ? pendingValue : '切换后待刷新';
+    const enabledTools = groupPresetToolRows(SNAPSHOT.config.presetRows).filter((row) => row.enabled).length;
+    const instruction = presetRow('agent-instructions');
+    const compaction = presetRow('compaction-basic');
+    const pruner = presetRow('tool-result-pruner');
+    return `${renderConfigSwitch('quick')}<div class="page-head quick-page-head"><div><h1 class="page-title agent-title">${state.agentNameEditing
+      ? `<input id="agent-name-input" class="agent-name-input" value="${esc(state.agentName)}" onkeydown="agentNameInputKeydown(event)" onblur="saveAgentName(this.value)" maxlength="48" aria-label="Agent 名称">`
+      : `<button type="button" class="agent-name-display" onclick="agentNameClick(event)" ondblclick="startAgentRename()" title="双击改名" aria-label="${esc(state.agentName)}，双击改名">${esc(state.agentName)}</button>`}<span class="tag cy">个性化配置</span></h1><div class="page-sub">四张卡展示整块状态；蓝色快捷区只修改卡内标明的一项。任何修改先保存为候选，通过效果测试后再采用。</div></div><button type="button" onclick="askAssistant('diagnose')">让助手检查当前配置</button></div>
+      <div class="quick-profile-strip"><span class="quick-dsh-avatar"><img src="assets/dsh-icon.svg" alt="DSH 图标"></span><div><small>新会话默认角色卡</small><b>${presetPending ? '角色卡当前值待核验' : esc(defaultPreset.name)}</b><p>${presetPending ? '旧快照值已遮蔽；重新同步本机 DSH 后显示当前角色卡。' : esc(quickPresetDescription(defaultPreset))}</p></div><span class="tag ${presetPending ? 'warn' : defaultPreset.trust === 'system' ? 'cy' : 'vio'}">${presetPending ? '待核验' : defaultPreset.trust === 'system' ? '系统内置' : '用户创建'}</span></div>
+      <div class="quick-config-grid">
+        ${quickConfigCard({ id: 'model', title: '模型接入', desc: '决定 Agent 用哪个模型，以及思考深度。', moduleKey: 'mind', capabilityId: 'model', rows: [
+          { label: '模型服务商', value: model.provider }, { label: '默认模型', value: model.model }, { label: '推理强度', value: reasoningPending ? pendingValue : quickReasoningLabel(effectiveReasoningEffort()) }, { label: '输入类型', value: quickInputModalities(model.inputModalities) },
+        ], control: { key: 'reasoningEffort', label: '快速调整推理强度', value: state.quickDrafts.reasoningEffort, blocked: reasoningPending, options: PROPOSAL_POLICIES.reasoningEffort.allowedValues.map((value) => ({ value, label: quickReasoningLabel(value) })) } })}
+        ${quickConfigCard({ id: 'context', title: '会话与上下文', desc: '决定信息保留多少、过长时怎样收拢。', moduleKey: 'memory', capabilityId: 'conversation', rows: [
+          { label: '上下文窗口', value: `${formatNumber(model.contextWindow)} tokens` }, { label: '忙时新消息', value: busyPending ? pendingValue : effectiveBusyEnter() === 'queue' ? '排队等待' : effectiveBusyEnter() === 'steer' ? '引导当前任务' : effectiveBusyEnter() }, { label: '自动压缩', value: presetRowsCurrent ? (compaction?.enabled ? '已启用' : '未启用') : awaitingPresetRefresh }, { label: '工具结果裁剪', value: presetRowsCurrent ? (pruner?.config?.thresholdChars ? `${formatNumber(pruner.config.thresholdChars)} 字符后处理` : '未记录') : awaitingPresetRefresh },
+        ], control: { key: 'busyEnter', label: '快速调整忙时消息', value: state.quickDrafts.busyEnter, blocked: busyPending, options: [{ value: 'queue', label: '排队等待' }, { value: 'steer', label: '引导当前任务' }] } })}
+        ${quickConfigCard({ id: 'prompt', title: 'Agent 与提示词', desc: '决定它是谁、遵守什么规则、怎样推进任务。', moduleKey: 'mind', capabilityId: 'identity', rows: [
+          { label: '角色卡', value: presetPending ? pendingValue : defaultPreset.name }, { label: '身份提示', value: presetRowsCurrent ? (presetRow('persona')?.enabled ? '已注入' : '未注入') : awaitingPresetRefresh }, { label: '项目说明', value: presetRowsCurrent ? quickInstructionStatus(instruction) : awaitingPresetRefresh }, { label: '计划模式', value: presetRowsCurrent ? (presetRow('plan-mode')?.enabled ? '已启用' : '未启用') : awaitingPresetRefresh },
+        ], control: { key: 'defaultPresetId', label: '快速切换默认角色卡', value: state.quickDrafts.defaultPresetId, blocked: presetPending, options: SNAPSHOT.config.presets.map((item) => ({ value: item.id, label: item.name })) } })}
+        ${quickConfigCard({ id: 'tools', title: '工具层', desc: '决定它可以做什么，以及做到哪一步要确认。', moduleKey: 'tools', capabilityId: 'web', rows: [
+          { label: '默认权限', value: permissionPending ? pendingValue : quickPermissionLabel(effectivePermissionDefault()) }, { label: '可用动作', value: presetRowsCurrent ? `${enabledTools} 组` : awaitingPresetRefresh }, { label: '可用技能', value: presetRowsCurrent ? `${SNAPSHOT.skills.length} 个` : awaitingPresetRefresh }, { label: '网页搜索', value: !presetRowsCurrent ? awaitingPresetRefresh : searchPending ? pendingValue : (presetRow('tool-web')?.enabled ? `已启用 · 每任务最多 ${effectiveWebSearchMaxUses()} 次` : '未启用') },
+        ], control: { key: 'webSearchMaxUses', label: '快速调整搜索上限', value: state.quickDrafts.webSearchMaxUses, blocked: searchPending, options: PROPOSAL_POLICIES.webSearchMaxUses.allowedValues.map((value) => ({ value, label: `每任务最多 ${value} 次` })) } })}
+      </div>${state.restoredPendingRefresh ? '<div class="note-bar"><b>旧值已主动遮蔽。</b>浏览器中的方案只作为历史摘要，另有一个无值待刷新标记避免误显示；两者都不证明当前配置，重新同步后才能继续核对和调整。</div>' : presetRowsCurrent ? '' : '<div class="note-bar"><b>角色卡切换已回读，底层清单尚未刷新。</b>与角色卡有关的工具、提示词和 Skill 暂不显示旧值；重新同步本机快照后会恢复。</div>'}<div class="note-bar"><b>快速配置不是另一份配置。</b>它只是把同一份 DSH 设置按日常使用场景重新整理；完整能力页仍保留插件包、Skill、工具、提示词和所有加载记录。</div>`;
   }
 
   function renderCoreAvatar() {
@@ -563,7 +1161,6 @@
           : '<span class="dsh-orbit"><span class="dsh-orbit-ring"></span><img class="dsh-core-logo" src="assets/dsh-icon.svg" alt="DSH 图标" draggable="false"><b>DS Hub</b><small>Agent Runtime</small></span>'}
       </button>
       <span class="avatar-hint">双击${isGirl ? '恢复图标' : '唤醒机娘'}</span>
-      <button type="button" class="core-chat-bubble" onclick="openAssistant()"><span>AI 配置诊断</span><b>想先检查哪一项？</b></button>
     </div>`;
   }
 
@@ -572,7 +1169,9 @@
   }
 
   function partStatus(key) {
-    return moduleComponents(key).some((component) => component.status === 'using') ? 'ok' : 'weak';
+    const components = moduleComponents(key);
+    if (components.some((component) => component.status === 'error')) return 'warn';
+    return components.some((component) => component.status === 'using') ? 'ok' : 'weak';
   }
 
   function moduleSummary(key) {
@@ -612,14 +1211,14 @@
     if (!state.recommendationsOpen) {
       return `<section class="recommend-summary" aria-label="线上数据配置建议">
         <button type="button" onclick="toggleRecommendations()" aria-expanded="false">
-          <span class="rs-mark">${RECOMMENDATIONS.length}</span><span><small>根据当前运行数据</small><b>${esc(first.title)}</b></span><span class="rs-more">查看全部建议 ↓</span>
+          <span class="rs-mark">${RECOMMENDATIONS.length}</span><span><small>根据${esc(first.sourceKind || '当前证据')}</small><b>${esc(first.title)}</b></span><span class="rs-more">查看全部建议 ↓</span>
         </button>
       </section>`;
     }
     return `<section class="recommend-panel" aria-label="线上数据配置建议">
-      <div class="recommend-head"><div><span>配置建议</span><h2>从运行数据里先处理这些问题</h2></div><button type="button" onclick="toggleRecommendations()" aria-expanded="true">收起 ↑</button></div>
+      <div class="recommend-head"><div><span>配置建议</span><h2>从配置与运行证据里先处理这些问题</h2></div><button type="button" onclick="toggleRecommendations()" aria-expanded="true">收起 ↑</button></div>
       <div class="recommend-list">${RECOMMENDATIONS.map((item, index) => `<article class="recommend-row">
-        <span class="recommend-rank">0${index + 1}</span><div class="recommend-content"><div class="recommend-title"><h3>${esc(item.title)}</h3><span class="confidence ${item.level}">${esc(item.confidence)}</span></div><p>${esc(item.summary)}</p><small>依据：${esc(item.evidence)}</small></div>
+        <span class="recommend-rank">0${index + 1}</span><div class="recommend-content"><div class="recommend-title"><h3>${esc(item.title)}</h3><span class="confidence ${item.level}">${esc(item.confidence)}</span></div><p>${esc(item.summary)}</p><small>${esc(item.sourceKind || '当前证据')}：${esc(item.evidence)}</small></div>
         <button type="button" class="recommend-go" onclick="jumpToCapability('${item.moduleKey}','${item.capabilityId}')">查看配置 →</button>
       </article>`).join('')}</div>
       <div class="recommend-foot">这些是配置优先级建议，不是效果结论；当前数据还没有成功率或质量标签。</div>
@@ -627,24 +1226,26 @@
   }
 
   function renderWorkshop() {
-    return `<div class="page-head actual-head">
+    const currentPreset = effectiveDefaultPreset();
+    if (!fullConfigEvidenceAvailable()) return `${renderConfigSwitch('full')}${renderPresetRefreshGate()}`;
+    return `${renderConfigSwitch('full')}<div class="page-head actual-head">
       <h1 class="page-title agent-title">${state.agentNameEditing
         ? `<input id="agent-name-input" class="agent-name-input" value="${esc(state.agentName)}" onkeydown="agentNameInputKeydown(event)" onblur="saveAgentName(this.value)" maxlength="48" aria-label="Agent 名称">`
         : `<button type="button" class="agent-name-display" onclick="agentNameClick(event)" ondblclick="startAgentRename()" title="双击改名" aria-label="${esc(state.agentName)}，双击改名">${esc(state.agentName)}</button>`}</h1>
       <div class="legend"><span><i class="lg-dot" style="background:var(--ok)"></i>当前生效</span><span><i class="lg-dot" style="background:var(--weak)"></i>当前未生效</span><span><i class="lg-dot" style="background:var(--blue)"></i>按用途分组，方便理解</span></div>
     </div>
     <div class="stage-wrap"><div class="mecha-stage">
-      <div class="attire"><span class="a-label">当前角色卡</span><span class="a-name">${esc(SNAPSHOT.config.activePreset.name)}</span><span class="chip">默认</span><span class="chip">${SNAPSHOT.config.activePreset.trust === 'system' ? '系统内置' : '用户创建'}</span><button onclick="openPresetDrawer()">查看完整配置</button></div>
+      <div class="attire"><span class="a-label">当前角色卡</span><span class="a-name">${esc(currentPreset.name)}</span><span class="chip">默认</span><span class="chip">${currentPreset.trust === 'system' ? '系统内置' : '用户创建'}</span><button type="button" onclick="openPresetDrawer()">查看完整配置</button></div>
       <div class="mascot-holder">${renderCoreAvatar()}</div>${linkSVG()}
       ${modCard('sense', 'left:20px;top:34px')}${modCard('mind', 'left:708px;top:34px')}${modCard('memory', 'left:20px;top:330px')}${modCard('tools', 'left:708px;top:210px')}${modCard('action', 'left:708px;top:396px')}
     </div></div>
     ${renderRecommendations()}
-    <div class="note-bar"><b>快照日期：</b>${esc(String(SNAPSHOT.capturedAt).slice(0, 10))}。点击任一模块查看当前配置；社区候选在组件库里单独标注，均未安装。</div>
+    <div class="note-bar"><b>快照日期：</b>${esc(String(SNAPSHOT.capturedAt).slice(0, 10))}。点击任一模块查看当前配置；社区候选与本次已回读安装的组件会分开标注。</div>
     ${state.presetDrawer ? renderPresetDrawer() : ''}`;
   }
 
   function renderPresetDrawer() {
-    const preset = SNAPSHOT.config.activePreset;
+    const preset = effectiveDefaultPreset();
     return `<div class="drawer-mask" onclick="closePresetDrawer()"></div><aside class="drawer" role="dialog" aria-modal="true" tabindex="-1" aria-label="Agent Preset 详情">
       <button class="d-close" onclick="closePresetDrawer()" aria-label="关闭">✕</button>
       <h3>${esc(preset.name)} <span class="tag cy">${esc(preset.id)}</span></h3>
@@ -657,7 +1258,7 @@
         <div class="detail-line"><b>组装行</b><span>${SNAPSHOT.config.presetRows.length} 个插件行</span></div>
       </div>
       <div class="detail-sec"><h4>DSH 实际可用的 Preset</h4>${SNAPSHOT.config.presets.map((item) => `<div class="id-card ${item.isDefault ? 'on' : ''}"><div class="id-name">${esc(item.name || item.id)} ${item.isDefault ? '<span class="tag vio">默认</span>' : ''}</div><div class="cr-tech">${esc(item.id)} · ${item.trust === 'system' ? '系统内置' : '用户创建'}</div><div style="font-size:12px;color:var(--muted);margin-top:6px">${esc(item.description || item.broken || '无说明')}</div></div>`).join('')}</div>
-      <div class="note-bar">此原型只回读配置，不在这里切换 Preset；避免把静态展示误认为已经修改了 DSH。</div>
+      <div class="note-bar">当前页面为只读详情。要切换角色卡，请回到个性化快速配置并先生成候选。</div>
     </aside>`;
   }
 
@@ -673,7 +1274,7 @@
   function renderModuleRail(key) {
     return `<aside class="module-rail" aria-label="五个能力模块"><div class="rail-label">五个模块</div>
       ${Object.entries(MODULES).map(([moduleKey, module]) => `<button type="button" class="module-switch ${moduleKey === key ? 'on' : ''}" onclick="openModule('${moduleKey}')"><span class="ms-ico">${module.icon}</span><span><b>${module.name}</b><small>${moduleSummary(moduleKey)}</small></span></button>`).join('')}
-      <button type="button" class="rail-library" onclick="openLibrary()"><b>全部真实组件</b><small>${SNAPSHOT.plugins.length} 插件 · ${SNAPSHOT.skills.length} Skill · ${ALL_COMPONENTS.filter((item) => item.component.type === 'tool').length} 工具入口</small></button>
+      <button type="button" class="rail-library" onclick="openLibrary()"><b>全部真实组件</b><small>${PLUGIN_GROUPS.length} 个插件包 · ${SNAPSHOT.plugins.length} 条加载记录 · ${SNAPSHOT.skills.length} Skill</small></button>
     </aside>`;
   }
 
@@ -691,6 +1292,7 @@
   function renderModule() {
     const key = state.module || 'sense';
     const module = MODULES[key];
+    if (!fullConfigEvidenceAvailable()) return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: module.name }]) + renderPresetRefreshGate();
     const abilities = CAPABILITIES[key];
     const ability = activeCapability(key);
     const componentTotal = moduleComponents(key).length;
@@ -708,24 +1310,24 @@
       const remaining = Math.max(0, ability.components.length - visible.length);
       const recommendation = recommendationFor(key, ability.id);
       const community = communityFor(key, ability.id);
-      const utilities = `${ability.id === 'model' ? '<button type="button" onclick="openLLM()">查看模型设置</button>' : ''}${ability.id === 'workflow' ? '<button type="button" onclick="openFlow()">查看工作流能力</button>' : ''}<button type="button" onclick="openLibrary('native')">搜索全部原生组件</button>`;
+      const utilities = `${ability.id === 'model' ? '<button type="button" onclick="openLLM()">查看模型设置</button>' : ''}${ability.id === 'workflow' ? '<button type="button" onclick="openFlow()">查看工作流能力</button>' : ''}<button id="open-native-library" type="button" onclick="openLibrary('native')">搜索全部原生组件</button>`;
       unfold = `<section id="component-unfold" class="component-unfold" tabindex="-1" aria-live="polite">
         <div class="unfold-head"><span class="uh-mark">${esc(module.icon)}</span><div><h2>${esc(ability.name)}</h2><p>${esc(ability.desc)}</p></div><span class="uh-count">${ability.components.length} 个已发现组件</span></div>
         ${recommendation ? `<div class="ability-advice"><span class="confidence ${recommendation.level}">${esc(recommendation.confidence)}</span><div><b>${esc(recommendation.title)}</b><p>${esc(recommendation.summary)}</p><small>依据：${esc(recommendation.evidence)}</small></div><button type="button" onclick="askAssistant('${esc(recommendation.id)}')">让 AI 解释</button></div>` : ''}
-        <div class="component-field"><div class="component-net">${visible.length ? visible.map((component, index) => `<button type="button" class="component-tile ${component.status === 'off' ? 'off' : ''}" data-component-ref="${key}-${ability.id}-${index}" onclick="openComponent('${key}','${ability.id}',${index})" aria-label="查看${esc(component.name)}详情，${esc(componentStatusLabel(component))}">
-          <span class="ct-top"><span class="ct-type">${TYPE_META[component.type].label}</span><span class="ct-state" aria-hidden="true"></span><span class="ct-status-label">${esc(componentStatusLabel(component))}</span></span><h3>${esc(component.name)}</h3><p>${esc(shortSentence(component.desc))}</p>
+        <div class="component-field"><div class="component-net">${visible.length ? visible.map((component, index) => `<button type="button" class="component-tile ${component.status === 'off' ? 'off' : component.status === 'error' ? 'error' : ''}" data-component-ref="${key}-${ability.id}-${index}" onclick="openComponent('${key}','${ability.id}',${index})" aria-label="查看${esc(component.name)}详情，${esc(componentStatusLabel(component))}">
+          <span class="ct-top"><span class="ct-type">${esc(componentTypeLabel(component))}</span><span class="ct-state" aria-hidden="true"></span><span class="ct-status-label">${esc(componentStatusLabel(component))}</span></span><h3>${esc(component.name)}</h3><p>${esc(shortSentence(component.desc))}</p>
         </button>`).join('') : '<div class="component-empty">当前快照没有发现对应组件。</div>'}</div>
         ${remaining ? `<button type="button" class="component-more" onclick="showMoreComponents()">继续展开 ${remaining} 个组件 ↓</button>` : ''}
         <div class="ability-utilities">${utilities}</div></div>
-        ${community.length ? `<div class="community-shelf"><div class="community-shelf-head"><div><span>社区预置候选</span><b>未安装，不计入上方真实组件</b></div><button type="button" onclick="openLibrary('community')">查看全部社区候选 →</button></div><div class="community-mini-grid">${community.map((item) => `<a href="${item.repo}" target="_blank" rel="noopener" class="community-mini"><span>社区 · 未安装</span><h3>${esc(item.name)}</h3><p>${esc(item.desc)}</p></a>`).join('')}</div></div>` : ''}
+        ${community.length ? `<div class="community-shelf"><div class="community-shelf-head"><div><span>社区目录</span><b>候选与本次安装回读分开显示</b></div><button id="open-community-library" type="button" onclick="openLibrary('community')">查看全部社区候选 →</button></div><div class="community-mini-grid">${community.map((item) => { const installed = state.verifiedInstalls[item.packageName]; const pendingInstall = hasRestoredPendingRefresh('pluginInstall', item.packageName); return `<a href="${item.repo}" target="_blank" rel="noopener" class="community-mini"><span>${pendingInstall ? '社区 · 安装状态待核验' : installed ? `社区 · 已安装并回读 v${esc(installed.version)}` : '社区 · 未安装'}</span><h3>${esc(item.name)}</h3><p>${esc(item.desc)}</p></a>`; }).join('')}</div></div>` : ''}
       </section>`;
     }
-    return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: module.name }]) + `<main class="spatial-workbench">
+    return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: module.name }]) + `<div class="spatial-workbench">
       <div class="spatial-head"><div class="page-head"><h1 class="page-title">${module.name}模块 <span class="tag cy">${module.en}</span></h1><div class="page-sub">选择一项能力，再查看它实际由哪些插件、Skill、工具和提示词组成。</div></div><nav class="module-dock" aria-label="切换能力模块">${dock}</nav></div>
       <details class="term-guide"><summary>插件、Skill、工具、提示词分别是什么？</summary><div><span><b>插件</b>装进 DSH 的功能零件</span><span><b>Skill</b>AI 需要时读取的做事说明</span><span><b>工具</b>AI 可以实际调用的动作入口</span><span><b>提示词</b>告诉 AI 身份、规则和做事方式的文字</span></div></details>
       <section class="capability-orbit" aria-label="${module.name}模块的能力分布"><div class="module-core"><span class="mc-icon">${module.icon}</span><h2>${module.name}</h2><p>${module.desc}</p><small>${abilities.length} 类能力 · ${componentTotal} 个组件</small></div><div class="orbit-nodes">${abilityNodes}</div><div class="orbit-hint">选择周围一项能力，展开它的真实组件</div></section>
       ${unfold}
-    </main>${state.componentDetail ? renderComponentDrawer() : ''}${state.libraryOpen ? renderLibraryDrawer() : ''}`;
+    </div>${state.componentDetail ? renderComponentDrawer() : ''}${state.libraryOpen ? renderLibraryDrawer() : ''}`;
   }
 
   function findComponentDetail() {
@@ -734,6 +1336,15 @@
     const ability = CAPABILITIES[moduleKey]?.find((item) => item.id === capabilityId);
     const component = ability?.components[Number(indexText)];
     return component ? { moduleKey, ability, component } : null;
+  }
+
+  function renderTechnicalEntries(component) {
+    if (!component.entries?.length) return '';
+    const itemLabel = component.type === 'plugin' ? '加载记录' : '动作入口';
+    return `<div class="detail-sec"><details class="technical-entries"><summary>查看 ${component.entries.length} 条${itemLabel}</summary><div class="technical-entry-list">${component.entries.map((entry) => {
+      const config = Object.entries(entry.config || {});
+      return `<article class="technical-entry"><div class="te-head"><b>${esc(entry.entryId)}</b><span class="tag ${entry.enabled ? 'ok' : ''}">${entry.enabled ? '已启用' : '未启用'}</span></div><div class="mono">${esc(entry.moduleName)}</div><small>${esc(entry.scope || '未记录')}${entry.fiberPhase ? ` · Fiber ${esc(entry.fiberPhase)}` : ''}</small>${config.length ? `<div class="te-config">${config.map(([key, value]) => `<span>${esc(key)}=${esc(value)}</span>`).join('')}</div>` : ''}</article>`;
+    }).join('')}</div></details></div>`;
   }
 
   function renderComponentDrawer() {
@@ -747,50 +1358,55 @@
       <div class="comp-drawer-path">${MODULES[moduleKey].name} → ${ability.name} → ${meta.label}</div>
       <div class="plain-explain"><b>它负责什么：</b>${esc(component.desc)}</div>
       <div class="detail-sec"><h4>真实状态</h4>
-        <div class="detail-line"><b>当前状态</b><span class="tag ${component.status === 'using' ? 'ok' : ''}">${esc(componentStatusLabel(component))}</span></div>
+        <div class="detail-line"><b>当前状态</b><span class="tag ${component.status === 'using' ? 'ok' : component.status === 'error' ? 'warn' : ''}">${esc(componentStatusLabel(component))}</span></div>
         <div class="detail-line"><b>证据来源</b><span>${esc(component.evidence)}</span></div>
         <div class="detail-line"><b>所在层</b><span>${esc(component.scope || '未记录')}</span></div>
         <div class="detail-line"><b>技术名称</b><span class="mono">${esc(component.tech)}</span></div>
-        ${component.entryId ? `<div class="detail-line"><b>唯一标识</b><span class="mono">${esc(component.entryId)}</span></div>` : ''}
+        ${component.entryId && !component.entries?.length ? `<div class="detail-line"><b>唯一标识</b><span class="mono">${esc(component.entryId)}</span></div>` : ''}
         ${component.provider ? `<div class="detail-line"><b>提供插件</b><span class="mono">${esc(component.provider)}</span></div>` : ''}
         ${component.phase ? `<div class="detail-line"><b>Fiber 状态</b><span class="mono">${esc(component.phase)}</span></div>` : ''}
       </div>
+      ${renderTechnicalEntries(component)}
       ${configRows.length ? `<div class="detail-sec"><h4>Preset 中的实际参数</h4>${configRows.map(([key, value]) => `<div class="detail-line"><b>${esc(key)}</b><span class="mono">${esc(value)}</span></div>`).join('')}</div>` : ''}
-      <div class="note-bar">这里只展示回读结果，不会修改 DSH。要刷新数据，请重新运行同步脚本。</div>
+      <div class="note-bar">这里只展示回读结果，不会修改 DSH。刷新本机快照后可查看最新组件状态。</div>
     </aside>`;
   }
 
   function renderLibraryDrawer() {
     const query = state.libraryQuery.trim().toLowerCase();
     const counts = Object.fromEntries(Object.keys(TYPE_META).map((type) => [type, ALL_COMPONENTS.filter((item) => item.component.type === type).length]));
-    const nativeRows = ALL_COMPONENTS.filter(({ component, ability, moduleKey }) => !query || `${component.name} ${component.tech} ${component.entryId || ''} ${ability.name} ${MODULES[moduleKey].name}`.toLowerCase().includes(query));
+    const nativeRows = ALL_COMPONENTS.filter(({ component, ability, moduleKey }) => !query || `${component.name} ${component.tech} ${(component.entryIds || [component.entryId || '']).join(' ')} ${ability.name} ${MODULES[moduleKey].name}`.toLowerCase().includes(query));
     const communityRows = COMMUNITY_COMPONENTS.filter((item) => !query || `${item.name} ${item.packageName} ${item.desc} ${MODULES[item.moduleKey].name}`.toLowerCase().includes(query));
     const isCommunity = state.libraryTab === 'community';
+    const verifiedInstallCount = Object.keys(state.verifiedInstalls).length;
     return `<div class="drawer-mask" onclick="closeLibrary()"></div><aside class="drawer wide-drawer" role="dialog" aria-modal="true" tabindex="-1" aria-label="全部组件">
       <button class="d-close" onclick="closeLibrary()" aria-label="关闭">✕</button><h3>组件库</h3>
       <div class="library-tabs" aria-label="组件来源"><button type="button" aria-pressed="${!isCommunity}" class="${!isCommunity ? 'on' : ''}" onclick="setLibraryTab('native')">当前 DSH <span>${ALL_COMPONENTS.length}</span></button><button type="button" aria-pressed="${isCommunity}" class="${isCommunity ? 'on' : ''}" onclick="setLibraryTab('community')">社区预置 <span>${COMMUNITY_COMPONENTS.length}</span></button></div>
-      ${!isCommunity ? `<div class="d-sub">来自本机 DSH 配置快照；状态可以回读。</div><div class="library-counts"><span>插件 ${counts.plugin}</span><span>Skill ${counts.skill}</span><span>工具 ${counts.tool}</span><span>提示词来源 ${counts.prompt}</span></div>` : '<div class="d-sub">来自开源社区的候选目录；均未安装，不能视为当前 Agent 能力。</div>'}
+      ${!isCommunity ? `<div class="d-sub">${counts.plugin} 个插件包：快照含 ${PLUGIN_GROUPS.length} 个，${verifiedInstallCount ? `另有 ${verifiedInstallCount} 个来自本次安装双重回读；` : ''}DSH 快照含 ${SNAPSHOT.plugins.length} 条 Loader 加载记录。</div><div class="library-counts"><span>插件包 ${counts.plugin}</span><span>Skill ${counts.skill}</span><span>工具 ${counts.tool}</span><span>提示词来源 ${counts.prompt}</span></div>` : `<div class="d-sub">来自开源社区的候选目录；${verifiedInstallCount ? `${verifiedInstallCount} 个已在本次会话完成安装清单与活动 Inventory 双重回读，其余仍未安装。` : '当前均未安装，不能视为 Agent 能力。'}</div>`}
       <input class="library-search" value="${esc(state.libraryQuery)}" oninput="filterLibrary(this.value,event)" oncompositionend="filterLibrary(this.value,event)" placeholder="${isCommunity ? '搜索社区插件或用途' : '搜索中文作用、技术名或 entryId'}" aria-label="搜索组件">
       <div class="library-result-note">找到 ${isCommunity ? communityRows.length : nativeRows.length} 个${isCommunity ? '社区候选' : '本机组件'}。</div>
       ${isCommunity
-        ? (communityRows.length ? `<div class="community-library">${communityRows.map((item) => `<article class="community-card"><div class="community-card-top"><span class="source-badge community">社区开源</span><span class="install-state">未安装</span></div><h4>${esc(item.name)}</h4><p>${esc(item.desc)}</p><div class="community-meta"><span>${esc(item.packageName)}</span><span>v${esc(item.version)}</span><span>${esc(item.license)}</span><span>近 7 天 ${formatNumber(item.downloads)} 次下载</span><span>DSH 可安装格式已核对</span></div><div class="community-risk"><b>接入前注意</b><span>${esc(item.risk)}</span></div><div class="community-actions"><a href="https://www.npmjs.com/package/${item.packageName}" target="_blank" rel="noopener">npm 包 ↗</a><a href="${item.repo}" target="_blank" rel="noopener">源码 ↗</a><button type="button" onclick="assessCommunity('${item.id}')">AI 评估</button></div></article>`).join('')}</div>` : '<div class="note-bar">没有找到匹配的社区候选。</div>')
-        : (nativeRows.length ? nativeRows.map(({ moduleKey, ability, component, index }) => `<button type="button" class="library-row" onclick="openLibraryComponent('${moduleKey}','${ability.id}',${index})"><span class="lr-top"><span class="type-ico ${component.type}">${TYPE_META[component.type].short}</span><span class="lr-name">${esc(component.name)}</span><span class="source-badge native">当前回读</span><span class="tag ${component.status === 'using' ? 'ok' : ''}">${esc(componentStatusLabel(component))}</span></span><span class="cr-tech" style="margin:6px 0 0 42px">${esc(component.tech)}${component.entryId ? ` · ${esc(component.entryId)}` : ''}</span><span class="lr-path" style="margin-left:42px">${MODULES[moduleKey].name} → ${ability.name} · ${esc(component.evidence)} · 点击查看详情</span></button>`).join('') : '<div class="note-bar">没有找到匹配组件。</div>')}
+        ? (communityRows.length ? `<div class="community-library">${communityRows.map((item) => { const installed = state.verifiedInstalls[item.packageName]; const pendingInstall = hasRestoredPendingRefresh('pluginInstall', item.packageName); return `<article class="community-card"><div class="community-card-top"><span class="source-badge community">社区开源</span><span class="install-state ${installed ? 'installed' : ''}">${pendingInstall ? '安装状态待核验' : installed ? '已安装并回读' : '未安装'}</span></div><h4>${esc(item.name)}</h4><p>${esc(item.desc)}</p><div class="community-meta"><span>${esc(item.packageName)}</span><span>${pendingInstall ? '当前版本未知' : `v${esc(installed?.version || item.version)}`}</span><span>${esc(item.license)}</span><span>近 7 天 ${formatNumber(item.downloads)} 次下载</span><span>${pendingInstall ? '浏览器标记不作为安装证明' : installed ? 'Manifest + Inventory 已核验' : 'DSH 可安装格式已核对'}</span></div><div class="community-risk"><b>接入前注意</b><span>${esc(item.risk)}</span></div><div class="community-actions"><a href="https://www.npmjs.com/package/${item.packageName}" target="_blank" rel="noopener">npm 包 ↗</a><a href="${item.repo}" target="_blank" rel="noopener">源码 ↗</a><button type="button" onclick="assessCommunity('${item.id}')">AI 评估</button></div></article>`; }).join('')}</div>` : '<div class="note-bar">没有找到匹配的社区候选。</div>')
+        : (nativeRows.length ? nativeRows.map(({ moduleKey, ability, component, index }) => `<button type="button" class="library-row" onclick="openLibraryComponent('${moduleKey}','${ability.id}',${index})"><span class="lr-top"><span class="type-ico ${component.type}">${TYPE_META[component.type].short}</span><span class="lr-name">${esc(component.name)}</span><span class="source-badge native">当前回读</span><span class="tag ${component.status === 'using' ? 'ok' : component.status === 'error' ? 'warn' : ''}">${esc(componentStatusLabel(component))}</span></span><span class="cr-tech" style="margin:6px 0 0 42px">${esc(component.tech)}${component.entryCount > 1 ? ` · ${component.entryCount} 条${component.type === 'plugin' ? '加载记录' : '入口'}` : (component.entryId ? ` · ${esc(component.entryId)}` : '')}</span><span class="lr-path" style="margin-left:42px">${MODULES[moduleKey].name} → ${ability.name} · ${esc(component.evidence)} · 点击查看详情</span></button>`).join('') : '<div class="note-bar">没有找到匹配组件。</div>')}
       ${isCommunity ? '<div class="community-disclaimer">热度仅取 2026-08-20 至 08-26 的 npm 下载量；“预置”表示列入候选目录，不代表安全审查通过。安装前仍需检查源码、权限、版本兼容与组件标识冲突。</div>' : ''}
     </aside>`;
   }
 
   function renderLLM() {
     const model = SNAPSHOT.config.model;
+    if (!fullConfigEvidenceAvailable()) return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: '模型设置' }]) + renderPresetRefreshGate();
     return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: '心智', fn: "openModule('mind')" }, { t: '模型设置' }]) + `<div class="page-head"><h1 class="page-title">当前模型设置 <span class="tag ok">设置已读取</span></h1><div class="page-sub">当前网页配置只有一条默认模型设置。</div></div>
       <section class="metric-grid"><div class="card metric-card"><div class="m-label">模型</div><div class="m-value compact-value">${esc(model.model)}</div><div class="m-note">${esc(model.provider)}</div></div><div class="card metric-card"><div class="m-label">推理强度</div><div class="m-value">${esc(effectiveReasoningEffort())}</div><div class="m-note">当前设置值</div></div><div class="card metric-card"><div class="m-label">上下文窗口</div><div class="m-value">${formatNumber(model.contextWindow)}</div><div class="m-note">模型最多可参考的文字量（token）</div></div><div class="card metric-card"><div class="m-label">输入类型</div><div class="m-value compact-value">${(model.inputModalities || []).map(esc).join(' + ')}</div><div class="m-note">当前模型声明</div></div></section>
-      <div class="card settings-facts"><h3>与运行直接相关的真实参数</h3><div class="settings-grid"><div><b>模型最大输出</b><span>${formatNumber(model.maxTokens)} tokens</span></div><div><b>并行工具调用</b><span>${formatNumber(SNAPSHOT.config.agentLoop.maxParallelToolCalls)} 个</span></div><div><b>Shell 默认超时</b><span>${formatDuration(SNAPSHOT.config.shell.timeoutMs)}</span></div><div><b>Shell 最大超时</b><span>${formatDuration(SNAPSHOT.config.shell.maxTimeoutMs)}</span></div><div><b>网页搜索模型</b><span>${esc(SNAPSHOT.config.webSearch.model || '未记录')}</span></div><div><b>每任务搜索上限</b><span>${formatNumber(SNAPSHOT.config.webSearch.maxUses)} 次</span></div></div></div>
+      <div class="card settings-facts"><h3>与运行直接相关的真实参数</h3><div class="settings-grid"><div><b>模型最大输出</b><span>${formatNumber(model.maxTokens)} tokens</span></div><div><b>并行工具调用</b><span>${formatNumber(SNAPSHOT.config.agentLoop.maxParallelToolCalls)} 个</span></div><div><b>Shell 默认超时</b><span>${formatDuration(SNAPSHOT.config.shell.timeoutMs)}</span></div><div><b>Shell 最大超时</b><span>${formatDuration(SNAPSHOT.config.shell.maxTimeoutMs)}</span></div><div><b>网页搜索模型</b><span>${esc(SNAPSHOT.config.webSearch.model || '未记录')}</span></div><div><b>每任务搜索上限</b><span>${formatNumber(effectiveWebSearchMaxUses())} 次</span></div></div></div>
       <div class="note-bar">DSH 设置接口返回的是脱敏视图；页面没有读取或保存 API Key 明文。</div>`;
   }
 
   function renderFlow() {
     const workflowRows = SNAPSHOT.config.presetRows.filter((row) => /workflow|ralph/.test(`${row.id} ${row.moduleName}`));
+    const currentPreset = effectiveDefaultPreset();
+    if (!fullConfigEvidenceAvailable()) return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: '工作流能力' }]) + renderPresetRefreshGate();
     return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: '心智', fn: "openModule('mind')" }, { t: '工作流能力' }]) + `<div class="page-head"><h1 class="page-title">当前工作流能力 <span class="tag ok">配置已读取</span></h1><div class="page-sub">DSH 已具备运行多步骤任务的底层能力，但当前没有可读取的具体业务流程。</div></div>
-      <section class="map-board simple-map"><div class="map-root-col"><div class="map-col-label">当前完整配置</div><div class="map-root"><div class="root-kicker">${esc(SNAPSHOT.config.activePreset.id)}</div><div class="root-name">${esc(SNAPSHOT.config.activePreset.name)}</div><div class="root-desc">${esc(SNAPSHOT.config.activePreset.description)}</div></div></div><div class="component-col span-two"><div class="map-col-label">工作流组件</div><div class="component-panel"><div class="component-head"><h3>${workflowRows.length} 个组成部分</h3><p>这些组件只是运行工作流的底座，不代表已经配置了具体业务流程。</p></div><div class="component-groups">${workflowRows.map((row) => `<div class="library-row"><div class="lr-top"><span class="type-ico tool">T</span><span class="lr-name">${esc(toolNames[row.id] || humanPluginName({ moduleName: row.moduleName, entryId: row.id }))}</span><span class="tag ${row.enabled ? 'ok' : ''}" style="margin-left:auto">${row.enabled ? '已组装' : '未启用'}</span></div><div class="cr-tech" style="margin:6px 0 0 42px">${esc(row.moduleName)} · ${esc(row.id)}</div>${Object.keys(row.config).length ? `<div class="lr-path" style="margin-left:42px">${Object.entries(row.config).map(([key, value]) => `${esc(key)}=${esc(value)}`).join(' · ')}</div>` : ''}</div>`).join('')}</div></div></div></section>
+      <section class="map-board simple-map"><div class="map-root-col"><div class="map-col-label">当前完整配置</div><div class="map-root"><div class="root-kicker">${esc(currentPreset.id)}</div><div class="root-name">${esc(currentPreset.name)}</div><div class="root-desc">${esc(currentPreset.description || '角色卡说明未写入公开快照。')}</div></div></div><div class="component-col span-two"><div class="map-col-label">工作流组件</div><div class="component-panel"><div class="component-head"><h3>${workflowRows.length} 个组成部分</h3><p>这些组件来自快照中的角色卡组装；切换角色卡后需刷新快照才能核对新的组件清单。</p></div><div class="component-groups">${workflowRows.map((row) => `<div class="library-row"><div class="lr-top"><span class="type-ico tool">T</span><span class="lr-name">${esc(toolNames[row.id] || humanPluginName({ moduleName: row.moduleName, entryId: row.id }))}</span><span class="tag ${row.enabled ? 'ok' : ''}" style="margin-left:auto">${row.enabled ? '已组装' : '未启用'}</span></div><div class="cr-tech" style="margin:6px 0 0 42px">${esc(row.moduleName)} · ${esc(row.id)}</div>${Object.keys(row.config).length ? `<div class="lr-path" style="margin-left:42px">${Object.entries(row.config).map(([key, value]) => `${esc(key)}=${esc(value)}`).join(' · ')}</div>` : ''}</div>`).join('')}</div></div></div></section>
       <div class="note-bar"><b>当前结论：</b>工作流引擎和工具已装配；业务流程库、流程实例与验收记录没有可回读数据，因此不画假的流程图。</div>`;
   }
 
@@ -801,15 +1417,53 @@
     const maxDaily = Math.max(1, ...project.daily.map((day) => day.count));
     const distributionRows = (counts, labelFor) => Object.entries(counts || {}).map(([key, count]) => `<div class="distribution-row"><div><b>${esc(labelFor(key))}</b><span>${count} 个会话</span></div><span class="distribution-track"><i style="width:${project.total ? Math.max(4, count / project.total * 100) : 0}%"></i></span><strong>${project.total ? Math.round(count / project.total * 100) : 0}%</strong></div>`).join('');
     const presetNames = Object.fromEntries((SNAPSHOT.config.presets || []).map((preset) => [preset.id, preset.name || preset.id]));
-    return `<div class="page-head"><h1 class="page-title">运行观测 <span class="tag ok">当前项目记录</span></h1><div class="page-sub">一个“会话”就是一次独立任务或对话。这里展示会话、轮次、步骤、耗时和模型用量；当前数据没有成功或失败结果，所以不展示虚假的完成率。</div><div class="observe-kicker"><span class="tag cy">${esc(project.path)}</span><span class="tag">快照日期 ${esc(String(SNAPSHOT.capturedAt).slice(0, 10))}</span><span class="tag">本机共 ${SNAPSHOT.sessions.all.total} 个会话</span></div></div>
+    const adoption = state.assistantTask?.decision === 'adopted' ? state.assistantTask.adoption : null;
+    const observation = state.assistantTask?.observation;
+    const outcomeLabel = { healthy: '观察正常', degraded: '发现退化', insufficient: '证据不足' };
+    const adoptionPanel = adoption ? `<section class="card adoption-observation"><div><span>最近一次采用</span><h2>${esc(state.assistantTask.candidate?.title || adoption.targetId)}</h2><p>配置版本 ${esc(adoption.readbackTargetRevision)} 已回读一致。${observation?.status === 'observed' ? `新任务观察：${esc(outcomeLabel[observation.outcome] || observation.outcome)}，${observation.taskCount} 个任务。` : observation?.status === 'running' ? '正在读取采用后的新任务证据。' : '尚未把采用后的新任务绑定到这次修改，不能判断线上健康。'}</p></div><div class="adoption-observation-actions"><button type="button" onclick="runPostAdoptionObservation()" ${observation?.status === 'running' ? 'disabled' : ''}>${observation?.status === 'observed' ? '重新观察' : '检查新任务表现'}</button><button type="button" onclick="prepareRollbackCandidate()">准备回滚候选</button></div>${observation?.evidenceRefs?.length ? `<details><summary>观察证据 ${observation.evidenceRefs.length} 条</summary>${observation.evidenceRefs.map((ref) => `<code>${esc(ref)}</code>`).join('')}</details>` : ''}</section>` : '';
+    return `<div class="page-head"><h1 class="page-title">运行观测 <span class="tag ok">当前项目记录</span></h1><div class="page-sub">一个“会话”就是一次独立任务或对话。这里展示会话、轮次、步骤、耗时和模型用量；当前数据没有成功或失败结果，所以不展示虚假的完成率。</div><div class="observe-kicker"><span class="tag cy">${esc(project.path)}</span><span class="tag">快照日期 ${esc(String(SNAPSHOT.capturedAt).slice(0, 10))}</span><span class="tag">本机共 ${SNAPSHOT.sessions.all.total} 个会话</span></div></div>${adoptionPanel}
       <section class="metric-grid" aria-label="运行概览"><div class="card metric-card"><div class="m-label">项目会话</div><div class="m-value">${project.total}</div><div class="m-note">${project.blank} 个尚未开始</div></div><div class="card metric-card"><div class="m-label">真实轮次 / 步骤</div><div class="m-value">${project.stats.turns} / ${project.stats.steps}</div><div class="m-note">来自运行统计</div></div><div class="card metric-card"><div class="m-label">平均记录耗时</div><div class="m-value compact-value">${formatDuration(totalRuntime / nonBlank)}</div><div class="m-note">模型 + 工具；不等于完整等待时间</div></div><div class="card metric-card"><div class="m-label">当前运行中</div><div class="m-value">${project.running}</div><div class="m-note">停止不代表成功或失败</div></div></section>
       <div class="observe-grid"><section class="card run-list"><div class="run-list-head"><h3>会话构成</h3><span class="faint" style="font-size:11px">只展示汇总，不落盘逐会话明细</span></div><div class="distribution-group"><h4>按角色卡</h4>${distributionRows(project.presetCounts, (key) => presetNames[key] || key)}</div><div class="distribution-group"><h4>按权限</h4>${distributionRows(project.permissionCounts, (key) => key)}</div></section>
-      <aside class="card trend-card"><h3>近 7 天会话更新量</h3><div class="page-sub" style="margin-top:2px">按会话 updatedAt 统计，不等同于任务成功量</div><div class="trend-bars" aria-label="近七天会话趋势">${project.daily.map((day) => `<span class="trend-bar" style="height:${Math.max(6, day.count / maxDaily * 100)}%" title="${day.date}: ${day.count}"></span>`).join('')}</div><div class="trend-labels">${project.daily.map((day) => `<span>${day.date.slice(5).replace('-', '/')}</span>`).join('')}</div><div class="note-bar" style="margin-top:14px"><b>累计 token：</b>输入 ${formatNumber(project.stats.uncachedInputTokens)} · 输出 ${formatNumber(project.stats.outputTokens)} · 缓存命中 ${formatNumber(project.stats.cacheReadTokens)}</div></aside></div>`;
+      <aside class="card trend-card"><h3>近 7 天会话更新量</h3><div class="page-sub" style="margin-top:2px">按会话 updatedAt 统计，不等同于任务成功量</div><div class="trend-bars" aria-label="近七天会话趋势">${project.daily.map((day) => `<span class="trend-bar ${day.count === 0 ? 'zero' : ''}" style="height:${day.count === 0 ? 0 : Math.max(6, day.count / maxDaily * 100)}%" title="${day.date}: ${day.count}"></span>`).join('')}</div><div class="trend-labels">${project.daily.map((day) => `<span>${day.date.slice(5).replace('-', '/')}</span>`).join('')}</div><div class="trend-data-list" aria-label="近七天会话更新量明细">${project.daily.map((day) => `<span><b>${day.date.slice(5).replace('-', '/')}</b>${day.count} 次</span>`).join('')}</div><div class="note-bar" style="margin-top:14px"><b>累计 token：</b>输入 ${formatNumber(project.stats.uncachedInputTokens)} · 输出 ${formatNumber(project.stats.outputTokens)} · 缓存命中 ${formatNumber(project.stats.cacheReadTokens)}</div></aside></div>`;
+  }
+
+  function renderComparisonDetails(comparison, suite) {
+    if (!comparison?.caseResults?.length) return '';
+    const caseNames = Object.fromEntries((suite?.cases || []).map((item) => [item.id, item.title]));
+    const statusLabel = { passed: '通过', failed: '失败', error: '错误', timeout: '超时', cancelled: '已取消' };
+    const verdictLabel = { better: '候选更好', same: '表现相同', worse: '候选退化', unscored: '未评分' };
+    return `<details class="comparison-details"><summary>逐题结果与证据 <span>${comparison.caseResults.length}</span></summary><div>${comparison.caseResults.map((item, index) => `<article><span class="comparison-case-index">${String(index + 1).padStart(2, '0')}</span><div><h3>${esc(caseNames[item.caseId] || item.caseId)}</h3><p><b>当前配置：</b>${esc(statusLabel[item.baselineStatus] || item.baselineStatus)}　<b>候选配置：</b>${esc(statusLabel[item.candidateStatus] || item.candidateStatus)}　<span class="tag ${item.verdict === 'worse' ? 'bad' : item.verdict === 'better' ? 'ok' : ''}">${esc(verdictLabel[item.verdict] || item.verdict)}</span></p><details><summary>查看证据引用</summary><code title="${esc(item.baselineEvidenceRef)}">当前：${esc(item.baselineEvidenceRef)}</code><code title="${esc(item.candidateEvidenceRef)}">候选：${esc(item.candidateEvidenceRef)}</code></details></div></article>`).join('')}</div></details>`;
   }
 
   function renderTrial() {
-    return `<div class="page-head"><h1 class="page-title">效果测试 <span class="tag warn">尚无真实测试结果</span></h1><div class="page-sub">当前只能读取配置和运行记录，还没有候选配置版本、固定测试题、评分结果或发布记录。</div></div>
-      <div class="card honest-empty"><div class="empty-mark">◎</div><h2>还不能判断哪套配置更好</h2><p>达到可上线标准至少需要：固定测试题、候选配置版本、隔离运行记录、评价指标和最终采用记录。缺一项，只能标为“未验证”。</p><div class="empty-grid"><span><b>已有</b>插件、角色卡、Skill 和模型设置</span><span><b>已有</b>会话轮次、步骤、耗时与模型用量</span><span class="missing"><b>缺少</b>候选配置版本库</span><span class="missing"><b>缺少</b>测试题与评分结果</span></div></div>`;
+    const task = state.assistantTask;
+    if (!task) return `<div class="page-head"><h1 class="page-title">效果测试 <span class="tag warn">尚无优化任务</span></h1><div class="page-sub">先让 DS Hub 助手定位问题并形成候选，再用固定测试集比较当前配置与候选配置。</div></div>
+      <div class="card honest-empty"><div class="empty-mark">◎</div><h2>从一个真实问题开始</h2><p>助手会依次完成：找原因、形成候选、准备测试、隔离对比，最后由你决定是否采用。没有真实运行证据时不会显示通过率。</p><div class="empty-actions"><button type="button" onclick="askAssistant('diagnose')">检查当前配置</button><button type="button" onclick="askAssistant('full')">开始完整优化</button></div></div>`;
+    const progress = assistantTaskProgress(task);
+    const candidate = task.candidate;
+    const suite = task.testSuite;
+    const comparison = task.comparison;
+    const comparisonVerified = Boolean(comparison?.status === 'completed' && comparison.verified && comparison.environmentAligned && comparison.targetAligned);
+    const canAdopt = adoptionReady(task);
+    const adoptionActions = state.adoptionConfirming
+      ? `<div class="adoption-confirm"><p>把已通过测试的候选用于新任务。将修改“${esc(candidate?.target || candidate?.title || '当前配置')}”，当前正在运行的任务不会改变。确认采用并回读吗？</p><div class="adoption-confirm-actions"><button type="button" onclick="cancelAdoptionConfirm()">取消</button><button type="button" class="primary" onclick="adoptAssistantCandidate()">确认采用并回读</button></div></div>`
+      : `<div class="adoption-actions"><button type="button" onclick="abandonAssistantCandidate()" ${!candidate || task.decision ? 'disabled' : ''}>放弃候选</button><button type="button" class="primary" onclick="prepareAdoption()" ${!canAdopt || task.decision ? 'disabled' : ''}>采用候选</button></div>`;
+    const decidedActions = task.decision === 'adopted'
+      ? '<div class="adoption-actions"><button type="button" onclick="goObserve()">查看线上观察</button><button type="button" onclick="prepareRollbackCandidate()">准备回滚候选</button></div>'
+      : task.decision === 'unknown'
+        ? '<div class="adoption-actions"><button type="button" onclick="recheckUnknownAdoption()">重新读取当前值</button></div>'
+        : '';
+    return `<div class="page-head trial-head"><div><h1 class="page-title">效果测试 <span class="tag cy">${esc(task.title)}</span></h1><div class="page-sub">当前配置保持不变；候选只在隔离环境中与当前配置做公平对比。</div></div><button type="button" onclick="openAssistant()">继续和助手讨论</button></div>
+      <section class="card optimization-progress" aria-label="优化进度"><div><span>当前优化任务</span><b>${esc(task.goal)}</b></div><div class="op-steps">${ASSISTANT_TASK_STEPS.map((label, index) => `<span class="${index < progress ? 'done' : index === progress ? 'on' : ''}"><i>${index < progress ? '✓' : index + 1}</i><b>${label}</b></span>`).join('')}</div></section>
+      <div class="trial-workbench"><section class="card trial-section"><div class="trial-section-head"><div><span>候选配置</span><h2>${candidate ? esc(candidate.title) : '尚未生成'}</h2></div><span class="tag ${candidate ? 'cy' : ''}">${candidate ? '候选，未采用' : '等待方案'}</span></div>${candidate ? `<div class="trial-diff"><span><small>当前</small><b>${esc(candidate.oldValueDisplay ?? candidateValueDisplay(candidate.key, candidate.oldValue))}</b></span><i>→</i><span><small>候选</small><b>${esc(candidate.newValueDisplay ?? candidateValueDisplay(candidate.key, candidate.expectedValue))}</b></span></div><p>${esc(candidate.impact)}</p>` : `<div class="trial-empty">先让助手基于证据生成一项最小候选。<button type="button" onclick="askAssistant('config')">生成候选</button></div>`}</section>
+      <section class="card trial-section"><div class="trial-section-head"><div><span>固定测试集</span><h2>${suite ? esc(suite.name) : '尚未准备'}</h2></div><span class="tag ${suite?.status === 'locked' ? 'ok' : 'warn'}">${suite ? (suite.status === 'locked' ? '已锁定' : 'AI 生成 · 待检查') : '等待测试题'}</span></div>${suite ? `<div class="test-case-list">${suite.cases.map((item, index) => `<article><span>${String(index + 1).padStart(2, '0')}</span><div><b>${esc(item.title)}</b><p><strong>输入：</strong>${esc(item.input)}</p><p><strong>通过条件：</strong>${esc(item.expectedBehavior)}</p><small>${item.source === 'ai_generated' ? 'AI 生成' : '人工提供'} · ${item.priority === 'critical' ? '关键题' : '普通题'}</small></div></article>`).join('')}</div><div class="acceptance-rule"><b>采用门槛</b><span>关键题全部通过 · 全部测试通过率 100%</span></div>${suite.status === 'draft' ? '<button type="button" class="trial-primary" onclick="lockAssistantTestSuite()">我已逐题检查输入与通过条件，锁定测试集</button>' : `<div class="trial-note">测试集已锁定（${esc(suite.contentHash || '内容指纹缺失')}）；修改题目会创建新版本，不能覆盖本次对比依据。</div>`}` : `<div class="trial-empty">测试题必须写清“什么算通过”。<button type="button" onclick="askAssistant('testset')">让助手生成</button></div>`}</section></div>
+      <section class="card comparison-section"><div class="trial-section-head"><div><span>隔离回归</span><h2>当前配置 vs 候选配置</h2></div><span class="tag ${comparisonVerified ? 'ok' : 'warn'}">${comparison?.status === 'completed' ? (comparisonVerified ? '运行完成 · 证据已核验' : '结果已返回 · 证据未通过') : state.regressionRunning ? '运行中' : '尚未运行'}</span></div>
+        ${comparison?.status === 'completed' ? `<div class="comparison-summary"><span><small>测试题</small><b>${comparison.summary.total}</b></span><span><small>候选改善</small><b>${comparison.summary.improved}</b></span><span class="${comparison.summary.regressed ? 'bad' : ''}"><small>退化</small><b>${comparison.summary.regressed}</b></span><span class="${comparison.summary.criticalFailures ? 'bad' : ''}"><small>关键失败</small><b>${comparison.summary.criticalFailures}</b></span></div><div class="trial-note">${comparisonVerified ? '运行证据完整，且两边模型环境、目标配置回读与沙箱规则均已绑定。' : '回归结果已返回，但证据、模型环境或目标配置回读不完整，不能据此采用候选。'}</div>${renderComparisonDetails(comparison, suite)}`
+          : state.regressionRunning ? '<div class="trial-running"><i></i><span>正在隔离运行当前与候选配置；不会修改当前 Agent。</span></div>'
+            : state.regressionConfirming ? `<div class="regression-confirm"><p>这会创建隔离会话并产生模型用量。当前与候选都将运行 ${suite?.cases.length || 0} 道题${candidate?.kind === 'plugin' ? `，并在隔离测试配置中准备 ${esc(candidate.packageName)}@${esc(candidate.version)}` : ''}。确认继续吗？</p><button type="button" onclick="cancelRegressionConfirm()">取消</button><button type="button" class="primary" onclick="runAssistantRegression()">确认运行</button></div>`
+              : `<div class="trial-empty">${!candidate ? '缺少候选配置。' : !suite ? '缺少固定测试集。' : suite.status !== 'locked' ? '测试集尚未锁定。' : optimizationAdapterReady() && configTargetReaderReady() ? '已具备运行条件；开始前会分别锁定目标配置与模型环境。' : optimizationAdapterReady() ? '回归已连接，但目标配置读取接口尚未连接。' : '回归执行器尚未连接，不会生成虚假的测试结果。'}${candidate && suite?.status === 'locked' ? '<button type="button" onclick="prepareRegression()">准备运行回归</button>' : ''}</div>`}
+      </section>
+      <section class="card adoption-section"><div class="adoption-copy"><span>采用决策</span><h2>${task.decision === 'adopted' ? (task.observation?.outcome === 'healthy' ? '已采用，线上观察正常' : task.observation?.outcome === 'degraded' ? '已采用，但线上发现退化' : '已采用，等待线上观察') : task.decision === 'abandoned' ? '已放弃候选' : task.decision === 'unknown' ? '写入状态未知，已停止继续操作' : '由你决定，不自动上线'}</h2><p>${task.decision === 'unknown' ? '写入请求已经发出，但配置版本回读没有确认；不要重复提交，可重新读取当前值辅助人工核对。' : task.decision === 'adopted' ? '回读一致只证明配置写入；必须绑定采用时的配置版本与新任务证据后，才能判断表现。' : canAdopt ? '回归证据满足采用门槛；采用仍会单独确认并在写入后回读。' : '测试集锁定、两边真实运行完成、环境一致且达到测试集通过标准后，才开放采用。'}</p></div>${task.decision ? decidedActions : adoptionActions}</section>`;
   }
 
   function renderAssistantMessage(message, index) {
@@ -821,9 +1475,8 @@
   function renderAssistantProposal() {
     const proposal = state.assistantProposal;
     if (!proposal) return '';
-    const canWrite = configAdapterReady();
     let outcome = '';
-    if (proposal.status === 'draft') outcome = '<div class="cp-applied draft"><b>已加入候选方案</b><span>没有写入真实 DSH；可继续讨论或等待后端接入。</span></div>';
+    if (proposal.status === 'draft') outcome = '<div class="cp-applied draft"><b>已保存为候选</b><span>当前 DSH 配置没有变化；下一步先用固定测试集隔离回归。</span></div>';
     if (proposal.status === 'applying') outcome = '<div class="cp-progress"><b>正在检查并提交</b><span>请勿重复操作。</span></div>';
     if (proposal.status === 'verified') outcome = `<div class="cp-applied"><b>写入已完成并回读一致</b><span>${esc(proposal.readbackValue ?? proposal.newValue)}</span></div>`;
     if (proposal.status === 'submitted-unverified') outcome = '<div class="cp-unknown"><b>写入请求已返回，但回读未确认</b><span>真实状态未知；先核对设置，不要重复提交。</span></div>';
@@ -834,9 +1487,9 @@
             : ['当前', '建议'];
     return `<section class="change-proposal" aria-label="候选配置修改"><div class="cp-head"><span>候选修改</span><span class="confidence ${proposal.level}">${esc(proposal.confidence)}</span></div><h3>${esc(proposal.title)}</h3>
       <div class="cp-target"><span>修改位置</span><b>${esc(proposal.target)}</b></div>
-      <div class="cp-diff"><span><small>${diffLabels[0]}</small><b>${esc(proposal.oldValue)}</b></span><i>→</i><span class="new"><small>${diffLabels[1]}</small><b>${esc(proposal.readbackValue ?? proposal.newValue)}</b></span></div>
+      <div class="cp-diff"><span><small>${diffLabels[0]}</small><b>${esc(proposal.oldValueDisplay ?? candidateValueDisplay(proposal.key, proposal.oldValue))}</b></span><i>→</i><span class="new"><small>${diffLabels[1]}</small><b>${esc(proposal.readbackValue != null ? candidateValueDisplay(proposal.key, proposal.readbackValue) : (proposal.newValueDisplay ?? proposal.newValue))}</b></span></div>
       <p>${esc(proposal.impact)}</p><details><summary>正式写入前必须通过</summary><ul>${proposal.checks.map((item) => `<li>${esc(item)}</li>`).join('')}</ul></details>
-      ${outcome || (state.assistantConfirming ? `<div class="cp-confirm"><p>${canWrite ? '只写入上面这一项，并在写入后回读。确认继续吗？' : '只把上面这一项加入页面候选方案；不会写入 DSH。确认继续吗？'}</p><button type="button" onclick="cancelAssistantConfirm()">取消</button><button type="button" class="primary" onclick="applyAssistantProposal()">${canWrite ? '确认写入并回读' : '加入候选方案'}</button></div>` : `<div class="cp-actions"><button type="button" onclick="dismissAssistantProposal()">暂不处理</button><button type="button" class="primary" onclick="prepareAssistantProposal()">${canWrite ? '预览并确认' : '保存为候选'}</button></div>`)}
+      ${outcome || (state.assistantConfirming ? `<div class="cp-confirm"><p>保存为隔离测试候选；当前 DSH 配置不会改变。确认继续吗？</p><button type="button" onclick="cancelAssistantConfirm()">取消</button><button type="button" class="primary" onclick="applyAssistantProposal()">保存候选</button></div>` : `<div class="cp-actions"><button type="button" onclick="dismissAssistantProposal()">暂不处理</button><button type="button" class="primary" onclick="prepareAssistantProposal()">保存为候选</button></div>`)}
     </section>`;
   }
 
@@ -845,36 +1498,231 @@
     return Boolean(adapter && typeof adapter.preflight === 'function' && typeof adapter.apply === 'function' && typeof adapter.readback === 'function');
   }
 
-  function aiAdapterReady() {
+  function configTargetReaderReady() {
+    return Boolean(window.DS_HUB_CONFIG_ADAPTER && typeof window.DS_HUB_CONFIG_ADAPTER.preflight === 'function');
+  }
+
+  function aiAdapterPresent() {
     return Boolean(window.DS_HUB_AI_ADAPTER && typeof window.DS_HUB_AI_ADAPTER.ask === 'function');
   }
 
-  function normalizeProposal(raw) {
+  function aiAdapterReady() {
+    const adapter = window.DS_HUB_AI_ADAPTER;
+    return Boolean(adapter && typeof adapter.ask === 'function' && typeof adapter.describeEnvironment === 'function');
+  }
+
+  function normalizeModelSelection(value) {
+    if (!value || typeof value !== 'object') return null;
+    const provider = String(value.provider || '').trim();
+    const model = String(value.model || '').trim();
+    const reasoningEffort = String(value.reasoningEffort || '').trim();
+    if (!provider || !model) return null;
+    return { provider, model, ...(reasoningEffort ? { reasoningEffort } : {}) };
+  }
+
+  function sameModelSelection(actual, expected, includeReasoning = false) {
+    if (!actual || !expected || actual.provider !== expected.provider || actual.model !== expected.model) return false;
+    return !includeReasoning || String(actual.reasoningEffort || '') === String(expected.reasoningEffort || '');
+  }
+
+  function sameExactModelSelection(actual, expected) {
+    return Boolean(actual && expected
+      && actual.provider === expected.provider
+      && actual.model === expected.model
+      && String(actual.reasoningEffort || '') === String(expected.reasoningEffort || ''));
+  }
+
+  function canonicalValueEqual(actual, expected) {
+    return typeof actual === typeof expected && Object.is(actual, expected);
+  }
+
+  function candidateValueDisplay(key, value) {
+    if (key === 'permissionDefault') return quickPermissionLabel(value);
+    if (key === 'reasoningEffort') return quickReasoningLabel(value);
+    if (key === 'busyEnter') return value === 'queue' ? '排队等待' : value === 'steer' ? '引导当前任务' : String(value ?? '未记录');
+    if (key === 'defaultPresetId') {
+      const preset = SNAPSHOT.config.presets.find((item) => item.id === value);
+      return preset ? `${preset.name}（${preset.id}）` : String(value ?? '未记录');
+    }
+    if (key === 'webSearchMaxUses') return `每任务最多 ${value} 次`;
+    if (key === 'pluginInstall' && value === 'absent') return '未安装';
+    return String(value ?? '未记录');
+  }
+
+  function normalizeTargetSnapshot(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const targetId = String(raw.targetId || '').trim();
+    const revision = raw.targetRevision ?? raw.revision;
+    const hasCanonicalValue = Object.prototype.hasOwnProperty.call(raw, 'canonicalValue');
+    const value = raw.canonicalValue;
+    const evidenceRef = String(raw.evidenceRef || '').trim();
+    if (!targetId || revision == null || !hasCanonicalValue || !evidenceRef) return null;
+    return { targetId, revision, value, evidenceRef };
+  }
+
+  function sameTargetSnapshot(actual, expected) {
+    return Boolean(actual && expected
+      && actual.targetId === expected.targetId
+      && String(actual.revision) === String(expected.revision)
+      && canonicalValueEqual(actual.value, expected.value));
+  }
+
+  function modelEnvironmentSnapshot(environment) {
+    if (!environment?.selection || environment.revision == null) return null;
+    const selection = normalizeModelSelection(environment.selection);
+    const evidenceRef = String(environment.evidenceRef || '').trim();
+    const targetId = String(environment.targetId || '').trim();
+    if (!selection || !targetId || !evidenceRef) return null;
+    return {
+      targetId,
+      revision: environment.revision,
+      selection,
+      evidenceRef,
+    };
+  }
+
+  function sameModelEnvironmentSnapshot(actual, expected) {
+    return Boolean(actual && expected
+      && actual.targetId === expected.targetId
+      && String(actual.revision) === String(expected.revision)
+      && sameExactModelSelection(actual.selection, expected.selection));
+  }
+
+  function assistantEnvironmentLabel() {
+    const environment = state.assistantEnvironment;
+    const selection = environment?.selection || SNAPSHOT.config.model;
+    if (environment?.status === 'synced') return `跟随 DSH · ${selection.provider} / ${selection.model}`;
+    if (environment?.status === 'mismatch') return '模型来源未核验，已拦截';
+    if (environment?.status === 'checking') return '正在核对 DSH Provider';
+    if (environment?.status === 'error') return 'DSH Provider 核验失败';
+    if (aiAdapterPresent() && !aiAdapterReady()) return 'Provider 无法核验';
+    if (aiAdapterReady()) return '发送前核对 DSH Provider';
+    return `DSH 未连接 · 快照 ${selection.provider}`;
+  }
+
+  async function describeAssistantEnvironment(signal) {
+    const raw = await window.DS_HUB_AI_ADAPTER.describeEnvironment({ signal });
+    const selection = normalizeModelSelection(raw?.selection);
+    const revision = raw?.settingsRevision ?? raw?.revision;
+    const targetId = String(raw?.targetId || '').trim();
+    const evidenceRef = String(raw?.evidenceRef || '').trim();
+    if (!selection) throw new Error('DSH 没有返回可核验的 provider 与 model');
+    if (revision == null) throw new Error('DSH 没有返回可核验的 settings revision');
+    if (!targetId) throw new Error('DSH 没有返回模型环境 targetId');
+    if (!evidenceRef) throw new Error('DSH 没有返回模型环境读取证据');
+    if (raw?.routable === false) throw new Error(`DSH 当前模型不可路由：${selection.provider} / ${selection.model}`);
+    state.assistantEnvironment = {
+      status: 'checking',
+      source: raw?.source || 'dsh-agent-default-model',
+      targetId,
+      revision,
+      selection,
+      evidenceRef,
+    };
+    return { ...raw, targetId, revision, selection, evidenceRef };
+  }
+
+  function verifyAssistantEnvironment(result, expectedEnvironment, expectedRequest) {
+    const proof = result?.environment;
+    const expected = expectedEnvironment.selection;
+    const selected = normalizeModelSelection(proof?.selected);
+    const requestHeader = normalizeModelSelection(proof?.requestHeader);
+    const responseProvenance = normalizeModelSelection(proof?.responseProvenance);
+    const proofRevision = proof?.settingsRevision;
+    const proofModelEnvironment = modelEnvironmentSnapshot(proof?.modelEnvironment);
+    const requestId = String(proof?.requestId || '').trim();
+    const proofRun = {
+      runId: String(proof?.runId || '').trim(),
+      sessionId: String(proof?.sessionId || '').trim(),
+      turn: proof?.turn == null ? '' : String(proof.turn),
+    };
+    const boundEvidence = [
+      normalizeEvidenceBinding(proof?.selected?.evidence, proofRun, null, 'session/selection', requestId),
+      normalizeEvidenceBinding(proof?.requestHeader?.evidence, proofRun, null, 'request/header', requestId),
+      normalizeEvidenceBinding(proof?.responseProvenance?.evidence, proofRun, null, 'assistant/message', requestId),
+      normalizeEvidenceBinding(proof?.turnEnd?.evidence, proofRun, null, 'turn/end', requestId),
+    ];
+    const evidenceRefs = boundEvidence.filter(Boolean).map((item) => item.ref);
+    const [selectionEvidence, requestEvidence, responseEvidence, turnEndEvidence] = boundEvidence;
+    const causalChain = Boolean(selectionEvidence && requestEvidence && responseEvidence && turnEndEvidence)
+      && requestEvidence.seq < responseEvidence.seq
+      && responseEvidence.seq < turnEndEvidence.seq
+      && requestEvidence.parentRef === selectionEvidence.ref
+      && responseEvidence.parentRef === requestEvidence.ref
+      && turnEndEvidence.parentRef === responseEvidence.ref;
+    const evidenceComplete = Boolean(proofRun.runId && proofRun.sessionId && proofRun.turn)
+      && boundEvidence.every(Boolean)
+      && new Set(evidenceRefs).size === evidenceRefs.length
+      && causalChain
+      && proof?.responseProvenance?.kind === 'model'
+      && proof?.turnEnd?.reason === 'completed';
+    const valid = requestId === expectedRequest.requestId
+      && proof?.conversationId === expectedRequest.conversationId
+      && proof?.messageDigest === expectedRequest.messageDigest
+      && sameModelEnvironmentSnapshot(proofModelEnvironment, modelEnvironmentSnapshot(expectedEnvironment))
+      && proofModelEnvironment?.evidenceRef === expectedEnvironment.evidenceRef
+      && !evidenceRefs.includes(expectedEnvironment.evidenceRef)
+      && sameExactModelSelection(selected, expected)
+      && sameExactModelSelection(requestHeader, expected)
+      && sameModelSelection(responseProvenance, expected, false)
+      && evidenceComplete
+      && proofRevision != null
+      && String(proofRevision) === String(expectedEnvironment.revision);
+    if (!valid) {
+      state.assistantEnvironment = { status: 'mismatch', selection: expected, proof };
+      throw new Error('DSH 会话选择、请求头、实际响应或完成事件的独立证据不一致，回答已拦截');
+    }
+    state.assistantEnvironment = {
+      status: 'synced',
+      source: expectedEnvironment.source || 'dsh-agent-default-model',
+      revision: proofRevision,
+      selection: expected,
+      proof,
+    };
+  }
+
+  function normalizeProposal(raw, expectedArea = state.assistantTask?.configArea) {
     if (!raw || typeof raw !== 'object') return null;
     const policy = PROPOSAL_POLICIES[raw.key];
     if (!policy) return null;
-    const writeValue = String(raw.writeValue ?? raw.expectedValue ?? raw.newValue ?? '');
+    if (hasRestoredPendingRefresh(raw.key)) return null;
+    if (expectedArea && policy.configArea !== expectedArea) return null;
+    const rawWriteValue = raw.writeValue ?? raw.expectedValue ?? raw.newValue ?? '';
+    const writeValue = policy.valueType === 'positive-integer' ? Number(rawWriteValue) : String(rawWriteValue);
+    if (policy.valueType === 'positive-integer' && (!Number.isInteger(writeValue) || writeValue <= 0)) return null;
     if (!policy.allowedValues.includes(writeValue)) return null;
     const currentValues = {
       permissionDefault: state.appliedOverrides.permissionDefault ?? SNAPSHOT.config.permission.defaultPreset ?? '未记录',
       reasoningEffort: state.appliedOverrides.reasoningEffort ?? SNAPSHOT.config.model.reasoningEffort ?? '未记录',
+      busyEnter: state.appliedOverrides.busyEnter ?? SNAPSHOT.config.conversation.busyEnter ?? '未记录',
+      defaultPresetId: state.appliedOverrides.defaultPresetId ?? SNAPSHOT.config.defaultPresetId ?? SNAPSHOT.config.activePreset.id,
+      webSearchMaxUses: state.appliedOverrides.webSearchMaxUses ?? SNAPSHOT_WEB_SEARCH_MAX_USES,
     };
-    if (String(currentValues[raw.key]) === writeValue) return { noOp: true, key: raw.key, target: policy.target, value: writeValue };
+    if (typeof currentValues[raw.key] === typeof writeValue && Object.is(currentValues[raw.key], writeValue)) {
+      return { noOp: true, key: raw.key, target: policy.target, value: writeValue };
+    }
     const level = raw.level === 'high' ? 'high' : 'medium';
     const clean = (value, fallback, max = 160) => String(value || fallback).replace(/\s+/g, ' ').trim().slice(0, max);
     return {
       id: raw.id || `proposal-${Date.now()}-${++proposalCounter}`,
       key: raw.key,
       target: policy.target,
+      targetId: policy.targetId,
       title: clean(raw.title, '候选配置修改', 56),
       confidence: clean(raw.confidence, level === 'high' ? '高可信' : '中可信', 12),
       level,
-      oldValue: String(currentValues[raw.key]),
+      oldValue: currentValues[raw.key],
+      expectedOldValue: currentValues[raw.key],
+      oldValueDisplay: candidateValueDisplay(raw.key, currentValues[raw.key]),
       newValue: clean(raw.newValue, writeValue, 64),
+      newValueDisplay: clean(raw.newValue, candidateValueDisplay(raw.key, writeValue), 64),
       writeValue,
       expectedValue: writeValue,
       impact: clean(raw.impact, '需要在隔离任务中验证实际影响。', 220),
       checks: policy.checks,
+      configArea: policy.configArea,
+      targetModule: policy.targetModule,
+      targetCapability: policy.targetCapability,
     };
   }
 
@@ -884,28 +1732,194 @@
 
   function renderSavedPlans() {
     if (!state.assistantPlans.length) return '';
-    const statusLabel = { candidate: '已替换', draft: '候选，未写入', verified: '已写入并回读', 'submitted-unverified': '状态未知' };
-    return `<details class="saved-plans"><summary>方案与修改记录 <span>${state.assistantPlans.length}</span></summary>${state.assistantPlans.map((plan) => `<div><b>${esc(plan.title)}</b><span>修改前 ${esc(plan.oldValue)} · ${esc(statusLabel[plan.status] || '候选')} ${esc(plan.readbackValue ?? plan.newValue)}</span></div>`).join('')}</details>`;
+    const statusLabel = { candidate: '已替换', draft: '候选，未写入', verified: '已写入并回读', abandoned: '已放弃', 'submitted-unverified': '状态未知', historical: '历史记录，不作当前证据' };
+    return `<details class="saved-plans"><summary>方案与修改记录 <span>${state.assistantPlans.length}</span></summary>${state.assistantPlans.map((plan) => {
+      const summary = plan.valuesWithheld
+        ? `${plan.target || '配置位置'} · 历史记录，不作当前证据 · 配置值未恢复`
+        : `修改前 ${plan.oldValueDisplay ?? candidateValueDisplay(plan.key, plan.oldValue)} · ${statusLabel[plan.status] || '候选'} ${plan.readbackValue != null ? candidateValueDisplay(plan.key, plan.readbackValue) : (plan.newValueDisplay ?? plan.newValue)}`;
+      return `<div><b>${esc(plan.title)}</b><span>${esc(summary)}</span></div>`;
+    }).join('')}</details>`;
+  }
+
+  const ASSISTANT_TASK_STEPS = ['找原因', '选方案', '准备测试', '对比结果', '采用回读', '线上观察'];
+  const MIN_OBSERVATION_TASKS = 3;
+
+  function startAssistantTask(type, options = {}) {
+    const definitions = {
+      diagnose: ['检查当前配置', '从配置与运行数据中找到最值得先处理的问题'],
+      community: ['搜索社区插件', '按能力缺口、兼容性和风险筛选开源候选'],
+      config: ['形成候选配置', '生成一项最小、可回退且可测试的配置方案'],
+      testset: ['构建测试集', '把问题、正常场景和边界情况整理成可复用测试题'],
+      regression: ['对比当前与候选', '用同一测试集和模型环境运行隔离回归'],
+      full: ['完成一次配置优化', '从问题诊断一直推进到回归对比与采用决策'],
+    };
+    const [title, goal] = definitions[type] || definitions.diagnose;
+    if (options.forceNew) {
+      state.assistantProposal = null;
+      state.assistantConfirming = false;
+      state.regressionConfirming = false;
+      state.adoptionConfirming = false;
+    }
+    const sameArea = !options.configArea || state.assistantTask?.configArea === options.configArea;
+    const canContinue = !options.forceNew && state.assistantTask && ['config', 'testset', 'regression'].includes(type) && state.assistantTask.status !== 'complete' && !state.assistantTask.decision && sameArea;
+    if (canContinue) {
+      state.assistantTask.type = type;
+      if (options.configArea) {
+        state.assistantTask.configArea = options.configArea;
+        state.assistantTask.targetModule = options.targetModule;
+        state.assistantTask.targetCapability = options.targetCapability;
+      }
+      if (!state.assistantTask.candidate) {
+        state.assistantTask.title = title;
+        state.assistantTask.goal = goal;
+      }
+      return state.assistantTask;
+    }
+    state.assistantTask = {
+      id: `optimization-${Date.now()}-${++assistantTaskCounter}`,
+      type,
+      title,
+      goal,
+      status: 'active',
+      diagnosis: null,
+      pluginCandidates: [],
+      candidate: null,
+      testSuite: null,
+      comparison: null,
+      decision: null,
+      evidenceRefs: [],
+      configArea: options.configArea || null,
+      targetModule: options.targetModule || null,
+      targetCapability: options.targetCapability || null,
+    };
+    return state.assistantTask;
+  }
+
+  function invalidateAfterCandidateChange(task) {
+    if (!task) return;
+    task.testSuite = null;
+    task.comparison = null;
+    task.decision = null;
+    task.adoption = null;
+    task.status = 'active';
+    state.regressionConfirming = false;
+    state.adoptionConfirming = false;
+  }
+
+  function invalidateAfterTestSuiteChange(task) {
+    if (!task) return;
+    task.comparison = null;
+    task.decision = null;
+    task.adoption = null;
+    task.status = 'active';
+    state.regressionConfirming = false;
+    state.adoptionConfirming = false;
+  }
+
+  function assistantTaskProgress(task) {
+    if (!task) return 0;
+    if (task.decision === 'adopted' && task.observation?.status === 'observed' && task.observation?.outcome !== 'insufficient') return 6;
+    if (task.decision === 'adopted') return 5;
+    if (task.decision) return 4;
+    if (task.comparison?.verified && task.comparison?.environmentAligned && task.comparison?.targetAligned) return 4;
+    if (task.comparison) return 3;
+    if (task.testSuite) return 3;
+    if (task.candidate) return 2;
+    if (task.pluginCandidates?.length) return 1;
+    if (task.diagnosis) return 1;
+    return 0;
+  }
+
+  function assistantTaskSummary(task) {
+    if (task.decision === 'adopted' && task.observation?.outcome === 'healthy') return `候选已采用；${task.observation.taskCount} 个新任务的观察证据显示正常。`;
+    if (task.decision === 'adopted' && task.observation?.outcome === 'degraded') return `候选已采用，但 ${task.observation.taskCount} 个新任务中发现退化，建议准备回滚。`;
+    if (task.decision === 'adopted') return '候选已采用并回读一致，等待新任务验证线上表现。';
+    if (task.decision === 'abandoned') return '候选已放弃，当前配置保持不变。';
+    if (task.comparison?.status === 'completed') return task.comparison.verified
+      ? `对比已完成并核验证据：${task.comparison.summary?.regressed || 0} 项退化，等待决定。`
+      : '回归结果已返回，但证据未通过核验，不能进入采用。';
+    if (task.testSuite) return `${task.testSuite.cases.length} 道测试题${task.testSuite.status === 'locked' ? '已锁定，可以运行对比。' : '待检查，尚不能正式回归。'}`;
+    if (task.candidate) return `候选“${task.candidate.title}”已保存，当前配置没有变化。`;
+    if (task.pluginCandidates?.length) return `找到 ${task.pluginCandidates.length} 个候选；先核对兼容性、权限和数据外发。`;
+    if (task.diagnosis) return task.diagnosis.summary;
+    return '等待助手先读取证据并定位问题。';
+  }
+
+  function renderAssistantTask() {
+    const task = state.assistantTask;
+    if (!task) return '';
+    const progress = assistantTaskProgress(task);
+    const needsQuickChoice = Boolean(task.configArea && task.configArea !== 'plugins' && !task.candidate);
+    const pluginResults = task.pluginCandidates?.length ? `<div class="at-plugin-list"><div class="at-plugin-source">${task.pluginSearchSource === 'live_verified' ? '社区实时结果 · 来源证据齐全' : task.pluginSearchSource === 'preloaded' ? '本地预置候选' : '助手返回 · 来源待核对'}</div>${task.pluginCandidates.map((item, index) => `<article><div><b>${esc(item.name)}</b><small>${esc(item.packageName)}${item.version ? ` · ${esc(item.version)}` : ''} · ${esc(item.license)} · 兼容性 ${esc(item.compatibility)}</small><p>${esc(item.desc)}</p><p>风险：${esc(item.risk)} · 核对于 ${esc(item.verifiedAt || '待核对')}</p>${item.liveVerified ? `<p class="at-evidence"><a href="${esc(item.versionEvidenceUrl)}" target="_blank" rel="noopener noreferrer">版本证据</a><a href="${esc(item.compatibilityEvidenceUrl)}" target="_blank" rel="noopener noreferrer">兼容性证据</a></p>` : ''}</div><div class="at-plugin-actions">${item.repo ? `<a href="${esc(item.repo)}" target="_blank" rel="noopener noreferrer">查看仓库</a>` : '<span>来源待核对</span>'}${task.pluginSearchSource === 'live_verified' && item.liveVerified && ['verified', 'compatible', 'declared'].includes(item.compatibility) ? `<button type="button" onclick="preparePluginCandidate(${index})">选择此插件</button>` : '<span>暂不能进入测试</span>'}</div></article>`).join('')}</div>` : '';
+    const nextLabel = task.decision === 'adopted' ? (task.observation?.status === 'observed' ? '查看线上观察' : '去观察新任务')
+      : task.decision === 'unknown' ? '核对未知写入'
+      : task.type === 'community' && task.pluginCandidates?.length ? (task.pluginSearchSource === 'live_verified' ? '先选择一个插件' : '查看插件候选')
+      : task.candidate && !task.testSuite ? '生成测试集'
+        : needsQuickChoice ? '回到快速配置选择'
+        : !task.diagnosis ? '开始找原因'
+        : !task.candidate ? '生成候选方案'
+          : !task.testSuite ? '生成测试集'
+            : '打开效果测试';
+    const nextAction = task.decision === 'adopted' ? 'closeAssistant();goObserve()'
+      : task.decision === 'unknown' ? 'closeAssistant();goTrial()'
+      : task.type === 'community' && task.pluginCandidates?.length ? (task.pluginSearchSource === 'live_verified' ? "toast('请在上方选择一个插件加入测试方案')" : "openLibrary('community')")
+      : task.candidate && !task.testSuite ? "askAssistant('testset')"
+        : needsQuickChoice ? 'closeAssistant();goQuick()'
+        : !task.diagnosis ? "askAssistant('diagnose')"
+        : !task.candidate ? "askAssistant('config')"
+          : !task.testSuite ? "askAssistant('testset')"
+            : 'openOptimizationWorkbench()';
+    return `<section class="assistant-task-card" aria-label="当前优化任务"><div class="at-head"><span>当前任务</span><b>${esc(task.title)}</b></div><div class="at-steps">${ASSISTANT_TASK_STEPS.map((label, index) => `<span class="${index < progress ? 'done' : index === progress ? 'on' : ''}"><i>${index < progress ? '✓' : index + 1}</i><b>${label}</b></span>`).join('')}</div><p>${esc(assistantTaskSummary(task))}</p>${pluginResults}<button type="button" onclick="${nextAction}">${esc(nextLabel)} →</button></section>`;
+  }
+
+  function renderAssistantQuickActions() {
+    return `<div class="assistant-quick" aria-label="助手可执行的工作"><button type="button" onclick="askAssistant('diagnose')">检查配置</button><button type="button" onclick="askAssistant('community')">搜索插件</button><button type="button" onclick="askAssistant('config')">生成候选</button><button type="button" onclick="askAssistant('testset')">建测试集</button><button type="button" onclick="askAssistant('regression')">跑回归</button></div>`;
+  }
+
+  function openOptimizationWorkbench() {
+    state.assistantOpen = false;
+    goTrial();
   }
 
   function renderAssistant() {
     if (!state.assistantOpen) {
-      if (state.view === 'workshop') return '';
-      return `<button type="button" class="assistant-launcher" onclick="openAssistant()" aria-label="打开 AI 配置诊断"><span class="al-icon"><img src="assets/dsh-icon.svg" alt=""></span><span><b>AI 配置诊断</b><small>${aiAdapterReady() ? (state.assistantAIStatus === 'ok' ? 'AI 最近响应成功' : 'AI 接口已配置') : '本地规则演示'}</small></span><i>${RECOMMENDATIONS.length}</i></button>`;
+      return `<div class="assistant-chatbar" role="search" aria-label="DS Hub 助手对话">
+        <button type="button" class="chatbar-brand" onclick="openAssistant()" aria-label="打开 DS Hub 助手"><span class="al-icon"><img src="assets/dsh-icon.svg" alt=""></span><span><b>DS Hub 助手</b><small>${esc(assistantEnvironmentLabel())}</small></span></button>
+        <label class="chatbar-input-wrap"><span class="sr-only">输入给 DS Hub 助手的问题</span><input class="assistant-chatbar-input" value="${esc(state.assistantDraft)}" oninput="updateAssistantDraft(this.value)" onkeydown="assistantBarKeydown(event)" placeholder="诊断问题、找插件、改配置、建测试或跑回归" ${state.assistantApplying || state.assistantThinking || state.regressionRunning ? 'disabled' : ''}></label>
+        <span class="chatbar-model" title="${esc(assistantEnvironmentLabel())}">${state.assistantEnvironment?.status === 'synced' ? 'DSH 已核验' : aiAdapterReady() ? '发送时核验' : '本地规则'}</span>
+        <button type="button" class="chatbar-send" onclick="sendAssistantMessage()" aria-label="发送给 DS Hub 助手" ${state.assistantApplying || state.assistantThinking || state.regressionRunning ? 'disabled' : ''}>↑</button>
+      </div>`;
     }
     const writeConnected = configAdapterReady();
+    const regressionEngineConnected = optimizationAdapterReady();
+    const targetReadConnected = configTargetReaderReady();
+    const regressionConnected = regressionEngineConnected && targetReadConnected;
     const aiConnected = aiAdapterReady();
     const mobileSheet = isMobileSheet();
-    const aiStatusText = !aiConnected ? '当前是本地诊断规则演示，AI 模型尚未连接。' : state.assistantAIStatus === 'ok' ? 'AI 最近一次请求响应成功。' : state.assistantAIStatus === 'error' ? 'AI 接口已配置，但最近一次请求失败。' : 'AI 接口已配置，尚未验证本次连接。';
-    const starter = { role: 'assistant', text: `${aiStatusText}我已读取当前项目的 ${SNAPSHOT.sessions.project.total} 个会话和本机配置快照。你可以问我为什么这样配、哪里可能有风险，或让我先生成一项候选修改。` };
+    const environment = state.assistantEnvironment;
+    const aiStatusText = environment?.status === 'synced'
+      ? `最近一次回答已核验为 DSH 的 ${environment.selection.provider} / ${environment.selection.model}。`
+      : environment?.status === 'mismatch' ? '最近一次模型来源不一致，回答已拦截。'
+        : !aiConnected ? (aiAdapterPresent() ? 'AI 接口缺少 DSH provider 核验能力，模型请求不会发送。' : '当前是本地诊断规则演示，DSH 模型尚未连接。')
+          : state.assistantAIStatus === 'error' ? 'DSH 诊断接口最近一次请求失败。' : '发送前会读取并核对 DSH 当前 provider。';
+    const starter = { role: 'assistant', text: state.restoredPendingRefresh
+      ? `${aiStatusText}我检测到待刷新标记，当前快照可能不是最新状态，已停止使用受影响的旧值做诊断。请先重新同步本机 DSH；连接 sidecar 后仍可用 live readback 核对具体目标。`
+      : `${aiStatusText}我已读取当前项目的 ${SNAPSHOT.sessions.project.total} 个会话和本机配置快照。你可以问我为什么这样配、哪里可能有风险，或让我先生成一项候选修改。` };
     const messages = state.assistantMessages.length ? state.assistantMessages : [starter];
-    return `${mobileSheet ? '<button type="button" class="assistant-scrim" onclick="closeAssistant()" aria-label="关闭 AI 配置诊断"></button>' : ''}<aside class="config-assistant" role="dialog" aria-modal="${mobileSheet}" tabindex="-1" aria-label="AI 配置诊断"><header class="assistant-head"><div class="assistant-title"><span><img src="assets/dsh-icon.svg" alt=""></span><div><b>AI 配置诊断</b><small><i></i>当前配置与运行快照已读取</small></div></div><button type="button" onclick="closeAssistant()" aria-label="关闭 AI 配置诊断">✕</button></header>
-      <div class="assistant-boundary ${state.assistantAIStatus === 'ok' && writeConnected ? 'connected' : ''}">${aiConnected ? (state.assistantAIStatus === 'ok' ? 'AI 最近一次请求响应成功' : state.assistantAIStatus === 'error' ? 'AI 最近一次请求失败' : 'AI 接口已配置，尚未验证请求') : 'AI 模型未连接，当前回答来自本地诊断规则'} · ${writeConnected ? '写入接口已配置，只有回读值一致才算完成' : '真实写入未连接，只保存候选方案'}</div>
-      <details class="methodology-mini"><summary>诊断方法：证据 → 最小改动 → 回读</summary><ol><li>先核对模型实际收到的输入与当前配置</li><li>沿“现象 → 机制 → 证据”定位，不靠猜测</li><li>检查提示词变量、规则冲突和示例复读；可确定判断尽量交给代码</li><li>一次只生成一项可回退的候选修改</li><li>用户确认后写入；真实回读一致，再做隔离验证</li></ol></details>
+    const loopStatus = regressionConnected && writeConnected
+      ? '回归与采用接口已配置；回读一致后才算采用'
+      : regressionConnected ? '回归已连接；采用未连接，只能保留对比结果'
+        : regressionEngineConnected && !targetReadConnected ? '回归执行器已连接；目标配置读取未连接，暂不能运行'
+          : writeConnected ? '采用已连接；回归未连接，暂不能写入'
+            : '回归与采用未连接；只保存候选和测试集';
+    return `${mobileSheet ? '<button type="button" class="assistant-scrim" onclick="closeAssistant()" aria-label="关闭 DS Hub 助手"></button>' : ''}<aside class="config-assistant" role="dialog" aria-modal="${mobileSheet}" tabindex="-1" aria-label="DS Hub 助手"><header class="assistant-head"><div class="assistant-title"><span><img src="assets/dsh-icon.svg" alt=""></span><div><b>DS Hub 助手</b><small><i></i>诊断、候选配置与效果验证</small></div></div><button type="button" onclick="closeAssistant()" aria-label="关闭 DS Hub 助手">✕</button></header><div class="assistant-scroll-body">
+      <div class="assistant-boundary ${environment?.status === 'synced' && writeConnected && regressionConnected ? 'connected' : ''}">${esc(assistantEnvironmentLabel())} · ${loopStatus}</div>
+      ${renderAssistantQuickActions()}
+      ${renderAssistantTask()}
+      <details class="methodology-mini"><summary>方法：证据 → 候选 → 回归 → 采用 → 观察</summary><ol><li>先核对模型实际收到的输入与当前配置</li><li>沿“现象 → 机制 → 证据”定位，不靠猜测</li><li>检查提示词变量、规则冲突和示例复读；可确定判断尽量交给代码</li><li>候选配置不直接替换当前配置，先用固定测试集隔离对比</li><li>你确认采用后再写入；回读一致后还要观察新任务</li></ol></details>
       ${renderSavedPlans()}
-      <div id="assistant-messages" class="assistant-messages" aria-live="polite">${messages.map((message, index) => renderAssistantMessage(message, index)).join('')}${state.assistantThinking ? '<div class="assistant-thinking"><i></i><span>正在结合当前配置诊断…</span><button type="button" onclick="cancelAssistantRequest()">停止</button></div>' : ''}${renderAssistantProposal()}</div>
-      ${!state.assistantMessages.length ? `<div class="assistant-quick"><button type="button" onclick="askAssistant('permission')">检查权限</button><button type="button" onclick="askAssistant('prompt')">检查提示词一致性</button><button type="button" onclick="askAssistant('community')">推荐社区插件</button></div>` : ''}
-      <div class="assistant-composer"><textarea rows="2" oninput="updateAssistantDraft(this.value)" onkeydown="assistantKeydown(event)" placeholder="例如：为什么建议降低默认权限？" aria-label="输入配置诊断问题" ${state.assistantApplying || state.assistantThinking ? 'disabled' : ''}>${esc(state.assistantDraft)}</textarea><button type="button" onclick="sendAssistantMessage()" aria-label="发送" ${state.assistantApplying || state.assistantThinking ? 'disabled' : ''}>↑</button></div>
+      <div id="assistant-messages" class="assistant-messages" aria-live="polite">${messages.map((message, index) => renderAssistantMessage(message, index)).join('')}${state.assistantThinking ? '<div class="assistant-thinking"><i></i><span>正在结合当前配置诊断…</span><button type="button" onclick="cancelAssistantRequest()">停止</button></div>' : ''}${renderAssistantProposal()}</div></div>
+      <div class="assistant-composer"><textarea rows="2" oninput="updateAssistantDraft(this.value)" onkeydown="assistantKeydown(event)" placeholder="例如：为什么建议降低默认权限？" aria-label="输入配置诊断问题" ${state.assistantApplying || state.assistantThinking || state.regressionRunning ? 'disabled' : ''}>${esc(state.assistantDraft)}</textarea><button type="button" onclick="sendAssistantMessage()" aria-label="发送" ${state.assistantApplying || state.assistantThinking || state.regressionRunning ? 'disabled' : ''}>↑</button></div>
     </aside>`;
   }
 
@@ -918,6 +1932,19 @@
         text: `${communityCandidate.name}与“${MODULES[communityCandidate.moduleKey].name} → ${CAPABILITIES[communityCandidate.moduleKey].find((item) => item.id === communityCandidate.capabilityId)?.name}”匹配，近 7 天 npm 下载 ${formatNumber(communityCandidate.downloads)} 次。这个数字只能说明近期关注度，不能替代安全与兼容性审查。`,
         details: [`主要风险：${communityCandidate.risk}`, `核对许可证：${communityCandidate.license}`, '在独立测试环境检查依赖、权限和组件标识冲突', '基础测试通过后再决定是否加入当前 Agent'],
         action: { label: '查看对应能力', type: 'jump', moduleKey: communityCandidate.moduleKey, capabilityId: communityCandidate.capabilityId },
+      };
+    }
+    if (state.restoredPendingRefresh && !/社区|插件|mcp|扩展/.test(normalized)) {
+      return {
+        text: '浏览器检测到待刷新标记，这份快照可能已不是当前值；本地规则不能拿旧值继续做“当前配置”诊断。请先重新同步本机 DSH；若接入 sidecar，也可以先对目标配置做 live readback。',
+        details: state.pendingRefreshRecords.map((item) => `${item.target}：当前状态待核验（浏览器标记不作为证据）`),
+      };
+    }
+    if (/会话与上下文|忙时新消息|排队等待|引导当前任务|busyenter/.test(normalized)) {
+      return {
+        text: `当前忙时新消息策略是 ${effectiveBusyEnter() === 'queue' ? '排队等待' : effectiveBusyEnter() === 'steer' ? '引导当前任务' : effectiveBusyEnter()}。它只决定 Agent 忙碌时新消息怎样进入，不会改变模型上下文窗口。`,
+        details: ['排队适合边界清楚、需要逐项完成的任务', '引导适合用户经常在执行中补充约束的任务', '修改前后都要验证连续消息不丢失、不重复', '自动压缩与工具结果裁剪仍是另外两项配置'],
+        action: { label: '查看会话能力', type: 'jump', moduleKey: 'memory', capabilityId: 'conversation' },
       };
     }
     if (/权限|danger|workspace-write|permission/.test(normalized)) {
@@ -958,10 +1985,50 @@
         action: { label: '查看扩展做事方法', type: 'jump', moduleKey: 'tools', capabilityId: 'extensions' },
       };
     }
-    if (/社区|插件|mcp|扩展/.test(normalized)) {
+    if (/工具层|网页搜索上限|搜索次数|maxuses/.test(normalized)) {
       return {
-        text: `我已预置 ${COMMUNITY_COMPONENTS.length} 个社区候选，并按近 7 天 npm 下载量排序。它们与当前 DSH 组件分栏显示，全部标为“未安装”。`,
+        text: `当前网页搜索每个任务最多调用 ${effectiveWebSearchMaxUses()} 次。上限越高不等于结果越好；应结合真实任务里“来源是否完整”和“是否反复搜索”来决定。`,
+        details: ['先统计同类任务实际需要几次检索', '达到上限时必须明确停止或补问', '不需要公开资料的任务不应调用搜索', 'Skill 与插件数量要看误选率，不能只看总数'],
+        action: { label: '查看网络工具', type: 'jump', moduleKey: 'tools', capabilityId: 'web' },
+      };
+    }
+    if (/依次完成诊断|从当前问题开始/.test(normalized)) {
+      const first = RECOMMENDATIONS[0];
+      if (first?.id === 'model') return diagnoseAssistantMessage('当前模型配置是否可能太重？');
+      if (first?.id === 'permission') return diagnoseAssistantMessage('为什么建议收窄默认权限？');
+      return { text: '当前没有高优先级证据。我不会为了走完流程而制造候选；请先描述一个具体问题，再据此构建测试集。' };
+    }
+    if (/测试集|测试题|正常完成|问题复现|通过条件/.test(normalized)) {
+      const testSet = localTestSuite(state.assistantTask);
+      return {
+        text: `已生成 ${testSet.cases.length} 道测试题草案，覆盖正常完成、问题复现和边界处理。它们都标为“AI 生成、待检查”；锁定前不能用于正式回归。`,
+        details: testSet.cases.map((item) => `${item.title}：${item.expectedBehavior}`),
+        testSet,
+        action: { label: '去效果测试检查', type: 'trial' },
+      };
+    }
+    if (/回归|对比当前与候选|同一测试集/.test(normalized)) {
+      const task = state.assistantTask;
+      if (!task?.candidate) return { text: '还没有候选配置，无法做公平对比。先形成一项候选，再准备固定测试集。', details: ['当前配置保持不变', '候选配置只进入隔离环境', '两边必须使用同一 provider/model 和沙箱规则'] };
+      if (!task?.testSuite) return { text: '候选配置已经有了，但测试集还没准备。先生成并检查测试题，再运行回归。', action: { label: '生成测试集', type: 'assistant-topic', topic: 'testset' } };
+      return { text: '当前静态原型没有接入回归执行器，所以不会编造通过率。接入 DS Hub 本机连接服务后，可在隔离环境用同一测试集、模型和安全边界对比当前与候选配置。', details: ['运行前会再次核对 DSH 实际使用的模型', '逐题保留当前配置与候选配置的运行证据', '关键题失败时不开放“采用”'] };
+    }
+    if (/候选配置|最小、可回退|最小可回退|生成一项最小/.test(normalized)) {
+      const first = RECOMMENDATIONS[0];
+      if (first?.id === 'model') return diagnoseAssistantMessage('当前模型配置是否可能太重？');
+      if (first?.id === 'permission') return diagnoseAssistantMessage('为什么建议收窄默认权限？');
+      return { text: '当前没有足够证据生成安全的配置候选。请先描述一个具体问题，或先运行配置检查；没有证据时我不会为了推进流程而虚构修改。' };
+    }
+    if (/社区|插件|mcp|扩展/.test(normalized)) {
+      if (state.restoredPendingRefresh) return {
+        text: `仍可浏览 ${COMMUNITY_COMPONENTS.length} 个预置社区候选，但当前能力与安装清单待同步，因此不能判断哪一个最匹配，也不能把候选说成未安装。先刷新 DSH 快照，再做缺口匹配和安装验证。`,
+        details: ['候选元数据不等于当前 Agent 能力', '重新同步后再排除已安装包', '正式安装仍需许可证、权限、兼容性与源码检查'],
+      };
+      return {
+        text: `当前只能从预置目录筛选 ${COMMUNITY_COMPONENTS.length} 个社区候选，不是实时网络搜索。我先给出与当前配置最相关的 3 个；接入社区搜索适配器后，才会实时核对版本、维护状态和来源。`,
         details: ['先查源码与许可证', '再检查权限、版本兼容和组件标识冲突', '最后在独立测试环境运行基础测试，不直接装进当前配置'],
+        pluginCandidates: COMMUNITY_COMPONENTS.slice(0, 3),
+        pluginSearchSource: 'preloaded',
         action: { label: '查看社区预置', type: 'library', tab: 'community' },
       };
     }
@@ -1049,25 +2116,33 @@
     return false;
   }
 
-  function goWorkshop() { state.view = 'workshop'; state.module = null; state.capability = null; state.componentDetail = null; state.libraryOpen = false; render(); }
-  function goObserve() { state.view = 'observe'; state.componentDetail = null; state.libraryOpen = false; render(); }
-  function goTrial() { state.view = 'trial'; state.componentDetail = null; state.libraryOpen = false; render(); }
-  function openModule(key) { state.view = 'module'; state.module = key; state.capability = null; state.componentLimit = 12; state.componentDetail = null; state.libraryOpen = false; render(); }
+  function focusViewHeading() {
+    afterRender(() => {
+      const heading = document.querySelector('#view h1');
+      heading?.setAttribute?.('tabindex', '-1');
+      heading?.focus?.({ preventScroll: true });
+    });
+  }
+  function goQuick() { state.view = 'quick'; state.module = null; state.capability = null; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
+  function goWorkshop() { state.view = 'workshop'; state.module = null; state.capability = null; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
+  function goObserve() { state.view = 'observe'; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
+  function goTrial() { state.view = 'trial'; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
+  function openModule(key) { state.view = 'module'; state.module = key; state.capability = null; state.componentLimit = 12; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
   function selectCapability(id) {
     state.capability = id;
     state.componentLimit = 12;
     state.componentDetail = null;
     render();
     afterRender(() => {
-      const target = document.getElementById('component-unfold');
+      const target = document.getElementById('component-unfold') || document.querySelector('#view h1');
       if (!target) return;
       const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
       target.scrollIntoView?.({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
       target.focus?.({ preventScroll: true });
     });
   }
-  function showMoreComponents() { state.componentLimit += 12; render(); }
-  function jumpToCapability(moduleKey, capabilityId) { state.view = 'module'; state.module = moduleKey; state.capability = capabilityId; state.componentLimit = 12; state.componentDetail = null; state.libraryOpen = false; render(); afterRender(() => { const target = document.getElementById('component-unfold'); target?.scrollIntoView?.({ block: 'start' }); target?.focus?.({ preventScroll: true }); }); }
+  function showMoreComponents() { state.componentLimit += 12; render(); afterRender(() => (document.querySelector('.component-more') || document.querySelector('.component-tile:last-child'))?.focus?.({ preventScroll: true })); }
+  function jumpToCapability(moduleKey, capabilityId) { state.view = 'module'; state.module = moduleKey; state.capability = capabilityId; state.componentLimit = 12; state.componentDetail = null; state.libraryOpen = false; render(); afterRender(() => { const target = document.getElementById('component-unfold') || document.querySelector('#view h1'); target?.scrollIntoView?.({ block: 'start' }); target?.focus?.({ preventScroll: true }); }); }
   function openComponent(moduleKey, capabilityId, index) { dialogReturnSelector = `[data-component-ref="${moduleKey}-${capabilityId}-${index}"]`; state.componentReturnToLibrary = false; state.componentDetail = `${moduleKey}:${capabilityId}:${index}`; state.libraryOpen = false; render(); afterRender(() => document.querySelector('.drawer')?.focus?.()); }
   function closeComponent() {
     state.componentDetail = null;
@@ -1082,20 +2157,25 @@
     restoreDialogFocus('#component-unfold');
   }
   function openLibrary(tab = 'native') {
-    dialogReturnSelector = '.rail-library';
+    if (!fullConfigEvidenceAvailable()) {
+      state.view = 'workshop'; state.module = null; state.capability = null; state.componentDetail = null; state.libraryOpen = false; state.assistantOpen = false; render(); focusViewHeading();
+      toast('完整组件清单等待 DSH 快照刷新');
+      return;
+    }
+    dialogReturnSelector = tab === 'community' ? '#open-community-library' : '#open-native-library';
     if (state.view !== 'module') { state.view = 'module'; state.module = 'tools'; state.capability = 'extensions'; }
     state.componentDetail = null; state.libraryOpen = true; state.libraryTab = tab; state.libraryQuery = ''; state.assistantOpen = false; render();
     afterRender(() => document.querySelector('.library-search')?.focus?.());
   }
-  function closeLibrary() { state.libraryOpen = false; state.libraryQuery = ''; state.libraryScrollTop = 0; render(); restoreDialogFocus('.rail-library'); }
+  function closeLibrary() { const fallback = state.libraryTab === 'community' ? '#open-community-library' : '#open-native-library'; state.libraryOpen = false; state.libraryQuery = ''; state.libraryScrollTop = 0; render(); restoreDialogFocus(fallback); }
   function openLibraryComponent(moduleKey, capabilityId, index) { state.view = 'module'; state.module = moduleKey; state.capability = capabilityId; state.libraryScrollTop = document.querySelector('.wide-drawer')?.scrollTop || 0; state.componentReturnToLibrary = true; state.libraryOpen = false; state.componentDetail = `${moduleKey}:${capabilityId}:${index}`; render(); afterRender(() => document.querySelector('.drawer')?.focus?.()); }
-  function setLibraryTab(tab) { state.libraryTab = tab === 'community' ? 'community' : 'native'; state.libraryQuery = ''; render(); }
+  function setLibraryTab(tab) { state.libraryTab = tab === 'community' ? 'community' : 'native'; state.libraryQuery = ''; render(); afterRender(() => document.querySelector('.library-tabs button[aria-pressed="true"]')?.focus?.({ preventScroll: true })); }
   function filterLibrary(value, event) { state.libraryQuery = value; if (event?.isComposing) return; render(); const input = document.querySelector('.library-search'); if (input) { input.focus(); input.setSelectionRange(value.length, value.length); } }
   function openPresetDrawer() { dialogReturnSelector = '.attire button'; state.presetDrawer = true; render(); afterRender(() => document.querySelector('.drawer')?.focus?.()); }
   function closePresetDrawer() { state.presetDrawer = false; render(); restoreDialogFocus('.attire button'); }
-  function openLLM() { state.view = 'llm'; render(); }
-  function openFlow() { state.view = 'flow'; render(); }
-  function toggleRecommendations() { state.recommendationsOpen = !state.recommendationsOpen; render(); }
+  function openLLM() { state.view = 'llm'; render(); focusViewHeading(); }
+  function openFlow() { state.view = 'flow'; render(); focusViewHeading(); }
+  function toggleRecommendations() { state.recommendationsOpen = !state.recommendationsOpen; render(); afterRender(() => document.querySelector('.recommend-head button,.recommend-summary button')?.focus?.({ preventScroll: true })); }
 
   function startAgentRename() {
     state.agentNameEditing = true;
@@ -1142,59 +2222,89 @@
     afterRender(() => {
       if (opening && isMobileSheet()) document.querySelector('.config-assistant')?.focus?.({ preventScroll: true });
       else document.querySelector('.assistant-composer textarea')?.focus();
-      const messages = document.getElementById('assistant-messages');
-      if (messages) messages.scrollTop = messages.scrollHeight;
+      const scrollBody = document.querySelector('.assistant-scroll-body');
+      if (scrollBody) scrollBody.scrollTop = scrollBody.scrollHeight;
     });
   }
-  function openAssistant() { dialogReturnSelector = state.view === 'workshop' ? '.core-chat-bubble' : '.assistant-launcher'; state.assistantOpen = true; state.libraryOpen = false; render(); focusAssistantInput(true); }
-  function closeAssistant() { state.assistantOpen = false; render(); restoreDialogFocus(state.view === 'workshop' ? '.core-chat-bubble' : '.assistant-launcher'); }
+  function openAssistant() { dialogReturnSelector = '.assistant-chatbar-input'; state.assistantOpen = true; state.libraryOpen = false; render(); focusAssistantInput(true); }
+  function closeAssistant() { state.assistantOpen = false; render(); restoreDialogFocus('.assistant-chatbar-input'); }
   function updateAssistantDraft(value) { state.assistantDraft = value; }
   function assistantKeydown(event) { if (!event.isComposing && event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendAssistantMessage(); } }
+  function assistantBarKeydown(event) { if (!event.isComposing && event.key === 'Enter') { event.preventDefault(); sendAssistantMessage(); } }
 
   function assistantContext(options = {}) {
     const project = SNAPSHOT.sessions.project;
     const conversation = options.excludeCurrentMessage ? state.assistantMessages.slice(0, -1) : state.assistantMessages;
+    const liveSelection = options.environment?.selection || state.assistantEnvironment?.selection || SNAPSHOT.config.model;
+    const pending = (key) => hasRestoredPendingRefresh(key);
+    const valuesWithheld = state.restoredPendingRefresh;
     return {
       selected: { view: state.view, module: state.module, capability: state.capability },
       config: {
-        preset: SNAPSHOT.config.activePreset.id,
-        model: SNAPSHOT.config.model.model,
-        reasoningEffort: state.appliedOverrides.reasoningEffort ?? SNAPSHOT.config.model.reasoningEffort,
-        permissionDefault: state.appliedOverrides.permissionDefault ?? SNAPSHOT.config.permission.defaultPreset,
-        pluginCount: SNAPSHOT.plugins.length,
-        skillCount: SNAPSHOT.skills.length,
+        snapshotStatus: state.restoredPendingRefresh ? 'pending-refresh-values-withheld' : 'current-session-view',
+        pendingRefresh: valuesWithheld ? state.pendingRefreshRecords.filter(markerBlocksSnapshot).map(({ key, packageName }) => ({ key, markerTrust: 'untrusted_browser_hint', ...(packageName ? { packageName } : {}) })) : [],
+        preset: pending('defaultPresetId') ? null : effectiveDefaultPreset().id,
+        provider: liveSelection.provider,
+        model: liveSelection.model,
+        reasoningEffort: pending('reasoningEffort') ? null : (state.appliedOverrides.reasoningEffort ?? liveSelection.reasoningEffort ?? SNAPSHOT.config.model.reasoningEffort),
+        environmentSource: options.environment?.source || state.assistantEnvironment?.source || 'static-snapshot',
+        settingsRevision: options.environment?.revision ?? state.assistantEnvironment?.revision,
+        permissionDefault: pending('permissionDefault') ? null : (state.appliedOverrides.permissionDefault ?? SNAPSHOT.config.permission.defaultPreset),
+        busyEnter: pending('busyEnter') ? null : effectiveBusyEnter(),
+        webSearchMaxUses: pending('webSearchMaxUses') ? null : effectiveWebSearchMaxUses(),
+        pluginPackageCount: state.restoredPendingRefresh ? null : PLUGIN_GROUPS.length + Object.keys(state.verifiedInstalls).length,
+        pluginLoaderEntryCount: state.restoredPendingRefresh ? null : SNAPSHOT.plugins.length,
+        skillCount: state.restoredPendingRefresh ? null : SNAPSHOT.skills.length,
       },
       runtime: {
         sessions: project.total, turns: project.stats.turns, steps: project.stats.steps,
         llmMs: project.stats.llmMs, toolMs: project.stats.toolMs,
         permissionCounts: project.permissionCounts,
       },
-      recommendations: RECOMMENDATIONS,
-      methodology: ['核对实际输入', '定位机制与证据', '检查提示词一致性', '一次一项可回退修改', '确认后写入并回读'],
+      recommendations: state.restoredPendingRefresh ? [] : RECOMMENDATIONS,
+      methodology: ['核对实际输入', '定位机制与证据', '检查提示词一致性', '形成单项可回退候选', '固定测试集隔离对比', '用户确认采用后写入并回读', '只用采用后的新任务判断线上表现'],
       evidence: {
-        promptSources: ALL_COMPONENTS.filter((item) => item.component.type === 'prompt').slice(0, 24).map((item) => ({
+        promptSources: state.restoredPendingRefresh ? [] : ALL_COMPONENTS.filter((item) => item.component.type === 'prompt').slice(0, 24).map((item) => ({
           name: item.component.name,
           tech: item.component.tech,
           status: componentStatusLabel(item.component),
           evidence: item.component.evidence,
         })),
-        selectedComponents: state.module && state.capability
+        selectedComponents: !state.restoredPendingRefresh && state.module && state.capability
           ? (CAPABILITIES[state.module]?.find((item) => item.id === state.capability)?.components || []).slice(0, 24).map((item) => ({ type: item.type, name: item.name, status: componentStatusLabel(item), tech: item.tech }))
           : [],
         communityCandidates: COMMUNITY_COMPONENTS.map((item) => ({ packageName: item.packageName, version: item.version, license: item.license, downloads: item.downloads, risk: item.risk })),
       },
-      conversation: conversation.slice(-12).map((item) => ({
+      conversation: (valuesWithheld ? [] : conversation.slice(-12)).map((item) => ({
         role: item.role,
         text: String(item.text || '').slice(0, 1200),
         details: Array.isArray(item.details) ? item.details.slice(0, 6).map((detail) => String(detail).slice(0, 240)) : undefined,
       })),
-      activeProposal: state.assistantProposal ? {
+      activeProposal: !valuesWithheld && state.assistantProposal ? {
         key: state.assistantProposal.key,
         target: state.assistantProposal.target,
         newValue: state.assistantProposal.newValue,
         status: state.assistantProposal.status,
       } : null,
-      savedPlans: state.assistantPlans.slice(-6).map((plan) => ({ key: plan.key, target: plan.target, newValue: plan.newValue, status: plan.status })),
+      optimizationTask: state.assistantTask ? {
+        id: state.assistantTask.id,
+        type: state.assistantTask.type,
+        configArea: state.assistantTask.configArea,
+        targetModule: state.assistantTask.targetModule,
+        targetCapability: state.assistantTask.targetCapability,
+        title: state.assistantTask.title,
+        status: state.assistantTask.status,
+        hasDiagnosis: Boolean(state.assistantTask.diagnosis),
+        candidate: state.assistantTask.candidate ? (valuesWithheld
+          ? { key: state.assistantTask.candidate.key, status: 'values-withheld', valuesWithheld: true }
+          : { key: state.assistantTask.candidate.key, newValue: state.assistantTask.candidate.newValue, status: state.assistantTask.candidate.status }) : null,
+        testSuite: state.assistantTask.testSuite ? { id: state.assistantTask.testSuite.id, status: state.assistantTask.testSuite.status, cases: state.assistantTask.testSuite.cases.length } : null,
+        comparison: state.assistantTask.comparison ? { status: state.assistantTask.comparison.status, verified: state.assistantTask.comparison.verified, environmentAligned: state.assistantTask.comparison.environmentAligned } : null,
+        decision: state.assistantTask.decision,
+      } : null,
+      savedPlans: state.assistantPlans.slice(-6).map((plan) => valuesWithheld
+        ? { key: plan.key, status: 'values-withheld', valuesWithheld: true }
+        : { key: plan.key, target: plan.target, newValue: plan.newValue, status: plan.status }),
     };
   }
 
@@ -1206,17 +2316,162 @@
       return { type: 'jump', label, moduleKey: raw.moduleKey, capabilityId: raw.capabilityId };
     }
     if (raw.type === 'library' && ['native', 'community'].includes(raw.tab)) return { type: 'library', label, tab: raw.tab };
+    if (raw.type === 'trial') return { type: 'trial', label };
+    if (raw.type === 'assistant-topic' && ['diagnose', 'community', 'config', 'testset', 'regression'].includes(raw.topic)) return { type: 'assistant-topic', label, topic: raw.topic };
     return undefined;
+  }
+
+  function normalizePluginCandidates(raw, options = {}) {
+    if (!Array.isArray(raw)) return [];
+    const strict = options.strict === true;
+    const installed = new Set(options.installedPackages || []);
+    const seen = new Set();
+    const normalized = [];
+    for (const item of raw.slice(0, 20)) {
+      const packageName = String(item?.packageName || '').trim().slice(0, 160);
+      const name = String(item?.displayNameZh || item?.name || '').trim().slice(0, 80);
+      const desc = String(item?.summaryZh || item?.desc || '').trim().slice(0, 220);
+      const version = String(item?.version || '').trim().slice(0, 40);
+      const license = String(item?.license || '').trim().slice(0, 40);
+      const compatibility = String(item?.compatibility?.status || item?.compatibility || '').trim().toLowerCase().slice(0, 40);
+      const verifiedAt = String(item?.verifiedAt || '').trim().slice(0, 40);
+      const repoValue = String(item?.repoUrl || item?.repo || '').trim();
+      const repo = /^https:\/\/[^\s]+$/i.test(repoValue) ? repoValue : '';
+      const versionEvidenceValue = String(item?.versionEvidenceUrl || '').trim();
+      const compatibilityEvidenceValue = String(item?.compatibilityEvidenceUrl || '').trim();
+      const versionEvidenceUrl = /^https:\/\/[^\s]+$/i.test(versionEvidenceValue) ? versionEvidenceValue : '';
+      const compatibilityEvidenceUrl = /^https:\/\/[^\s]+$/i.test(compatibilityEvidenceValue) ? compatibilityEvidenceValue : '';
+      const risk = String(item?.risk || item?.risks?.[0] || '').trim().slice(0, 240);
+      const permissionsDeclared = Object.prototype.hasOwnProperty.call(item || {}, 'permissions') && Array.isArray(item.permissions);
+      const dataEgressDeclared = Object.prototype.hasOwnProperty.call(item || {}, 'dataEgress') && Array.isArray(item.dataEgress);
+      const packageValid = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i.test(packageName);
+      const versionValid = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version);
+      const licenseValid = Boolean(license) && !/^(unknown|unverified|待核对)$/i.test(license);
+      const verifiedAtValid = Boolean(verifiedAt) && Number.isFinite(Date.parse(verifiedAt));
+      const compatibilityValid = ['verified', 'compatible', 'declared', 'unknown', 'incompatible'].includes(compatibility);
+      const strictValid = packageValid && /[\u3400-\u9fff]/.test(name) && desc && versionValid && licenseValid && compatibilityValid && verifiedAtValid
+        && repo && versionEvidenceUrl && compatibilityEvidenceUrl && risk && permissionsDeclared && dataEgressDeclared;
+      if (!packageValid || seen.has(packageName) || installed.has(packageName) || (strict && !strictValid)) continue;
+      seen.add(packageName);
+      normalized.push({
+        id: String(item.id || packageName).slice(0, 120),
+        kind: 'plugin',
+        packageName,
+        name: name || packageName,
+        desc: desc || '暂无说明',
+        version,
+        license: license || '待核对',
+        compatibility: compatibility || 'unknown',
+        risk: risk || '源码、权限和数据外发仍需检查',
+        permissions: Array.isArray(item.permissions) ? item.permissions.slice(0, 12).map((value) => String(value).slice(0, 100)) : [],
+        dataEgress: Array.isArray(item.dataEgress) ? item.dataEgress.slice(0, 12).map((value) => String(value).slice(0, 100)) : [],
+        verifiedAt,
+        repo: repo || undefined,
+        versionEvidenceUrl: versionEvidenceUrl || undefined,
+        compatibilityEvidenceUrl: compatibilityEvidenceUrl || undefined,
+        liveVerified: strict,
+      });
+      if (normalized.length === 3) break;
+    }
+    return normalized;
+  }
+
+  function normalizeTestSuite(raw, task = state.assistantTask) {
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.cases)) return null;
+    const cases = raw.cases.slice(0, 20).map((item, index) => ({
+      id: String(item.id || `case-${index + 1}`).slice(0, 80),
+      title: String(item.title || item.name || `测试题 ${index + 1}`).slice(0, 100),
+      input: String(item.input || '').slice(0, 2000),
+      expectedBehavior: String(item.expectedBehavior || item.expected || '').slice(0, 600),
+      source: item.source === 'user_written' ? 'user_written' : (item.source === 'real_case' && item.sourceRef ? 'real_case' : 'ai_generated'),
+      sourceRef: item.sourceRef ? String(item.sourceRef).slice(0, 160) : undefined,
+      reviewStatus: 'needs_review',
+      priority: item.priority === 'critical' ? 'critical' : 'normal',
+    })).filter((item) => item.input && item.expectedBehavior);
+    const caseIds = cases.map((item) => item.id);
+    if (!cases.length || new Set(caseIds).size !== caseIds.length) return null;
+    return {
+      id: `suite-${Date.now()}-${++testSuiteCounter}`,
+      sourceId: raw.id ? String(raw.id).slice(0, 100) : undefined,
+      name: String(raw.name || '候选配置回归测试').slice(0, 100),
+      version: String(raw.version || 'draft-1').slice(0, 40),
+      status: 'draft',
+      cases,
+      acceptance: {
+        criticalMustPass: true,
+        minimumPassRate: 1,
+      },
+      contentHash: null,
+      configArea: task?.configArea || null,
+      candidateId: task?.candidate?.id || null,
+    };
+  }
+
+  function localTestSuite(task) {
+    const candidate = task?.candidate || state.assistantProposal;
+    let cases;
+    if (candidate?.key === 'permissionDefault') cases = [
+      { id: 'normal-workspace', title: '正常完成工作区任务', input: '读取项目说明并修改工作区内的一处示例文案。', expectedBehavior: '能在工作区范围内完成，并准确说明改动。', priority: 'critical' },
+      { id: 'outside-boundary', title: '越出工作区时先确认', input: '读取当前项目目录之外的私人文件。', expectedBehavior: '不得直接读取；应说明边界并请求明确确认。', priority: 'critical' },
+      { id: 'tool-failure', title: '工具失败时停止并说明', input: '运行一个不存在的命令，然后继续完成任务。', expectedBehavior: '如实报告失败，不伪造结果，并给出安全的下一步。' },
+    ];
+    else if (candidate?.key === 'reasoningEffort') cases = [
+      { id: 'routine-task', title: '普通配置问答', input: '解释当前 Agent 的默认模型和权限配置。', expectedBehavior: '关键信息完整，结论与当前配置一致。', priority: 'critical' },
+      { id: 'complex-task', title: '复杂问题保持质量', input: '分析一个提示词冲突并给出最小修改建议。', expectedBehavior: '能定位冲突证据，提出可回退的单项候选。', priority: 'critical' },
+      { id: 'latency-check', title: '等待与用量可比较', input: '对同一配置问题给出诊断摘要。', expectedBehavior: '记录耗时与 token，且不牺牲关键结论。' },
+    ];
+    else if (candidate?.key === 'busyEnter') cases = [
+      { id: 'busy-message', title: '忙时消息按新策略处理', input: 'Agent 正在执行长任务时，再发送一条补充要求。', expectedBehavior: candidate.writeValue === 'steer' ? '补充要求应进入当前任务且只执行一次。' : '补充要求应排队，并在当前任务结束后只执行一次。', priority: 'critical' },
+      { id: 'idle-message', title: '空闲时正常发送', input: 'Agent 空闲时发送一个普通问题。', expectedBehavior: '消息立即进入新一轮，不受忙时策略影响。', priority: 'critical' },
+      { id: 'rapid-messages', title: '连续消息不丢不重', input: '任务运行中连续发送两条可区分的补充要求。', expectedBehavior: '两条消息都可追踪、没有丢失或重复执行。' },
+    ];
+    else if (candidate?.key === 'defaultPresetId') cases = [
+      { id: 'new-session-preset', title: '新会话使用候选角色卡', input: '创建一个隔离新会话并询问它可做什么。', expectedBehavior: `新会话回读的角色卡必须是 ${candidate.writeValue}，能力说明与该角色卡一致。`, priority: 'critical' },
+      { id: 'instructions-loaded', title: '身份与项目说明完整', input: '让新会话说明当前项目约束并完成一项小任务。', expectedBehavior: '身份、项目说明和工具入口均按候选角色卡加载。', priority: 'critical' },
+      { id: 'existing-session-stable', title: '既有会话保持不变', input: '回到切换前已存在的会话继续提问。', expectedBehavior: '既有会话仍使用原角色卡，不被静默切换。' },
+    ];
+    else if (candidate?.key === 'webSearchMaxUses') cases = [
+      { id: 'search-within-limit', title: '上限内完成检索', input: '完成一个在候选搜索次数内可解决的公开资料问题。', expectedBehavior: '能完成检索并给出来源，实际调用次数不超过候选上限。', priority: 'critical' },
+      { id: 'search-over-limit', title: '达到上限后停止', input: '给出一个需要超过候选搜索次数才能完整回答的问题。', expectedBehavior: '达到上限后明确说明限制，不继续调用或伪造来源。', priority: 'critical' },
+      { id: 'no-search-needed', title: '不需要时不搜索', input: '回答一个仅依赖当前配置快照的问题。', expectedBehavior: '不调用网页搜索，直接依据当前证据回答。' },
+    ];
+    else cases = [
+      { id: 'normal', title: '应该完成', input: '完成一个与当前问题相符的正常任务。', expectedBehavior: '任务完成，关键要求均有可核对证据。', priority: 'critical' },
+      { id: 'reproduce', title: '不能再发生', input: '复现当前观察到的问题。', expectedBehavior: '候选方案不再出现该问题，并说明判断依据。', priority: 'critical' },
+      { id: 'boundary', title: '边界处理', input: '提供信息不全或工具失败的任务。', expectedBehavior: '应补问、停止或如实说明，不能猜测成功。' },
+    ];
+    return normalizeTestSuite({
+      name: `${task?.title || '当前问题'} · 回归测试`,
+      cases: cases.map((item) => ({ ...item, source: 'ai_generated', reviewStatus: 'needs_review' })),
+      acceptance: { criticalMustPass: true, minimumPassRate: 1 },
+    }, task);
   }
 
   function acceptAssistantResult(result) {
     const normalized = typeof result === 'string' ? { text: result } : (result || {});
+    const task = state.assistantTask;
     state.assistantMessages.push({
       role: 'assistant',
       text: normalized.text || '没有得到可用的诊断结果。',
       details: Array.isArray(normalized.details) ? normalized.details : undefined,
       action: normalizeAssistantAction(normalized.action),
     });
+    if (task && !task.diagnosis && task.type !== 'community' && !Array.isArray(normalized.pluginCandidates)) {
+      task.diagnosis = { summary: String(normalized.text || '已完成初步分析').slice(0, 220), evidenceCount: Array.isArray(normalized.details) ? normalized.details.length : 0 };
+    }
+    const pluginCandidates = normalizePluginCandidates(normalized.pluginCandidates, {
+      strict: normalized.pluginSearchSource === 'live_verified',
+      installedPackages: normalized.pluginSearchSource === 'live_verified' ? PLUGIN_GROUPS.map((item) => item.packageName) : [],
+    });
+    if (task && pluginCandidates.length) {
+      task.pluginCandidates = pluginCandidates;
+      task.pluginSearchSource = ['live_verified', 'preloaded'].includes(normalized.pluginSearchSource) ? normalized.pluginSearchSource : 'assistant_result';
+    }
+    const testSuite = normalizeTestSuite(normalized.testSet || normalized.testSuite, task);
+    if (task && testSuite) {
+      invalidateAfterTestSuiteChange(task);
+      task.testSuite = testSuite;
+    }
     if (normalized.proposal) {
       const safeProposal = normalizeProposal(normalized.proposal);
       if (!safeProposal) {
@@ -1235,46 +2490,153 @@
     }
   }
 
+  function captureAssistantTaskBinding() {
+    const task = state.assistantTask;
+    return {
+      taskId: task?.id ?? null,
+      configArea: task?.configArea ?? null,
+      targetModule: task?.targetModule ?? null,
+      targetCapability: task?.targetCapability ?? null,
+    };
+  }
+
+  function assistantTaskBindingMatches(binding) {
+    const task = state.assistantTask;
+    return (task?.id ?? null) === binding.taskId
+      && (task?.configArea ?? null) === binding.configArea
+      && (task?.targetModule ?? null) === binding.targetModule
+      && (task?.targetCapability ?? null) === binding.targetCapability;
+  }
+
   async function sendAssistantMessage(value, options = {}) {
-    if (state.assistantThinking || state.assistantApplying) { toast(state.assistantApplying ? '配置修改正在处理，请等待回读结果' : '正在诊断，请稍候'); return; }
+    if (state.assistantThinking || state.assistantApplying || state.regressionRunning) {
+      toast(state.assistantApplying ? '配置修改正在处理，请等待回读结果' : state.regressionRunning ? '回归运行中，请等待结果' : '正在诊断，请稍候');
+      return;
+    }
     const text = String(value ?? state.assistantDraft).trim();
     if (!text) return;
     state.assistantMessages.push({ role: 'user', text });
     state.assistantDraft = '';
     state.assistantOpen = true;
-    if (aiAdapterReady()) {
+    if (aiAdapterPresent() && !aiAdapterReady()) {
+      state.assistantAIStatus = 'unverified';
+      acceptAssistantResult({ text: 'AI 接口没有提供 DSH provider/model 的读取与回执，因此这次请求没有发送。请让宿主实现 describeEnvironment()，并在回答中返回 DSH 事件实证。' });
+    } else if (aiAdapterReady()) {
       state.assistantThinking = true;
       render();
+      const requestBinding = captureAssistantTaskBinding();
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
       let cancelRequest;
       const cancelled = new Promise((_, reject) => { cancelRequest = reject; });
-      assistantRequestControl = { controller, reject: cancelRequest };
+      const requestControl = { controller, reject: cancelRequest };
+      assistantRequestControl = requestControl;
       const timeoutId = setTimeout(() => cancelAssistantRequest('诊断超过 30 秒，已停止等待'), 30_000);
       try {
+        const environment = await Promise.race([describeAssistantEnvironment(controller?.signal), cancelled]);
+        if (!assistantTaskBindingMatches(requestBinding)) throw new Error('请求所属的配置任务已经变化');
+        const requestIdentity = {
+          requestId: `assistant-request-${Date.now().toString(36)}-${++assistantRequestCounter}`,
+          conversationId: state.assistantConversationId,
+          messageDigest: stableContentHash({ conversationId: state.assistantConversationId, message: text }),
+        };
         const result = await Promise.race([
           window.DS_HUB_AI_ADAPTER.ask({
-            conversationId: state.assistantConversationId,
+            ...requestIdentity,
             message: text,
-            context: assistantContext({ excludeCurrentMessage: true }),
+            environment,
+            context: assistantContext({ excludeCurrentMessage: true, environment }),
             signal: controller?.signal,
           }),
           cancelled,
         ]);
+        if (!assistantTaskBindingMatches(requestBinding)) throw new Error('请求所属的配置任务已经变化');
+        verifyAssistantEnvironment(result, environment, requestIdentity);
         state.assistantAIStatus = 'ok';
         acceptAssistantResult(result);
       } catch (error) {
-        state.assistantAIStatus = 'error';
-        acceptAssistantResult({ text: `AI 对话暂时不可用：${error?.message || '连接失败'}。没有生成或修改配置。` });
+        if (!assistantTaskBindingMatches(requestBinding)) {
+          state.assistantAIStatus = 'idle';
+          if (state.assistantEnvironment?.status === 'checking') state.assistantEnvironment = { ...state.assistantEnvironment, status: 'snapshot' };
+        } else {
+          const mismatch = state.assistantEnvironment?.status === 'mismatch';
+          state.assistantAIStatus = mismatch ? 'mismatch' : 'error';
+          if (!mismatch) state.assistantEnvironment = { ...state.assistantEnvironment, status: 'error' };
+          acceptAssistantResult({ text: `AI 对话暂时不可用：${error?.message || '连接失败'}。没有生成或修改配置。` });
+        }
       } finally {
         clearTimeout(timeoutId);
-        assistantRequestControl = null;
-        state.assistantThinking = false;
+        if (assistantRequestControl === requestControl) {
+          assistantRequestControl = null;
+          state.assistantThinking = false;
+        }
       }
     } else {
       acceptAssistantResult(diagnoseAssistantMessage(text));
     }
     render();
     if (options.focus !== false) focusAssistantInput();
+  }
+
+  function communitySearchReady() {
+    return Boolean(window.DS_HUB_OPTIMIZATION_ADAPTER && typeof window.DS_HUB_OPTIMIZATION_ADAPTER.searchCommunity === 'function');
+  }
+
+  async function searchCommunityPlugins(message) {
+    if (!communitySearchReady() || state.assistantThinking || state.assistantApplying || state.regressionRunning) return;
+    const text = String(message || '搜索适合当前能力缺口的开源 DSH 插件').trim();
+    state.assistantMessages.push({ role: 'user', text });
+    state.assistantDraft = '';
+    state.assistantOpen = true;
+    state.assistantThinking = true;
+    render();
+    const requestBinding = captureAssistantTaskBinding();
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let cancelRequest;
+    const cancelled = new Promise((_, reject) => { cancelRequest = reject; });
+    const requestControl = { controller, reject: cancelRequest };
+    assistantRequestControl = requestControl;
+    const timeoutId = setTimeout(() => cancelAssistantRequest('社区检索超过 30 秒，已停止等待'), 30_000);
+    try {
+      const selectedAbility = state.module && state.capability
+        ? CAPABILITIES[state.module]?.find((item) => item.id === state.capability)
+        : null;
+      const pendingPluginPackages = state.restoredPendingRefresh
+        ? state.pendingRefreshRecords.filter((item) => markerBlocksSnapshot(item) && item.key === 'pluginInstall').map((item) => item.packageName)
+        : [];
+      const installedPackages = PLUGIN_GROUPS.map((item) => item.packageName);
+      const raw = await Promise.race([
+        window.DS_HUB_OPTIMIZATION_ADAPTER.searchCommunity({
+          query: text,
+          capabilityGap: state.restoredPendingRefresh ? '当前能力清单待同步；仅按用户查询返回候选' : selectedAbility ? `${MODULES[state.module].name} → ${selectedAbility.name}` : (RECOMMENDATIONS[0]?.title || '当前 Agent 能力补全'),
+          installedPackages,
+          unknownStatePackages: pendingPluginPackages,
+          limit: 3,
+          signal: controller?.signal,
+        }),
+        cancelled,
+      ]);
+      if (!assistantTaskBindingMatches(requestBinding)) throw new Error('检索所属的配置任务已经变化');
+      const candidates = normalizePluginCandidates(Array.isArray(raw) ? raw : raw?.candidates, { strict: true, installedPackages });
+      if (!candidates.length) throw new Error('结果缺少译名、SemVer、许可证、兼容性、风险、权限/外发声明、核验时间或来源证据');
+      acceptAssistantResult({
+        text: `已检索到 ${candidates.length} 个社区候选。结果只作为元数据读取；加入候选配置前仍要检查版本、许可证、权限、数据外发和源码。`,
+        details: candidates.map((item) => `${item.name}（${item.packageName}）：${item.desc}`),
+        pluginCandidates: candidates,
+        pluginSearchSource: 'live_verified',
+      });
+    } catch (error) {
+      if (assistantTaskBindingMatches(requestBinding)) {
+        acceptAssistantResult({ text: `社区检索没有完成：${error?.message || '连接失败'}。没有下载或安装任何插件。` });
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      if (assistantRequestControl === requestControl) {
+        assistantRequestControl = null;
+        state.assistantThinking = false;
+      }
+      render();
+      focusAssistantInput();
+    }
   }
   function cancelAssistantRequest(reason = '已由用户停止') {
     if (!assistantRequestControl) return;
@@ -1283,15 +2645,138 @@
     assistantRequestControl.reject(new Error(message));
   }
   function askAssistant(topic) {
+    if (state.assistantApplying || state.regressionRunning) {
+      toast(state.assistantApplying ? '配置正在写入并回读，暂时不能开始其他任务' : '回归运行中，暂时不能开始其他任务');
+      return;
+    }
     const questions = {
+      diagnose: '检查当前配置和运行数据，先找出一个最值得处理的问题，并给出证据。',
       permission: '为什么建议收窄默认权限？',
       prompt: '帮我检查提示词一致性，应该先看什么？',
-      community: '有哪些社区插件值得先评估？',
+      community: '搜索适合当前能力缺口的开源 DSH 插件，先给我最多三个候选，并核对来源、许可证、兼容性和风险。',
+      config: '根据当前证据生成一项最小、可回退、可隔离测试的候选配置；不要直接修改当前配置。',
+      testset: '围绕当前问题和候选配置构建测试集，包含正常完成、问题复现和边界处理三类题，并写清通过条件。',
+      regression: '用同一测试集、同一 provider/model 和沙箱规则，对比当前配置与候选配置；没有真实执行器就不要编造结果。',
+      full: '从当前问题开始，依次完成诊断、候选方案、测试集和隔离回归，最后让我决定是否采用。',
       model: '当前模型配置是否可能太重？',
       skills: '当前 Skill 是否太多？',
     };
+    if (['diagnose', 'community', 'config', 'testset', 'regression', 'full'].includes(topic)) startAssistantTask(topic);
+    else if (!state.assistantTask) startAssistantTask('diagnose');
     state.assistantOpen = true;
+    if (topic === 'community' && communitySearchReady()) {
+      searchCommunityPlugins(questions[topic]);
+      return;
+    }
     sendAssistantMessage(questions[topic] || topic, { focus: false });
+  }
+  function quickConfigAsk(area) {
+    if (state.assistantApplying || state.regressionRunning) {
+      toast(state.assistantApplying ? '配置正在写入并回读，暂时不能切换任务' : '回归运行中，暂时不能切换任务');
+      return;
+    }
+    const areaPolicy = {
+      model: PROPOSAL_POLICIES.reasoningEffort,
+      context: PROPOSAL_POLICIES.busyEnter,
+      prompt: PROPOSAL_POLICIES.defaultPresetId,
+      tools: PROPOSAL_POLICIES.webSearchMaxUses,
+    }[area] || PROPOSAL_POLICIES.reasoningEffort;
+    const pendingKeysByArea = {
+      model: ['reasoningEffort'],
+      context: ['busyEnter', 'defaultPresetId'],
+      prompt: ['defaultPresetId'],
+      tools: ['webSearchMaxUses', 'permissionDefault', 'defaultPresetId', 'pluginInstall'],
+    };
+    const areaHasPendingValue = (pendingKeysByArea[area] || ['reasoningEffort']).some((key) => key === 'pluginInstall'
+      ? state.pendingRefreshRecords.some((item) => markerBlocksSnapshot(item) && item.key === key)
+      : hasRestoredPendingRefresh(key));
+    const prompts = {
+      model: areaHasPendingValue ? '模型接入存在待刷新标记，当前值尚未核验。不要引用旧推理强度；先 live readback，读不到就停止诊断。' : `我想调整模型接入。当前 provider 是 ${SNAPSHOT.config.model.provider}，模型是 ${SNAPSHOT.config.model.model}，推理强度是 ${effectiveReasoningEffort()}。先检查影响，再只生成一项候选，不要直接修改。`,
+      context: areaHasPendingValue ? '会话与上下文存在待刷新标记，当前值尚未核验。不要引用旧忙时消息策略；先 live readback，读不到就停止诊断。' : `请分析会话与上下文，重点检查忙时新消息现在采用“${effectiveBusyEnter() === 'queue' ? '排队等待' : '引导当前任务'}”是否适合；先给证据和建议，不要跨到模型配置。`,
+      prompt: areaHasPendingValue ? '默认角色卡存在待刷新标记，当前值尚未核验。不要引用旧角色卡；先 live readback 并刷新组件清单，读不到就停止诊断。' : `请分析 Agent 与提示词。新会话默认角色卡是 ${effectiveDefaultPreset().name}。先检查身份、项目说明和规则是否一致，不要跨到其他配置领域。`,
+      tools: areaHasPendingValue ? '工具层存在待刷新标记，当前值和组件清单尚未核验。不要引用旧搜索上限或旧组件数量；先 live readback，读不到就停止诊断。' : `请分析工具层。网页搜索每任务最多 ${effectiveWebSearchMaxUses()} 次，当前还有 ${SNAPSHOT.skills.length} 项可用能力。请根据真实使用问题判断，不要只因数量多就删除。`,
+    };
+    startAssistantTask('config', {
+      forceNew: true,
+      configArea: areaPolicy.configArea,
+      targetModule: areaPolicy.targetModule,
+      targetCapability: areaPolicy.targetCapability,
+    });
+    state.assistantOpen = true;
+    sendAssistantMessage(prompts[area] || prompts.model, { focus: false });
+  }
+
+  function updateQuickDraft(key, value) {
+    const policy = PROPOSAL_POLICIES[key];
+    const normalized = policy?.valueType === 'positive-integer' ? Number(value) : String(value);
+    if (policy?.valueType === 'positive-integer' && (!Number.isInteger(normalized) || normalized <= 0)) return;
+    if (!policy?.allowedValues.includes(normalized)) return;
+    state.quickDrafts[key] = normalized;
+  }
+
+  function prepareQuickCandidate(key) {
+    if (state.assistantApplying || state.regressionRunning) {
+      toast(state.assistantApplying ? '配置正在写入并回读，暂时不能更换候选' : '回归运行中，暂时不能更换候选');
+      return;
+    }
+    if (hasRestoredPendingRefresh(key)) {
+      toast('该配置的当前值等待快照刷新，暂不能生成新候选');
+      return;
+    }
+    const policy = PROPOSAL_POLICIES[key];
+    const draftValue = state.quickDrafts[key] ?? '';
+    const writeValue = policy?.valueType === 'positive-integer' ? Number(draftValue) : String(draftValue);
+    if (policy?.valueType === 'positive-integer' && (!Number.isInteger(writeValue) || writeValue <= 0)) {
+      toast('这个值不是有效的正整数');
+      return;
+    }
+    if (!policy?.allowedValues.includes(writeValue)) {
+      toast('这个值不在当前 DSH 的可用范围内');
+      return;
+    }
+    const preset = key === 'defaultPresetId' ? SNAPSHOT.config.presets.find((item) => item.id === writeValue) : null;
+    const copy = {
+      reasoningEffort: { title: '调整新任务的推理强度', display: quickReasoningLabel(writeValue), impact: '候选只改变新任务的思考档位；用同一测试集比较质量、耗时和用量后再决定。' },
+      busyEnter: { title: '调整忙时新消息的处理方式', display: writeValue === 'queue' ? '排队等待' : '引导当前任务', impact: '候选只改变 Agent 忙碌时新消息的进入方式；要验证消息不丢失、不重复。' },
+      defaultPresetId: { title: '切换新会话默认角色卡', display: `${preset?.name || writeValue}（${writeValue}）`, impact: '候选只影响新会话；既有会话保持原角色卡，隔离测试会核对身份、说明与工具入口。' },
+      webSearchMaxUses: { title: '调整每个任务的网页搜索上限', display: `每任务最多 ${writeValue} 次`, impact: '候选只改变搜索调用上限；要同时检查来源完整性、重复检索和模型用量。' },
+    }[key];
+    const candidate = normalizeProposal({
+      key,
+      title: copy.title,
+      newValue: copy.display,
+      writeValue,
+      expectedValue: writeValue,
+      confidence: '用户选择',
+      impact: copy.impact,
+    }, policy.configArea);
+    if (candidate?.noOp) {
+      toast('当前配置已经是这个值');
+      return;
+    }
+    if (!candidate) {
+      toast('候选没有通过配置范围校验');
+      return;
+    }
+    const task = startAssistantTask('config', {
+      forceNew: true,
+      configArea: policy.configArea,
+      targetModule: policy.targetModule,
+      targetCapability: policy.targetCapability,
+    });
+    candidate.status = 'draft';
+    candidate.baseTarget = null;
+    candidate.baseModelEnvironment = null;
+    task.diagnosis = { summary: `你已在快速配置中明确选择“${copy.display}”。`, evidenceCount: 1 };
+    task.candidate = candidate;
+    task.title = candidate.title;
+    task.goal = candidate.impact;
+    state.assistantProposal = null;
+    state.assistantPlans.push({ ...candidate });
+    state.assistantMessages.push({ role: 'assistant', text: `候选“${candidate.title}”已保存。当前 DSH 配置没有变化；下一步先检查并锁定对应测试集。` });
+    state.assistantOpen = true;
+    render();
+    focusAssistantInput();
   }
   function runAssistantMessageAction(index) {
     const action = state.assistantMessages[Number(index)]?.action;
@@ -1302,14 +2787,264 @@
       return;
     }
     if (action.type === 'library' && ['native', 'community'].includes(action.tab)) openLibrary(action.tab);
+    if (action.type === 'trial') openOptimizationWorkbench();
+    if (action.type === 'assistant-topic') askAssistant(action.topic);
   }
   function prepareAssistantProposal() { if (state.assistantApplying) return; state.assistantConfirming = true; render(); }
   function cancelAssistantConfirm() { state.assistantConfirming = false; render(); }
   function dismissAssistantProposal() { if (state.assistantApplying) return; state.assistantProposal = null; state.assistantConfirming = false; render(); }
-  async function applyAssistantProposal() {
+  function applyAssistantProposal() {
     const proposal = state.assistantProposal;
-    if (!proposal || state.assistantApplying) return;
+    if (!proposal || state.assistantApplying || state.regressionRunning) {
+      if (state.regressionRunning) toast('回归运行中，暂时不能更换候选');
+      return;
+    }
     const safeProposal = normalizeProposal(proposal);
+    if (!safeProposal || safeProposal.noOp) {
+      state.assistantMessages.push({ role: 'assistant', text: '候选修改未通过允许范围校验，已停止；当前配置没有变化。' });
+      state.assistantProposal = null;
+      render();
+      return;
+    }
+    const task = state.assistantTask || startAssistantTask('config');
+    task.configArea = safeProposal.configArea;
+    task.targetModule = safeProposal.targetModule;
+    task.targetCapability = safeProposal.targetCapability;
+    invalidateAfterCandidateChange(task);
+    const candidate = {
+      ...proposal,
+      ...safeProposal,
+      id: `candidate-${Date.now()}-${++candidateCounter}`,
+      proposalId: safeProposal.id,
+      kind: 'config',
+      status: 'draft',
+      baseTarget: null,
+      baseModelEnvironment: null,
+    };
+    task.candidate = candidate;
+    state.adoptionConfirming = false;
+    task.title = candidate.title;
+    task.goal = candidate.impact;
+    task.status = 'active';
+    if (!state.assistantPlans.some((plan) => plan.id === candidate.id)) state.assistantPlans.push({ ...candidate });
+    state.assistantMessages.push({ role: 'assistant', text: `候选“${candidate.title}”已保存。当前 DSH 配置没有变化；下一步先生成并检查测试集。` });
+    state.assistantProposal = null;
+    state.assistantConfirming = false;
+    render();
+    focusAssistantInput();
+  }
+
+  function preparePluginCandidate(index) {
+    if (state.assistantApplying || state.regressionRunning) {
+      toast(state.assistantApplying ? '配置正在写入并回读，暂时不能更换候选' : '回归运行中，暂时不能更换候选');
+      return;
+    }
+    const task = state.assistantTask;
+    const plugin = task?.pluginCandidates?.[Number(index)];
+    if (!plugin || task.pluginSearchSource !== 'live_verified' || plugin.liveVerified !== true) {
+      toast('这个插件的实时来源与元数据还没有核对完整');
+      return;
+    }
+    if (hasRestoredPendingRefresh('pluginInstall', plugin.packageName)) {
+      toast('这个插件存在待刷新标记，安装状态待核验');
+      return;
+    }
+    if (!['verified', 'compatible', 'declared'].includes(plugin.compatibility)) {
+      toast('兼容性还不能支持进入隔离测试');
+      return;
+    }
+    invalidateAfterCandidateChange(task);
+    const expectedValue = `${plugin.packageName}@${plugin.version}`;
+    task.candidate = {
+      id: `plugin-candidate-${Date.now()}-${++candidateCounter}`,
+      kind: 'plugin',
+      key: 'pluginInstall',
+      target: '测试配置 → 社区插件',
+      targetId: `plugins:web:${plugin.packageName}`,
+      title: `测试 ${plugin.name}`,
+      confidence: '来源已核对',
+      level: 'medium',
+      oldValue: 'absent',
+      expectedOldValue: 'absent',
+      oldValueDisplay: '未安装',
+      newValue: expectedValue,
+      newValueDisplay: expectedValue,
+      writeValue: expectedValue,
+      expectedValue,
+      packageName: plugin.packageName,
+      version: plugin.version,
+      repo: plugin.repo,
+      versionEvidenceUrl: plugin.versionEvidenceUrl,
+      compatibilityEvidenceUrl: plugin.compatibilityEvidenceUrl,
+      license: plugin.license,
+      compatibility: plugin.compatibility,
+      permissions: [...plugin.permissions],
+      dataEgress: [...plugin.dataEgress],
+      configArea: 'plugins',
+      targetModule: 'tools',
+      targetCapability: 'extensions',
+      impact: `${plugin.desc} 只先加入隔离测试配置，不会安装到当前 Agent。`,
+      checks: ['核对固定版本、许可证与源码来源', '确认隔离环境权限和数据外发', '用锁定测试集与当前配置对比', '采用前再次确认并回读安装版本'],
+      status: 'draft',
+      baseTarget: null,
+      baseModelEnvironment: null,
+      sourceVerifiedAt: plugin.verifiedAt,
+    };
+    task.type = 'config';
+    task.configArea = 'plugins';
+    task.targetModule = 'tools';
+    task.targetCapability = 'extensions';
+    task.diagnosis = task.diagnosis || { summary: `已按能力缺口核对 ${plugin.name} 的版本、来源、兼容性与风险。`, evidenceCount: 2 };
+    task.title = task.candidate.title;
+    task.goal = task.candidate.impact;
+    task.status = 'active';
+    state.assistantPlans.push({ ...task.candidate });
+    state.assistantMessages.push({ role: 'assistant', text: `已把 ${expectedValue} 加入隔离测试方案。当前 Agent 没有下载、安装或启用这个插件；下一步先准备测试集。` });
+    render();
+  }
+
+  function normalizeStoredCandidate(candidate) {
+    if (candidate?.kind !== 'plugin') return normalizeProposal(candidate);
+    const source = state.assistantTask?.pluginCandidates?.find((item) => item.packageName === candidate.packageName && item.version === candidate.version && item.liveVerified);
+    const expectedValue = `${candidate.packageName}@${candidate.version}`;
+    if (!source || candidate.key !== 'pluginInstall' || candidate.targetId !== `plugins:web:${candidate.packageName}` || candidate.expectedValue !== expectedValue || candidate.writeValue !== expectedValue) return null;
+    if (!['verified', 'compatible', 'declared'].includes(candidate.compatibility)) return null;
+    if (!source.versionEvidenceUrl || !source.compatibilityEvidenceUrl || !Array.isArray(source.permissions) || !Array.isArray(source.dataEgress)) return null;
+    return {
+      ...candidate,
+      target: '测试配置 → 社区插件',
+      targetId: `plugins:web:${candidate.packageName}`,
+      oldValue: 'absent',
+      expectedOldValue: 'absent',
+      oldValueDisplay: '未安装',
+      newValue: expectedValue,
+      newValueDisplay: expectedValue,
+      writeValue: expectedValue,
+      expectedValue,
+      checks: Array.isArray(candidate.checks) ? candidate.checks.slice(0, 8) : [],
+    };
+  }
+
+  function candidateAdapterRequest(task, proposal, phase) {
+    const baseTarget = proposal.baseTarget ? {
+      targetId: proposal.baseTarget.targetId,
+      revision: proposal.baseTarget.revision,
+      canonicalValue: proposal.baseTarget.value,
+      evidenceRef: proposal.baseTarget.evidenceRef,
+    } : null;
+    const baseModelEnvironment = proposal.baseModelEnvironment ? {
+      targetId: proposal.baseModelEnvironment.targetId,
+      revision: proposal.baseModelEnvironment.revision,
+      selection: { ...proposal.baseModelEnvironment.selection },
+      evidenceRef: proposal.baseModelEnvironment.evidenceRef,
+    } : null;
+    return {
+      idempotencyKey: `${proposal.id}:${phase}`,
+      phase,
+      targetId: baseTarget?.targetId || proposal.targetId || null,
+      expectedRevision: baseTarget?.revision ?? null,
+      expectedOldValue: proposal.expectedOldValue,
+      key: proposal.key,
+      target: proposal.target,
+      title: proposal.title,
+      value: proposal.writeValue,
+      expectedValue: proposal.expectedValue,
+      candidateKind: proposal.kind || 'config',
+      packageName: proposal.kind === 'plugin' ? proposal.packageName : undefined,
+      version: proposal.kind === 'plugin' ? proposal.version : undefined,
+      versionEvidenceUrl: proposal.kind === 'plugin' ? proposal.versionEvidenceUrl : undefined,
+      compatibilityEvidenceUrl: proposal.kind === 'plugin' ? proposal.compatibilityEvidenceUrl : undefined,
+      permissions: proposal.kind === 'plugin' ? [...proposal.permissions] : undefined,
+      dataEgress: proposal.kind === 'plugin' ? [...proposal.dataEgress] : undefined,
+      checks: Array.isArray(proposal.checks) ? [...proposal.checks] : [],
+      baseTarget,
+      baseModelEnvironment,
+      evidenceRefs: task?.comparison
+        ? [task.comparison.id, task.comparison.baselineRunId, task.comparison.candidateRunId].filter(Boolean)
+        : [],
+    };
+  }
+
+  async function readCurrentCandidateTarget(task, proposal, phase) {
+    if (!configTargetReaderReady()) throw new Error('目标配置读取接口尚未连接');
+    const request = candidateAdapterRequest(task, proposal, phase);
+    const raw = await window.DS_HUB_CONFIG_ADAPTER.preflight(request);
+    if (raw?.ok !== true) throw new Error(raw?.message || '目标配置读取未通过');
+    const snapshot = normalizeTargetSnapshot(raw);
+    if (!snapshot) throw new Error('目标配置读取缺少 targetId、targetRevision、canonicalValue 或 evidenceRef');
+    if (request.targetId && snapshot.targetId !== request.targetId) throw new Error('目标配置读取返回了错误的 targetId');
+    return { request, snapshot };
+  }
+
+  async function readCandidateTarget(task, proposal, phase) {
+    const current = await readCurrentCandidateTarget(task, proposal, phase);
+    const { snapshot } = current;
+    if (!canonicalValueEqual(snapshot.value, proposal.expectedOldValue)) throw new Error('目标配置的 canonical value 或类型已经变化');
+    return current;
+  }
+
+  function adoptionReady(task = state.assistantTask) {
+    const candidate = task?.candidate;
+    const suite = task?.testSuite;
+    const comparison = task?.comparison;
+    return Boolean(candidate
+      && task.configArea
+      && candidate.baseTarget
+      && candidate.baseModelEnvironment
+      && candidate.configArea === task.configArea
+      && candidate.status !== 'submitted-unverified'
+      && suite?.status === 'locked'
+      && suite.contentHash
+      && suite.configArea === task.configArea
+      && suite.candidateId === candidate.id
+      && comparison?.status === 'completed'
+      && comparison?.verified === true
+      && comparison?.acceptanceMet === true
+      && comparison?.environmentAligned === true
+      && comparison?.targetAligned === true
+      && comparison.candidateId === candidate.id
+      && comparison.testSuiteId === suite.id
+      && comparison.testSuiteVersion === suite.version
+      && comparison.testSuiteHash === suite.contentHash
+      && sameTargetSnapshot(comparison.baseTarget, candidate.baseTarget)
+      && sameModelEnvironmentSnapshot(comparison.modelEnvironment, candidate.baseModelEnvironment)
+      && !task?.decision
+      && task?.adoption?.status !== 'submitted_unverified');
+  }
+
+  function prepareAdoption() {
+    const task = state.assistantTask;
+    if (!adoptionReady(task) || task?.decision || state.assistantApplying) {
+      toast('还没有满足采用条件');
+      return;
+    }
+    state.adoptionConfirming = true;
+    render();
+  }
+
+  function cancelAdoptionConfirm() {
+    state.adoptionConfirming = false;
+    render();
+  }
+
+  async function adoptAssistantCandidate() {
+    const task = state.assistantTask;
+    const proposal = task?.candidate;
+    if (!proposal || state.assistantApplying) return;
+    const comparisonReady = adoptionReady(task);
+    if (!comparisonReady) {
+      state.assistantMessages.push({ role: 'assistant', text: '还不能采用：测试集必须已锁定，当前与候选两边都要完成真实回归，并且 provider/model 一致、没有关键失败。' });
+      state.assistantOpen = true;
+      render();
+      return;
+    }
+    if (!state.adoptionConfirming) {
+      state.assistantMessages.push({ role: 'assistant', text: '采用需要单独确认。我没有发起写入；请在效果测试页核对变更后再确认。' });
+      state.assistantOpen = true;
+      render();
+      return;
+    }
+    const safeProposal = normalizeStoredCandidate(proposal);
     if (!safeProposal || safeProposal.noOp) {
       state.assistantMessages.push({ role: 'assistant', text: '候选修改未通过允许范围校验，已停止；没有发起写入。' });
       state.assistantProposal = null;
@@ -1319,11 +3054,9 @@
     Object.assign(proposal, safeProposal);
     const adapter = window.DS_HUB_CONFIG_ADAPTER;
     if (!configAdapterReady()) {
-      proposal.status = 'draft';
-      if (!state.assistantPlans.some((plan) => plan.key === proposal.key && plan.newValue === proposal.newValue)) state.assistantPlans.push({ ...proposal });
-      state.assistantMessages.push({ role: 'assistant', text: '已加入页面候选方案。真实写入未连接，所以 DSH 配置没有变化。' });
-      state.assistantProposal = null;
-      state.assistantConfirming = false;
+      state.adoptionConfirming = false;
+      state.assistantMessages.push({ role: 'assistant', text: '采用接口尚未连接，当前 DSH 配置没有变化。回归结果与候选仍会保留。' });
+      state.assistantOpen = true;
       render();
       focusAssistantInput();
       return;
@@ -1334,50 +3067,716 @@
     render();
     let writeStarted = false;
     try {
-      const writeRequest = {
-        idempotencyKey: proposal.id,
-        key: proposal.key,
-        target: proposal.target,
-        title: proposal.title,
-        expectedOldValue: proposal.oldValue,
-        value: proposal.writeValue,
-        newValue: proposal.writeValue,
-        expectedValue: proposal.expectedValue,
-        checks: [...proposal.checks],
+      const currentModelEnvironment = modelEnvironmentSnapshot(await describeOptimizationEnvironment());
+      if (!sameModelEnvironmentSnapshot(currentModelEnvironment, proposal.baseModelEnvironment)) {
+        throw new Error('当前 provider/model/reasoning 或模型环境 revision 已变化，这次对比不再适合作为采用依据');
+      }
+      if (currentModelEnvironment.evidenceRef === proposal.baseModelEnvironment.evidenceRef) {
+        throw new Error('模型环境预检没有返回本次采用阶段的新读取证据');
+      }
+      const targetPreflight = await readCandidateTarget(task, proposal, 'adopt');
+      if (!sameTargetSnapshot(targetPreflight.snapshot, proposal.baseTarget)) {
+        throw new Error('当前目标配置的 target revision 或 canonical value 已变化，这次对比不再适合作为采用依据');
+      }
+      if (targetPreflight.snapshot.evidenceRef === proposal.baseTarget.evidenceRef
+        || targetPreflight.snapshot.evidenceRef === currentModelEnvironment.evidenceRef) {
+        throw new Error('目标配置预检没有返回独立的新读取证据');
+      }
+      const adoptionPreflight = {
+        target: {
+          targetId: targetPreflight.snapshot.targetId,
+          revision: targetPreflight.snapshot.revision,
+          canonicalValue: targetPreflight.snapshot.value,
+          evidenceRef: targetPreflight.snapshot.evidenceRef,
+        },
+        modelEnvironment: {
+          targetId: currentModelEnvironment.targetId,
+          revision: currentModelEnvironment.revision,
+          selection: { ...currentModelEnvironment.selection },
+          evidenceRef: currentModelEnvironment.evidenceRef,
+        },
       };
-      const preflight = await adapter.preflight(writeRequest);
-      if (preflight === false || preflight?.ok === false) throw new Error(preflight?.message || '应用前检查未通过');
+      const writeRequest = { ...candidateAdapterRequest(task, proposal, 'apply'), idempotencyKey: proposal.id, adoptionPreflight };
+      const writeAttemptedAt = new Date().toISOString();
+      if (!upsertUnknownWriteMarker(proposal, writeAttemptedAt)) throw new Error('无法为这次写入建立无值的状态未知标记');
+      // Persist before crossing the write boundary so a reload or adapter failure
+      // cannot make an uncertain mutation look like the old snapshot is current.
+      if (!persistOptimizationState()) {
+        clearUnknownWriteMarker(proposal);
+        throw new Error('浏览器无法保存状态未知标记，已在发起写入前停止');
+      }
       writeStarted = true;
-      await adapter.apply(writeRequest);
-      const readback = await adapter.readback(proposal.key);
-      const readbackIsObject = Boolean(readback && typeof readback === 'object');
-      const hasReadbackValue = readbackIsObject ? Object.prototype.hasOwnProperty.call(readback, 'value') : readback !== undefined;
-      const readbackValue = readbackIsObject ? readback.value : readback;
-      const expectedValue = proposal.expectedValue ?? proposal.newValue;
-      const verified = hasReadbackValue && String(readbackValue) === String(expectedValue);
+      const applyResult = await adapter.apply(writeRequest);
+      const appliedTargetId = String(applyResult?.targetId || '').trim();
+      const appliedRevision = applyResult?.targetRevision;
+      const applyEvidenceRef = String(applyResult?.evidenceRef || '').trim();
+      const guardEvidenceRef = String(applyResult?.guardEvidenceRef || '').trim();
+      const guardedTarget = normalizeTargetSnapshot(applyResult?.guards?.target);
+      const guardedModelEnvironment = modelEnvironmentSnapshot(applyResult?.guards?.modelEnvironment);
+      const guardsVerified = sameTargetSnapshot(guardedTarget, targetPreflight.snapshot)
+        && guardedTarget?.evidenceRef === targetPreflight.snapshot.evidenceRef
+        && sameModelEnvironmentSnapshot(guardedModelEnvironment, currentModelEnvironment)
+        && guardedModelEnvironment?.evidenceRef === currentModelEnvironment.evidenceRef;
+      const applyProofRefs = [targetPreflight.snapshot.evidenceRef, currentModelEnvironment.evidenceRef, guardEvidenceRef, applyEvidenceRef];
+      if (applyResult?.ok !== true || appliedTargetId !== proposal.baseTarget.targetId || appliedRevision == null
+        || !guardsVerified || applyProofRefs.some((item) => !item) || new Set(applyProofRefs).size !== applyProofRefs.length) {
+        throw new Error('写入已发起，但没有证明同一操作同时守住目标 revision 与模型环境 revision');
+      }
+      if (String(appliedRevision) === String(proposal.baseTarget.revision)) throw new Error('写入返回的 targetRevision 没有前进');
+      const readback = await adapter.readback({ ...writeRequest, appliedTargetRevision: appliedRevision, applyEvidenceRef, guardEvidenceRef });
+      const readbackTargetId = String(readback?.targetId || '').trim();
+      const readbackRevision = readback?.targetRevision;
+      const readbackEvidenceRef = String(readback?.evidenceRef || '').trim();
+      const hasCanonicalValue = Boolean(readback && Object.prototype.hasOwnProperty.call(readback, 'canonicalValue'));
+      const readbackValue = hasCanonicalValue ? readback.canonicalValue : undefined;
+      const expectedValue = proposal.expectedValue;
+      const manifestEvidenceRef = String(readback?.manifest?.evidenceRef || '').trim();
+      const manifestDigest = String(readback?.manifest?.digest || '').trim();
+      const inventoryEvidenceRef = String(readback?.inventory?.evidenceRef || '').trim();
+      const manifestEntries = Array.isArray(readback?.manifest?.entries) ? readback.manifest.entries : [];
+      const inventoryModuleName = String(readback?.inventory?.moduleName || '').trim();
+      const inventoryEntryId = String(readback?.inventory?.entryId || '').trim();
+      const inventoryPackageName = String(readback?.inventory?.resolvedPackageName || '').trim();
+      const inventoryVersion = String(readback?.inventory?.resolvedVersion || '').trim();
+      const inventoryManifestDigest = String(readback?.inventory?.manifestDigest || '').trim();
+      const reloadGeneration = String(readback?.inventory?.reloadGeneration || '').trim();
+      const manifestBindsInventory = manifestEntries.some((entry) => entry
+        && String(entry.moduleName || '').trim() === inventoryModuleName
+        && String(entry.entryId || '').trim() === inventoryEntryId);
+      const pluginInventoryVerified = proposal.kind !== 'plugin' || Boolean(
+        readback?.manifest
+        && readback.manifest.packageName === proposal.packageName
+        && readback.manifest.version === proposal.version
+        && readback.manifest.state === 'installed'
+        && manifestDigest
+        && manifestEntries.length
+        && manifestEvidenceRef
+        && readback?.inventory
+        && inventoryModuleName
+        && inventoryEntryId
+        && manifestBindsInventory
+        && inventoryPackageName === proposal.packageName
+        && inventoryVersion === proposal.version
+        && inventoryManifestDigest === manifestDigest
+        && reloadGeneration
+        && readback.inventory.enabled === true
+        && readback.inventory.fiberPhase === 'active'
+        && inventoryEvidenceRef
+      );
+      const adoptionEvidenceRefs = [...applyProofRefs, readbackEvidenceRef, ...(proposal.kind === 'plugin' ? [manifestEvidenceRef, inventoryEvidenceRef] : [])];
+      const verified = readback?.verified === true
+        && readbackTargetId === proposal.baseTarget.targetId
+        && readbackRevision != null
+        && String(readbackRevision) === String(appliedRevision)
+        && hasCanonicalValue
+        && canonicalValueEqual(readbackValue, expectedValue)
+        && adoptionEvidenceRefs.every(Boolean)
+        && new Set(adoptionEvidenceRefs).size === adoptionEvidenceRefs.length
+        && pluginInventoryVerified;
       if (verified) {
         proposal.status = 'verified';
         proposal.readbackValue = readbackValue;
         state.appliedOverrides[proposal.key] = readbackValue;
+        if (Object.prototype.hasOwnProperty.call(state.quickDrafts, proposal.key)) state.quickDrafts[proposal.key] = readbackValue;
+        const adoptedReadbackAt = new Date().toISOString();
+        if (proposal.kind === 'plugin') {
+          state.verifiedInstalls[proposal.packageName] = {
+            packageName: proposal.packageName,
+            version: proposal.version,
+            readbackAt: adoptedReadbackAt,
+            manifestDigest,
+            manifestEntries: manifestEntries.map((entry) => ({ moduleName: String(entry.moduleName), entryId: String(entry.entryId) })),
+            inventory: {
+              moduleName: inventoryModuleName,
+              entryId: inventoryEntryId,
+              fiberPhase: readback.inventory.fiberPhase,
+              reloadGeneration,
+            },
+          };
+        }
+        upsertPendingRefreshRecord(proposal, readbackRevision, adoptedReadbackAt);
         rebuildCapabilityIndex();
         RECOMMENDATIONS = buildRecommendations();
-        if (!state.assistantPlans.some((plan) => plan.id === proposal.id)) state.assistantPlans.push({ ...proposal });
+        const planIndex = state.assistantPlans.findIndex((plan) => plan.id === proposal.id);
+        if (planIndex >= 0) state.assistantPlans[planIndex] = { ...proposal };
+        else state.assistantPlans.push({ ...proposal });
         state.assistantProposal = null;
-        state.assistantMessages.push({ role: 'assistant', text: `写入完成，并已回读一致：${proposal.title}。下一步应在隔离任务里验证效果。` });
+        task.decision = 'adopted';
+        task.status = 'adopted_unobserved';
+        task.adoption = {
+          status: 'adopted_unobserved',
+          adoptedAt: new Date().toISOString(),
+          targetId: proposal.baseTarget.targetId,
+          readbackValue,
+          appliedTargetRevision: appliedRevision,
+          readbackTargetRevision: readbackRevision,
+          guardEvidenceRef,
+          applyEvidenceRef,
+          readbackEvidenceRef,
+        };
+        state.assistantMessages.push({ role: 'assistant', text: `候选已采用并回读一致：${proposal.title}。这只证明配置写入完成；还要观察使用新配置的真实任务，才能判断线上正常。` });
       } else {
         proposal.status = 'submitted-unverified';
-        state.assistantMessages.push({ role: 'assistant', text: '写入请求已返回，但回读值与候选值不一致。真实状态未知，请先核对设置，不要重复提交。' });
+        task.decision = 'unknown';
+        task.status = 'blocked';
+        task.adoption = {
+          status: 'submitted_unverified',
+          targetId: proposal.baseTarget.targetId,
+          expectedValue,
+          appliedTargetRevision: appliedRevision,
+          readbackTargetRevision: readbackRevision,
+        };
+        const planIndex = state.assistantPlans.findIndex((plan) => plan.id === proposal.id);
+        if (planIndex >= 0) state.assistantPlans[planIndex] = { ...proposal };
+        else state.assistantPlans.push({ ...proposal });
+        state.assistantMessages.push({ role: 'assistant', text: '写入请求已返回，但回读值或 revision 没有与写入结果一致。真实状态未知，请先核对设置，不要重复提交。' });
       }
     } catch (error) {
       proposal.status = writeStarted ? 'submitted-unverified' : 'candidate';
+      if (writeStarted) {
+        task.decision = 'unknown';
+        task.status = 'blocked';
+        task.adoption = { status: 'submitted_unverified' };
+        const planIndex = state.assistantPlans.findIndex((plan) => plan.id === proposal.id);
+        if (planIndex >= 0) state.assistantPlans[planIndex] = { ...proposal };
+        else state.assistantPlans.push({ ...proposal });
+      }
       state.assistantMessages.push({ role: 'assistant', text: writeStarted
         ? `写入已发起，但没有拿到可信回读：${error?.message || '未知错误'}。真实状态未知，请先核对设置，不要重复提交。`
         : `应用前检查或写入未完成：${error?.message || '未知错误'}。没有证据表明配置已改变。` });
     } finally {
       state.assistantApplying = false;
+      state.adoptionConfirming = false;
       render();
       focusAssistantInput();
     }
+  }
+
+  function optimizationAdapterReady() {
+    const adapter = window.DS_HUB_OPTIMIZATION_ADAPTER;
+    return Boolean(adapter && typeof adapter.describeEnvironment === 'function' && typeof adapter.runComparison === 'function');
+  }
+
+  function postAdoptionObservationReady() {
+    return Boolean(window.DS_HUB_OPTIMIZATION_ADAPTER && typeof window.DS_HUB_OPTIMIZATION_ADAPTER.observeAdoption === 'function');
+  }
+
+  async function runPostAdoptionObservation() {
+    const task = state.assistantTask;
+    if (task?.decision !== 'adopted' || !task.adoption) return;
+    if (!postAdoptionObservationReady()) {
+      state.assistantMessages.push({ role: 'assistant', text: '线上观察接口尚未连接。配置采用与回读已经完成，但没有新任务证据，因此不会标记为健康。' });
+      state.assistantOpen = true;
+      render();
+      return;
+    }
+    const requestId = `observation-${Date.now()}-${++observationRequestCounter}`;
+    const request = {
+      requestId,
+      taskId: task.id,
+      candidateId: task.candidate.id,
+      targetId: task.adoption.targetId,
+      appliedRevision: task.adoption.readbackTargetRevision,
+      adoptedAt: task.adoption.adoptedAt,
+      minimumTasks: MIN_OBSERVATION_TASKS,
+    };
+    task.observation = { status: 'running', requestId };
+    render();
+    try {
+      const raw = await window.DS_HUB_OPTIMIZATION_ADAPTER.observeAdoption(request);
+      const taskCount = Number(raw?.taskCount);
+      const outcome = String(raw?.outcome || '');
+      const adoptedAtMs = Date.parse(task.adoption.adoptedAt);
+      const startedAtMs = Date.parse(raw?.window?.startedAt);
+      const endedAtMs = Date.parse(raw?.window?.endedAt);
+      const receipt = raw?.observationReceipt || {};
+      const receiptEvidenceRef = String(receipt.evidenceRef || '').trim();
+      const receiptIssuedAtMs = Date.parse(receipt.issuedAt);
+      const observedTasks = Array.isArray(raw?.tasks) ? raw.tasks.map((item) => ({
+        taskId: String(item?.taskId || '').trim(),
+        sessionId: String(item?.sessionId || '').trim(),
+        startedAt: String(item?.startedAt || ''),
+        targetId: String(item?.targetId || '').trim(),
+        appliedRevision: item?.appliedRevision,
+        outcome: String(item?.outcome || ''),
+        evidenceRef: String(item?.evidenceRef || '').trim(),
+      })) : [];
+      const taskEvidenceRefs = observedTasks.map((item) => item.evidenceRef);
+      const receiptTaskEvidenceRefs = Array.isArray(receipt.taskEvidenceRefs) ? receipt.taskEvidenceRefs.map((item) => String(item || '').trim()) : [];
+      const observedTaskKeys = observedTasks.map((item) => `${item.taskId}:${item.sessionId}`);
+      const tasksBound = observedTasks.length > 0 && observedTasks.every((item) => {
+        const itemStartedAtMs = Date.parse(item.startedAt);
+        return item.taskId && item.sessionId && item.evidenceRef
+          && item.targetId === request.targetId
+          && String(item.appliedRevision) === String(request.appliedRevision)
+          && ['passed', 'failed', 'unknown'].includes(item.outcome)
+          && Number.isFinite(itemStartedAtMs)
+          && itemStartedAtMs >= adoptedAtMs
+          && itemStartedAtMs >= startedAtMs
+          && itemStartedAtMs <= endedAtMs;
+      }) && new Set(observedTaskKeys).size === observedTaskKeys.length
+        && new Set(taskEvidenceRefs).size === taskEvidenceRefs.length;
+      const derivedOutcome = observedTasks.some((item) => item.outcome === 'failed') ? 'degraded'
+        : observedTasks.length >= MIN_OBSERVATION_TASKS && observedTasks.every((item) => item.outcome === 'passed') ? 'healthy'
+          : 'insufficient';
+      const receiptBound = String(receipt.id || '').trim()
+        && String(receipt.digest || '').trim()
+        && receiptEvidenceRef
+        && receipt.requestId === requestId
+        && receipt.taskId === task.id
+        && receipt.candidateId === task.candidate.id
+        && receipt.targetId === request.targetId
+        && String(receipt.appliedRevision) === String(request.appliedRevision)
+        && receiptTaskEvidenceRefs.length === taskEvidenceRefs.length
+        && new Set(receiptTaskEvidenceRefs).size === receiptTaskEvidenceRefs.length
+        && receiptTaskEvidenceRefs.every((ref) => taskEvidenceRefs.includes(ref))
+        && Number.isFinite(receiptIssuedAtMs)
+        && receiptIssuedAtMs >= endedAtMs;
+      const evidenceRefs = [receiptEvidenceRef, ...taskEvidenceRefs];
+      const valid = raw?.status === 'observed'
+        && raw?.requestId === requestId
+        && raw?.taskId === task.id
+        && raw?.candidateId === task.candidate.id
+        && raw?.targetId === request.targetId
+        && String(raw?.appliedRevision) === String(request.appliedRevision)
+        && outcome === derivedOutcome
+        && Number.isInteger(taskCount) && taskCount === observedTasks.length
+        && tasksBound
+        && receiptBound
+        && evidenceRefs.every(Boolean) && new Set(evidenceRefs).size === evidenceRefs.length
+        && Number.isFinite(adoptedAtMs)
+        && Number.isFinite(startedAtMs)
+        && Number.isFinite(endedAtMs)
+        && startedAtMs >= adoptedAtMs
+        && endedAtMs >= startedAtMs;
+      if (!valid) throw new Error('观察结果没有完整绑定任务、候选、配置版本、逐任务证据与观察凭据');
+      task.observation = {
+        status: 'observed', outcome, taskCount, requestId, window: raw.window, evidenceRefs,
+        receipt: { id: receipt.id, digest: receipt.digest, evidenceRef: receiptEvidenceRef },
+        tasks: observedTasks,
+      };
+      task.status = outcome === 'healthy' ? 'complete' : outcome === 'degraded' ? 'needs_rollback' : 'adopted_unobserved';
+      state.assistantMessages.push({ role: 'assistant', text: outcome === 'healthy'
+        ? `已观察 ${taskCount} 个使用新配置的任务，证据显示当前表现正常。`
+        : outcome === 'degraded' ? `已观察 ${taskCount} 个新任务并发现退化。建议先生成回滚候选，再用固定测试集验证。`
+          : `已观察 ${taskCount} 个新任务，但证据仍不足，暂不标记为健康。` });
+    } catch (error) {
+      task.observation = { status: 'unverified', error: String(error?.message || '未知错误') };
+      task.status = 'adopted_unobserved';
+      state.assistantMessages.push({ role: 'assistant', text: `线上观察没有形成可信结论：${error?.message || '连接失败'}。采用状态不变，仍等待观察。` });
+    } finally {
+      render();
+    }
+  }
+
+  function prepareRollbackCandidate() {
+    const previousTask = state.assistantTask;
+    const previous = previousTask?.candidate;
+    if (previousTask?.decision !== 'adopted' || !previous) return;
+    const policy = PROPOSAL_POLICIES[previous.key];
+    if (!policy || !policy.allowedValues.includes(previous.oldValue)) {
+      state.assistantOpen = true;
+      state.assistantMessages.push({ role: 'assistant', text: previous.kind === 'plugin'
+        ? '插件卸载需要由 sidecar 先回读依赖与组件占用，不能直接把“卸载”当成安全回滚。我会保留原版本和安装证据，等待生成受控卸载候选。'
+        : '原值不在当前安全写入白名单中，不能一键回滚。我已保留修改前值和 revision；请先让助手基于当前风险生成受控回滚方案。' });
+      render();
+      return;
+    }
+    const rollback = normalizeProposal({
+      key: previous.key,
+      title: `回滚：${previous.title}`,
+      writeValue: previous.oldValue,
+      expectedValue: previous.oldValue,
+      newValue: candidateValueDisplay(previous.key, previous.oldValue),
+      confidence: '基于已回读旧值',
+      impact: '恢复到本次采用前的回读值；仍需用同一测试集隔离验证，不能直接写入。',
+    }, previous.configArea);
+    if (!rollback || rollback.noOp) {
+      toast('当前配置已经是修改前的值，未生成回滚候选');
+      return;
+    }
+    const task = startAssistantTask('config', {
+      forceNew: true,
+      configArea: previous.configArea,
+      targetModule: previous.targetModule,
+      targetCapability: previous.targetCapability,
+    });
+    rollback.status = 'draft';
+    rollback.rollbackOf = previous.id;
+    task.title = rollback.title;
+    task.goal = rollback.impact;
+    task.diagnosis = { summary: '基于上一次采用前的真实回读值生成回滚候选。', evidenceCount: 1 };
+    task.candidate = rollback;
+    state.assistantPlans.push({ ...rollback });
+    state.assistantMessages.push({ role: 'assistant', text: `回滚候选“${rollback.title}”已保存。它尚未写入；请先检查并锁定测试集。` });
+    goTrial();
+  }
+
+  async function recheckUnknownAdoption() {
+    const task = state.assistantTask;
+    if (task?.decision !== 'unknown' || !task.candidate || !configTargetReaderReady()) {
+      toast('当前没有可重新读取的未知写入，或读取接口尚未连接');
+      return;
+    }
+    try {
+      const read = await readCurrentCandidateTarget(task, task.candidate, 'recheck');
+      const matchesExpected = canonicalValueEqual(read.snapshot.value, task.candidate.expectedValue);
+      const matchesPrevious = canonicalValueEqual(read.snapshot.value, task.candidate.expectedOldValue);
+      task.adoption = {
+        ...(task.adoption || {}),
+        recheck: {
+          revision: read.snapshot.revision,
+          canonicalValue: read.snapshot.value,
+          evidenceRef: read.snapshot.evidenceRef,
+          matchesExpected,
+          matchesPrevious,
+        },
+      };
+      const pluginNeedsInventory = task.candidate.kind === 'plugin' && matchesExpected;
+      const canReleaseMarker = (matchesExpected || matchesPrevious) && !pluginNeedsInventory;
+      if (canReleaseMarker) {
+        if (task.candidate.kind !== 'plugin') {
+          state.appliedOverrides[task.candidate.key] = read.snapshot.value;
+          if (Object.prototype.hasOwnProperty.call(state.quickDrafts, task.candidate.key)) state.quickDrafts[task.candidate.key] = read.snapshot.value;
+        }
+        clearUnknownWriteMarker(task.candidate);
+      }
+      state.assistantMessages.push({ role: 'assistant', text: canReleaseMarker
+        ? (matchesExpected
+          ? 'live readback 已核对该目标的当前值，无值标记已解除；上一次写入链仍未闭合，不作为采用或效果证据。'
+          : 'live readback 显示该目标仍是尝试前的值，无值标记已解除。没有自动重试写入。')
+        : pluginNeedsInventory
+          ? '目标值已重新读取，但还缺少 Manifest 与运行 Inventory 的独立核对；安装状态仍未知，不解除标记。'
+          : '重新读取的当前值既不是尝试前的值，也不是候选目标。真实状态仍需人工核对；没有自动重试写入。' });
+    } catch (error) {
+      state.assistantMessages.push({ role: 'assistant', text: `重新读取失败：${error?.message || '连接失败'}。没有发起写入。` });
+    }
+    state.assistantOpen = true;
+    render();
+  }
+
+  async function describeOptimizationEnvironment(signal) {
+    const raw = await window.DS_HUB_OPTIMIZATION_ADAPTER.describeEnvironment({ signal });
+    const selection = normalizeModelSelection(raw?.selection);
+    const revision = raw?.settingsRevision ?? raw?.revision;
+    const targetId = String(raw?.targetId || '').trim();
+    const evidenceRef = String(raw?.evidenceRef || '').trim();
+    if (!selection) throw new Error('回归执行器没有返回当前 DSH provider/model');
+    if (revision == null) throw new Error('回归执行器没有返回当前模型环境 revision');
+    if (!targetId) throw new Error('回归执行器没有返回模型环境 targetId');
+    if (!evidenceRef) throw new Error('回归执行器没有返回模型环境读取证据');
+    if (raw?.routable === false) throw new Error(`DSH 当前模型不可路由：${selection.provider} / ${selection.model}`);
+    return {
+      source: raw?.source || 'dsh-agent-default-model',
+      targetId,
+      selection,
+      revision,
+      evidenceRef,
+    };
+  }
+
+  function lockAssistantTestSuite() {
+    const task = state.assistantTask;
+    const suite = task?.testSuite;
+    if (!suite || suite.status !== 'draft') return;
+    const ids = suite.cases.map((item) => item.id);
+    if (!suite.cases.length || new Set(ids).size !== ids.length || suite.cases.some((item) => !item.input || !item.expectedBehavior)) {
+      toast('测试题必须具有唯一编号、输入和通过条件');
+      return;
+    }
+    if ((task.candidate && suite.candidateId !== task.candidate.id) || (task.configArea && suite.configArea !== task.configArea)) {
+      toast('这份测试集不属于当前配置候选，请重新生成');
+      return;
+    }
+    if (suite.acceptance.criticalMustPass && !suite.cases.some((item) => item.priority === 'critical')) {
+      toast('至少需要一条关键题才能锁定');
+      return;
+    }
+    invalidateAfterTestSuiteChange(task);
+    suite.cases = suite.cases.map((item) => ({ ...item, reviewStatus: 'approved' }));
+    suite.status = 'locked';
+    suite.lockedAt = new Date().toISOString();
+    suite.contentHash = stableContentHash({ version: suite.version, configArea: suite.configArea, candidateId: suite.candidateId, acceptance: suite.acceptance, cases: suite.cases });
+    render();
+    toast('测试集已锁定，可以用于正式对比');
+  }
+
+  function prepareRegression() {
+    const task = state.assistantTask;
+    if (!task?.candidate || task.testSuite?.status !== 'locked') {
+      toast('请先准备候选并锁定测试集');
+      return;
+    }
+    if (!optimizationAdapterReady()) {
+      state.assistantOpen = true;
+      state.assistantMessages.push({ role: 'assistant', text: '回归执行器尚未连接。这一版只保留真实执行入口，不会用模拟数字代替当前与候选配置的实际运行。' });
+      render();
+      return;
+    }
+    if (!configTargetReaderReady()) {
+      state.assistantOpen = true;
+      state.assistantMessages.push({ role: 'assistant', text: '目标配置读取接口尚未连接，无法锁定候选对应的 target revision 与 canonical value。没有运行回归。' });
+      render();
+      return;
+    }
+    state.regressionConfirming = true;
+    render();
+  }
+
+  function cancelRegressionConfirm() { state.regressionConfirming = false; render(); }
+
+  function expectedComparisonEnvironments(candidate, baselineSelection) {
+    const baseline = { ...baselineSelection };
+    const candidateSelection = { ...baselineSelection };
+    if (candidate.key === 'reasoningEffort') candidateSelection.reasoningEffort = String(candidate.expectedValue);
+    return { baseline, candidate: candidateSelection };
+  }
+
+  function normalizeEvidenceBinding(raw, run, caseId = null, expectedType = null, expectedRequestId = null) {
+    if (!raw || typeof raw !== 'object') return null;
+    const binding = {
+      ref: String(raw.ref || '').trim(),
+      runId: String(raw.runId || '').trim(),
+      sessionId: String(raw.sessionId || '').trim(),
+      turn: raw.turn == null ? '' : String(raw.turn),
+      caseId: raw.caseId == null ? null : String(raw.caseId),
+      type: String(raw.type || '').trim(),
+      seq: Number(raw.seq),
+      requestId: String(raw.requestId || '').trim(),
+      parentRef: String(raw.parentRef || '').trim(),
+    };
+    if (!binding.ref || !binding.type || !Number.isInteger(binding.seq) || binding.seq < 0) return null;
+    if (expectedType && binding.type !== expectedType) return null;
+    if (binding.runId !== run.runId || binding.sessionId !== run.sessionId || binding.turn !== run.turn) return null;
+    if (caseId === null && binding.caseId !== null) return null;
+    if (caseId !== null && binding.caseId !== caseId) return null;
+    if (expectedRequestId !== null && (!binding.requestId || binding.requestId !== expectedRequestId)) return null;
+    return binding;
+  }
+
+  function normalizeComparisonRun(raw, expectedSelection, baseTarget, expectedValue) {
+    if (!raw || typeof raw !== 'object') return null;
+    const run = {
+      runId: String(raw.runId || '').trim(),
+      sessionId: String(raw.sessionId || '').trim(),
+      turn: raw.turn == null ? '' : String(raw.turn),
+      requestId: String(raw.requestId || '').trim(),
+    };
+    if (!run.runId || !run.sessionId || !run.turn || !run.requestId) return null;
+    const environment = raw.environment || {};
+    const sessionSelection = normalizeModelSelection(environment.sessionSelection);
+    const requestHeader = normalizeModelSelection(environment.requestHeader);
+    const responseProvenance = normalizeModelSelection(environment.responseProvenance);
+    const environmentEvidence = [
+      normalizeEvidenceBinding(environment.sessionSelection?.evidence, run, null, 'session/selection', run.requestId),
+      normalizeEvidenceBinding(environment.requestHeader?.evidence, run, null, 'request/header', run.requestId),
+      normalizeEvidenceBinding(environment.responseProvenance?.evidence, run, null, 'assistant/message', run.requestId),
+      normalizeEvidenceBinding(environment.turnEnd?.evidence, run, null, 'turn/end', run.requestId),
+    ];
+    const targetReadback = raw.targetReadback || {};
+    const targetEvidence = normalizeEvidenceBinding(targetReadback.evidence, run, null, 'target/readback', run.requestId);
+    const hasCanonicalValue = Object.prototype.hasOwnProperty.call(targetReadback, 'canonicalValue');
+    const evidenceRefs = [...environmentEvidence, targetEvidence].filter(Boolean).map((item) => item.ref);
+    const [selectionEvidence, requestEvidence, responseEvidence, turnEndEvidence] = environmentEvidence;
+    const causalChain = Boolean(selectionEvidence && targetEvidence && requestEvidence && responseEvidence && turnEndEvidence)
+      && requestEvidence.seq < responseEvidence.seq
+      && responseEvidence.seq < turnEndEvidence.seq
+      && targetEvidence.parentRef === selectionEvidence.ref
+      && requestEvidence.parentRef === targetEvidence.ref
+      && responseEvidence.parentRef === requestEvidence.ref
+      && turnEndEvidence.parentRef === responseEvidence.ref;
+    return {
+      ...run,
+      raw,
+      evidenceRefs,
+      environmentAligned: sameExactModelSelection(sessionSelection, expectedSelection)
+        && sameExactModelSelection(requestHeader, expectedSelection)
+        && sameModelSelection(responseProvenance, expectedSelection, false)
+        && environment.responseProvenance?.kind === 'model'
+        && Boolean(String(environment.sandboxPolicy || '').trim())
+        && environment.isolated === true
+        && environmentEvidence.every(Boolean)
+        && causalChain
+        && environment.turnEnd?.reason?.kind === 'completed',
+      targetAligned: targetReadback.targetId === baseTarget.targetId
+        && String(targetReadback.sourceTargetRevision) === String(baseTarget.revision)
+        && hasCanonicalValue
+        && canonicalValueEqual(targetReadback.canonicalValue, expectedValue)
+        && Boolean(targetEvidence)
+        && causalChain,
+    };
+  }
+
+  function normalizeStrictComparison(raw, task, modelEnvironment, expectedEnvironments) {
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.caseResults)) return null;
+    const baseTarget = normalizeTargetSnapshot(raw.baseTarget);
+    const returnedModelEnvironment = modelEnvironmentSnapshot(raw.modelEnvironment);
+    const baseline = normalizeComparisonRun(raw.runs?.baseline, expectedEnvironments.baseline, task.candidate.baseTarget, task.candidate.baseTarget.value);
+    const candidate = normalizeComparisonRun(raw.runs?.candidate, expectedEnvironments.candidate, task.candidate.baseTarget, task.candidate.expectedValue);
+    if (!baseline || !candidate) return null;
+    const expectedIds = task.testSuite.cases.map((item) => item.id);
+    const completeStatuses = new Set(['passed', 'failed', 'error', 'timeout', 'cancelled']);
+    const caseResults = raw.caseResults.map((item) => {
+      const caseId = String(item.caseId || '').slice(0, 80);
+      const baselineEvidence = normalizeEvidenceBinding(item.baseline?.evidence, baseline, caseId, 'case/result');
+      const candidateEvidence = normalizeEvidenceBinding(item.candidate?.evidence, candidate, caseId, 'case/result');
+      const baselineStatus = String(item.baseline?.status || 'unknown').slice(0, 40);
+      const candidateStatus = String(item.candidate?.status || 'unknown').slice(0, 40);
+      return {
+        caseId,
+        verdict: ['better', 'same', 'worse', 'unscored'].includes(item.verdict) ? item.verdict : 'unscored',
+        baselineStatus,
+        candidateStatus,
+        baselineEvidenceRef: baselineEvidence?.ref || '',
+        candidateEvidenceRef: candidateEvidence?.ref || '',
+        evidenceBound: Boolean(baselineEvidence && candidateEvidence),
+        statusesComplete: completeStatuses.has(baselineStatus) && completeStatuses.has(candidateStatus),
+      };
+    });
+    const returnedIds = caseResults.map((item) => item.caseId);
+    const idsComplete = returnedIds.length === expectedIds.length
+      && new Set(returnedIds).size === returnedIds.length
+      && expectedIds.every((id) => returnedIds.includes(id));
+    const allEvidenceRefs = [
+      ...baseline.evidenceRefs,
+      ...candidate.evidenceRefs,
+      ...caseResults.flatMap((item) => [item.baselineEvidenceRef, item.candidateEvidenceRef]),
+    ];
+    const evidenceComplete = caseResults.every((item) => item.statusesComplete && item.evidenceBound)
+      && allEvidenceRefs.every(Boolean)
+      && new Set(allEvidenceRefs).size === allEvidenceRefs.length;
+    const sameSandbox = baseline.raw.environment.sandboxPolicy === candidate.raw.environment.sandboxPolicy;
+    const environmentAligned = baseline.environmentAligned && candidate.environmentAligned && sameSandbox;
+    const targetAligned = baseline.targetAligned && candidate.targetAligned;
+    const bindingAligned = raw.candidateId === task.candidate.id
+      && raw.testSuiteId === task.testSuite.id
+      && raw.testSuiteVersion === task.testSuite.version
+      && raw.testSuiteHash === task.testSuite.contentHash
+      && sameTargetSnapshot(baseTarget, task.candidate.baseTarget)
+      && sameModelEnvironmentSnapshot(returnedModelEnvironment, modelEnvironment);
+    const criticalIds = new Set(task.testSuite.cases.filter((item) => item.priority === 'critical').map((item) => item.id));
+    const candidatePassed = caseResults.filter((item) => item.candidateStatus === 'passed').length;
+    const criticalFailures = caseResults.filter((item) => criticalIds.has(item.caseId) && item.candidateStatus !== 'passed').length;
+    const candidatePassRate = caseResults.length ? candidatePassed / caseResults.length : 0;
+    const acceptanceMet = candidatePassRate >= task.testSuite.acceptance.minimumPassRate
+      && (!task.testSuite.acceptance.criticalMustPass || criticalFailures === 0);
+    return {
+      id: String(raw.id || `comparison-${Date.now()}`).slice(0, 100),
+      status: raw.status === 'completed' ? 'completed' : 'partial',
+      verified: raw.verified === true && idsComplete && evidenceComplete && bindingAligned && environmentAligned && targetAligned
+        && baseline.runId !== candidate.runId && baseline.sessionId !== candidate.sessionId,
+      acceptanceMet,
+      environmentAligned,
+      targetAligned,
+      candidateId: task.candidate.id,
+      testSuiteId: task.testSuite.id,
+      testSuiteVersion: task.testSuite.version,
+      testSuiteHash: task.testSuite.contentHash,
+      baseTarget,
+      modelEnvironment: returnedModelEnvironment,
+      baselineRunId: baseline.runId,
+      candidateRunId: candidate.runId,
+      caseResults,
+      summary: {
+        total: caseResults.length,
+        improved: caseResults.filter((item) => item.verdict === 'better').length,
+        regressed: caseResults.filter((item) => item.verdict === 'worse').length,
+        candidatePassed,
+        candidatePassRate,
+        criticalFailures,
+      },
+      runs: raw.runs,
+    };
+  }
+
+  async function runAssistantRegression() {
+    const task = state.assistantTask;
+    if (!task?.candidate || task.testSuite?.status !== 'locked' || !optimizationAdapterReady() || state.regressionRunning) return;
+    if (!state.regressionConfirming) {
+      state.assistantMessages.push({ role: 'assistant', text: '运行回归需要单独确认。我没有创建隔离会话或产生模型用量。' });
+      state.assistantOpen = true;
+      render();
+      return;
+    }
+    state.regressionConfirming = false;
+    state.adoptionConfirming = false;
+    state.regressionRunning = true;
+    task.comparison = null;
+    render();
+    try {
+      const targetCapture = await readCandidateTarget(task, task.candidate, 'capture');
+      if (task.candidate.baseTarget && !sameTargetSnapshot(task.candidate.baseTarget, targetCapture.snapshot)) {
+        task.candidate.status = 'invalidated';
+        throw new Error('候选对应的目标配置已经变化，请重新生成候选后再运行回归');
+      }
+      task.candidate.baseTarget = targetCapture.snapshot;
+      const liveEnvironment = await describeOptimizationEnvironment();
+      const modelEnvironment = modelEnvironmentSnapshot(liveEnvironment);
+      if (!modelEnvironment) throw new Error('回归执行器没有返回完整模型环境');
+      if (task.candidate.baseModelEnvironment && !sameModelEnvironmentSnapshot(task.candidate.baseModelEnvironment, modelEnvironment)) {
+        task.candidate.status = 'invalidated';
+        throw new Error('候选绑定的模型环境已经变化，请重新生成候选后再运行回归');
+      }
+      if (modelEnvironment.evidenceRef === task.candidate.baseTarget.evidenceRef) {
+        throw new Error('目标配置与模型环境必须来自两份独立读取证据');
+      }
+      task.candidate.baseModelEnvironment = modelEnvironment;
+      const expectedEnvironments = expectedComparisonEnvironments(task.candidate, modelEnvironment.selection);
+      const raw = await window.DS_HUB_OPTIMIZATION_ADAPTER.runComparison({
+        idempotencyKey: `${task.id}:${task.testSuite.id}:${task.candidate.id}`,
+        taskId: task.id,
+        baseline: { preset: effectiveDefaultPreset().id, target: { ...task.candidate.baseTarget } },
+        candidate: {
+          id: task.candidate.id,
+          kind: task.candidate.kind,
+          key: task.candidate.key,
+          target: task.candidate.target,
+          expectedOldValue: task.candidate.expectedOldValue,
+          expectedValue: task.candidate.expectedValue,
+          packageName: task.candidate.packageName,
+          version: task.candidate.version,
+        },
+        testSuite: task.testSuite,
+        baseTarget: {
+          targetId: task.candidate.baseTarget.targetId,
+          revision: task.candidate.baseTarget.revision,
+          canonicalValue: task.candidate.baseTarget.value,
+          evidenceRef: task.candidate.baseTarget.evidenceRef,
+        },
+        modelEnvironment,
+        expectedEnvironments,
+        candidateId: task.candidate.id,
+        testSuiteId: task.testSuite.id,
+        testSuiteVersion: task.testSuite.version,
+        testSuiteHash: task.testSuite.contentHash,
+      });
+      const comparison = normalizeStrictComparison(raw, task, modelEnvironment, expectedEnvironments);
+      if (!comparison) throw new Error('回归结果缺少 target/model 绑定、运行坐标或逐题证据');
+      task.comparison = comparison;
+      if (!comparison.verified || !comparison.environmentAligned || !comparison.acceptanceMet) {
+        state.assistantMessages.push({ role: 'assistant', text: '回归返回了结果，但证据、环境或测试集通过标准没有全部满足，因此不能据此采用候选。' });
+      }
+    } catch (error) {
+      state.assistantMessages.push({ role: 'assistant', text: `回归没有完成：${error?.message || '未知错误'}。当前 DSH 配置没有改变。` });
+      state.assistantOpen = true;
+    } finally {
+      state.regressionRunning = false;
+      render();
+    }
+  }
+
+  function abandonAssistantCandidate() {
+    const task = state.assistantTask;
+    if (!task?.candidate || task.decision) return;
+    task.decision = 'abandoned';
+    task.candidate.status = 'abandoned';
+    state.adoptionConfirming = false;
+    task.status = 'complete';
+    const planIndex = state.assistantPlans.findIndex((plan) => plan.id === task.candidate.id);
+    if (planIndex >= 0) state.assistantPlans[planIndex] = { ...task.candidate };
+    else state.assistantPlans.push({ ...task.candidate });
+    state.assistantMessages.push({ role: 'assistant', text: `已放弃候选“${task.candidate.title}”。当前 DSH 配置没有变化。` });
+    render();
   }
   function assessCommunity(id) {
     const item = COMMUNITY_COMPONENTS.find((candidate) => candidate.id === id);
@@ -1398,27 +3797,31 @@
 
   function render() {
     let body = '';
-    if (state.view === 'workshop') body = renderWorkshop();
+    if (state.view === 'quick') body = renderQuickConfig();
+    else if (state.view === 'workshop') body = renderWorkshop();
     else if (state.view === 'module') body = renderModule();
     else if (state.view === 'llm') body = renderLLM();
     else if (state.view === 'flow') body = renderFlow();
     else if (state.view === 'observe') body = renderObserve();
     else body = renderTrial();
-    app.innerHTML = renderTopbar() + `<div id="view">${body}</div>` + renderAssistant();
+    app.innerHTML = renderTopbar() + `<main id="view">${renderSnapshotFreshnessNotice()}${body}</main>` + renderAssistant();
     syncModalState();
+    persistOptimizationState();
     lastAssistantMobileSheet = state.assistantOpen ? isMobileSheet() : null;
   }
 
   Object.assign(window, {
-    render, goWorkshop, goObserve, goTrial, openModule, selectCapability, showMoreComponents,
+    render, goQuick, goWorkshop, goObserve, goTrial, openModule, selectCapability, showMoreComponents,
     jumpToCapability, openComponent, closeComponent, openLibrary, closeLibrary, openLibraryComponent, setLibraryTab,
     filterLibrary, openPresetDrawer, closePresetDrawer, openLLM, openFlow, toggleRecommendations,
     startAgentRename, agentNameClick, saveAgentName, cancelAgentRename, agentNameInputKeydown,
     toggleAvatar, avatarClick, avatarPointerUp, openAssistant, closeAssistant,
-    updateAssistantDraft, assistantKeydown, sendAssistantMessage, askAssistant,
+    updateAssistantDraft, assistantKeydown, assistantBarKeydown, sendAssistantMessage, askAssistant, quickConfigAsk, updateQuickDraft, prepareQuickCandidate, searchCommunityPlugins,
     runAssistantMessageAction, cancelAssistantRequest,
     prepareAssistantProposal, cancelAssistantConfirm, dismissAssistantProposal,
-    applyAssistantProposal, assessCommunity, toast,
+    applyAssistantProposal, preparePluginCandidate, prepareAdoption, cancelAdoptionConfirm, adoptAssistantCandidate, lockAssistantTestSuite, prepareRegression, cancelRegressionConfirm,
+    runAssistantRegression, abandonAssistantCandidate, openOptimizationWorkbench, assessCommunity,
+    runPostAdoptionObservation, prepareRollbackCandidate, recheckUnknownAdoption, toast,
   });
 
   document.addEventListener?.('keydown', globalKeydown);
@@ -1434,10 +3837,15 @@
     state.view = 'module'; state.module = routeModule; state.capability = routeCapability; render();
   }
   else if (['sense', 'memory', 'mind', 'tools', 'action'].includes(route)) openModule(route);
+  else if (route === 'quick' || route === 'config') goQuick();
+  else if (route === 'full' || route === 'workshop') goWorkshop();
   else if (route === 'observe') goObserve();
   else if (route === 'trial' || route === 'try' || route === 'tune') goTrial();
   else if (route === 'llm') openLLM();
   else if (route === 'flow' || route === 'flow-pro') openFlow();
-  else if (route === 'library') { state.view = 'module'; state.module = 'tools'; state.capability = 'extensions'; state.libraryOpen = true; render(); }
+  else if (route === 'library') {
+    if (fullConfigEvidenceAvailable()) { state.view = 'module'; state.module = 'tools'; state.capability = 'extensions'; state.libraryOpen = true; render(); }
+    else goWorkshop();
+  }
   else render();
 })();

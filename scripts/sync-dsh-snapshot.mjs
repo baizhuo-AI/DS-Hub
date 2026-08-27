@@ -7,8 +7,17 @@ import { fileURLToPath } from 'node:url';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const outputPath = path.resolve(scriptDir, '../dsh-snapshot.js');
-const apiBase = (process.argv[2] || 'http://127.0.0.1:3080').replace(/\/$/, '');
-const projectPath = path.resolve(process.argv[3] || process.env.DS_HUB_PROJECT_PATH || path.resolve(scriptDir, '..'));
+const cliArgs = process.argv.slice(2);
+const includeSkillCopy = cliArgs.includes('--include-skill-copy');
+const includeUserPresetNames = cliArgs.includes('--include-user-preset-names');
+const positionalArgs = cliArgs.filter((arg) => !arg.startsWith('--'));
+const apiBase = (positionalArgs[0] || 'http://127.0.0.1:3080').replace(/\/$/, '');
+const projectPath = path.resolve(positionalArgs[1] || process.env.DS_HUB_PROJECT_PATH || path.resolve(scriptDir, '..'));
+const apiUrl = new URL(apiBase);
+const loopbackHosts = new Set(['127.0.0.1', 'localhost', '[::1]']);
+if (!['http:', 'https:'].includes(apiUrl.protocol) || !loopbackHosts.has(apiUrl.hostname)) {
+  throw new Error('Snapshot sync only accepts a loopback DSH API. Refusing to persist a remote endpoint.');
+}
 
 async function call(method, payload = {}) {
   const rpcId = `studio-snapshot-${method.replace(/[^a-z0-9]+/gi, '-')}-${Date.now()}`;
@@ -27,6 +36,25 @@ async function call(method, payload = {}) {
 
 function valueOf(namespaces, ns) {
   return namespaces.find((item) => item.ns === ns)?.value || {};
+}
+
+function modelMetadataOf(namespaces, selection) {
+  const candidates = [];
+  for (const namespace of namespaces) {
+    if (!namespace.ns?.startsWith('llm-')) continue;
+    const settings = namespace.value || {};
+    const models = Array.isArray(settings) ? settings
+      : [settings.models, settings.availableModels, settings.modelCatalog].find(Array.isArray) || [];
+    for (const model of models) {
+      const id = model?.id || model?.model;
+      if (!id) continue;
+      const provider = model.provider || settings.provider || settings.id;
+      const score = Number(id === selection.model) * 4 + Number(provider === selection.provider) * 2;
+      candidates.push({ score, namespace: namespace.ns, settings, model: { ...model, id, provider } });
+    }
+  }
+  return candidates.filter((candidate) => candidate.model.id === selection.model).sort((a, b) => b.score - a.score)[0]
+    || { namespace: null, settings: {}, model: {} };
 }
 
 function parseScalar(text) {
@@ -93,12 +121,37 @@ function countBy(items, pick) {
   return counts;
 }
 
-function summarizeSessions(items) {
+function pick(value, keys) {
+  return Object.fromEntries(keys.filter((key) => Object.prototype.hasOwnProperty.call(value || {}, key)).map((key) => [key, value[key]]));
+}
+
+function createPresetPrivacyMap(presets) {
+  let userIndex = 0;
+  return new Map((presets || []).map((preset) => {
+    const rawId = String(preset?.id || '');
+    if (preset?.trust === 'system') return [rawId, rawId];
+    userIndex += 1;
+    return [rawId, `user-preset-${userIndex}`];
+  }));
+}
+
+function publicPreset(preset, presetPrivacyMap) {
+  const trust = preset?.trust || 'unknown';
+  const canExposeName = trust === 'system' || includeUserPresetNames;
+  return {
+    id: presetPrivacyMap.get(String(preset?.id || '')) || 'user-preset',
+    trust,
+    isDefault: Boolean(preset?.isDefault),
+    name: canExposeName ? String(preset?.name || preset?.id || '') : '用户角色卡',
+  };
+}
+
+function summarizeSessions(items, publicPresetId = (value) => value) {
   return {
     total: items.length,
     running: items.filter((item) => item.running).length,
     blank: items.filter((item) => item.blank).length,
-    presetCounts: countBy(items, (item) => item.agentPreset),
+    presetCounts: countBy(items, (item) => publicPresetId(item.agentPreset)),
     permissionCounts: countBy(items, (item) => item.projections?.values?.permissions?.currentValue),
     stats: sumStats(items),
   };
@@ -154,13 +207,16 @@ const [host, presetList, settingsView, sessionsView, pluginInventory] = await Pr
 const namespaces = settingsView.namespaces || [];
 const defaultPresetId = valueOf(namespaces, 'agent-presets').default
   || presetList.presets.find((preset) => preset.isDefault)?.id;
+const presetPrivacyMap = createPresetPrivacyMap(presetList.presets);
+const publicPresetId = (presetId) => presetPrivacyMap.get(String(presetId || '')) || 'user-preset';
 const presetRead = await call('agentPreset.read', { agentPreset: defaultPresetId });
 const presetRows = parsePresetRows(presetRead.content);
 const sessions = sessionsView.items || [];
-const skillSession = sessions
+const projectSessions = sessions.filter((item) => item.cwd === projectPath);
+const skillSession = projectSessions
   .filter((item) => item.agentPreset === defaultPresetId)
   .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
-  || sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+  || null;
 let skills = [];
 if (skillSession) {
   try {
@@ -171,48 +227,52 @@ if (skillSession) {
 }
 
 const modelSettings = valueOf(namespaces, 'agent-default-model');
-const deepseekSettings = valueOf(namespaces, 'llm-deepseek');
-const modelSpec = (deepseekSettings.models || []).find((model) => model.id === modelSettings.model) || {};
-const projectSessions = sessions.filter((item) => item.cwd === projectPath);
+const selectedModel = {
+  provider: modelSettings.provider || host.provider,
+  model: modelSettings.model || host.model,
+};
+const modelMetadata = modelMetadataOf(namespaces, selectedModel);
+const modelSpec = modelMetadata.model;
+const providerSettings = modelMetadata.settings;
 const pluginRows = pluginInventory.entries || [];
 
 const snapshot = {
   schemaVersion: 1,
-  capturedAt: `${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`,
+  capturedAt: new Date().toISOString(),
   source: {
-    apiBase,
+    api: 'loopback-dsh-web',
     profile: 'web',
     packageVersion: await packageVersion(),
     hostVersion: host.version,
   },
   config: {
-    defaultPresetId,
-    presets: presetList.presets,
-    authorablePresets: presetList.authorable,
+    defaultPresetId: publicPresetId(defaultPresetId),
+    presets: presetList.presets.map((preset) => publicPreset(preset, presetPrivacyMap)),
+    authorablePresets: Boolean(presetList.authorable),
     activePreset: {
-      id: presetRead.agentPreset,
-      name: presetRead.name || presetRead.agentPreset,
-      description: presetRead.description || '',
+      id: publicPresetId(presetRead.agentPreset),
       trust: presetRead.trust,
+      name: presetRead.trust === 'system' || includeUserPresetNames ? (presetRead.name || presetRead.agentPreset) : '用户角色卡',
     },
     model: {
-      provider: modelSettings.provider || host.provider,
-      model: modelSettings.model || host.model,
+      provider: selectedModel.provider,
+      model: selectedModel.model,
       reasoningEffort: modelSettings.reasoningEffort,
-      contextWindow: modelSpec.contextWindow || deepseekSettings.defaultContextWindow,
+      contextWindow: modelSpec.contextWindow || modelSpec.context?.contextWindow || providerSettings.defaultContextWindow,
       inputModalities: modelSpec.inputModalities || ['text'],
-      maxTokens: deepseekSettings.maxTokens,
+      maxTokens: modelSpec.maxTokens || modelSpec.defaultMaxTokens || providerSettings.maxTokens,
+      metadataNamespace: modelMetadata.namespace,
     },
     webSearch: (() => {
       const settings = valueOf(namespaces, 'web-search-deepseek');
       return { model: settings.model, maxTokens: settings.maxTokens, maxUses: settings.maxUses };
     })(),
-    agentLoop: valueOf(namespaces, 'agent-loop'),
-    shell: valueOf(namespaces, 'shell'),
-    permission: valueOf(namespaces, 'permission'),
+    agentLoop: pick(valueOf(namespaces, 'agent-loop'), ['maxParallelToolCalls']),
+    shell: pick(valueOf(namespaces, 'shell'), ['timeoutMs', 'maxTimeoutMs']),
+    permission: pick(valueOf(namespaces, 'permission'), ['defaultPreset']),
     locale: valueOf(namespaces, 'locale').preference,
     theme: valueOf(namespaces, 'ui-theme').preference,
-    conversation: valueOf(namespaces, 'ui-conversation'),
+    conversation: pick(valueOf(namespaces, 'ui-conversation'), ['busyEnter']),
     presetRows,
   },
   plugins: pluginRows.map(({ entryId, moduleName, enabled, fiberPhase }) => ({
@@ -221,24 +281,52 @@ const snapshot = {
     enabled,
     fiberPhase,
   })),
+  skillInventory: {
+    status: skillSession ? 'available' : 'unavailable',
+    source: 'project_session',
+    presetId: publicPresetId(defaultPresetId),
+    copyIncluded: includeSkillCopy,
+  },
   skills: skills.map(({ name, description, whenToUse, modelInvocable }) => ({
     name,
-    description,
-    ...(whenToUse ? { whenToUse } : {}),
     modelInvocable,
+    ...(includeSkillCopy && description ? { description } : {}),
+    ...(includeSkillCopy && whenToUse ? { whenToUse } : {}),
   })),
   sessions: {
-    all: summarizeSessions(sessions),
+    all: summarizeSessions(sessions, publicPresetId),
     project: {
       path: '当前项目（已匿名）',
-      ...summarizeSessions(projectSessions),
+      ...summarizeSessions(projectSessions, publicPresetId),
       recent: [],
       daily: dailySessions(projectSessions),
     },
   },
 };
 
-const source = `/* Generated by scripts/sync-dsh-snapshot.mjs. Contains no credentials, conversation content, session IDs, or per-session records. */\nwindow.DSH_SNAPSHOT = ${JSON.stringify(snapshot, null, 2).replace(/</g, '\\u003c')};\n`;
+function assertPublicSnapshot(value, trail = []) {
+  const deniedKeys = new Set(['sessionid', 'cwd', 'apikey', 'api_key', 'accesstoken', 'refreshtoken', 'password', 'secret', 'credential', 'credentials']);
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertPublicSnapshot(item, [...trail, String(index)]));
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      if (deniedKeys.has(key.toLowerCase())) throw new Error(`Refusing to write sensitive key at ${[...trail, key].join('.')}`);
+      if (key.toLowerCase() === 'path' && item !== '当前项目（已匿名）') throw new Error(`Refusing to write a non-anonymous path at ${[...trail, key].join('.')}`);
+      assertPublicSnapshot(item, [...trail, key]);
+    }
+    return;
+  }
+  if (typeof value !== 'string') return;
+  if (/(?:^|[\s"'])(?:\/(?:Users|home|private|var|tmp|opt|Volumes)\/|[A-Za-z]:\\)/.test(value)) throw new Error(`Refusing to write an absolute path at ${trail.join('.')}`);
+  if (/https?:\/\/(?!127\.0\.0\.1(?::\d+)?(?:\/|$)|localhost(?::\d+)?(?:\/|$)|\[::1\](?::\d+)?(?:\/|$))/i.test(value)) {
+    throw new Error(`Refusing to write a non-loopback URL at ${trail.join('.')}`);
+  }
+}
+
+assertPublicSnapshot(snapshot);
+const source = `/* Generated privacy-minimized snapshot. Review before public sharing; no conversation text or per-session records are included. */\nwindow.DSH_SNAPSHOT = ${JSON.stringify(snapshot, null, 2).replace(/</g, '\\u003c')};\n`;
 await writeFile(outputPath, source, 'utf8');
 console.log(`Wrote ${outputPath}`);
 console.log(`Plugins ${pluginRows.filter((row) => row.enabled).length}/${pluginRows.length} enabled; skills ${skills.length}; project sessions ${projectSessions.length}.`);
