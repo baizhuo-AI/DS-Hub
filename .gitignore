@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+
+# Local-only snapshot variants and unused source reference.
+dsh-snapshot.local.js
+assets/ds-girl.png
