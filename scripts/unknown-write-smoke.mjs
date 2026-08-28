@@ -122,7 +122,9 @@ assert.ok(appSource.lastIndexOf('if (!persistOptimizationState())', applyBoundar
 // A failed/unknown write marker survives reload, masks the value and gates full config.
 const blocked = createRuntime({ storedState: storedUnknown, withAI: true });
 assert.match(blocked.app.innerHTML, /写入状态未知/);
-assert.match(blocked.app.innerHTML, /当前值待核验/);
+assert.doesNotMatch(blocked.app.innerHTML, /SMOKE_(?:OLD|ATTEMPTED|READBACK)_VALUE/);
+blocked.context.goQuick();
+assert.match(blocked.app.innerHTML, /当前值等待重新核验/);
 assert.doesNotMatch(blocked.app.innerHTML, /SMOKE_(?:OLD|ATTEMPTED|READBACK)_VALUE/);
 blocked.context.goWorkshop();
 assert.match(blocked.app.innerHTML, /完整能力等待重新同步/);
@@ -138,9 +140,17 @@ assert.doesNotMatch(JSON.stringify(persisted), /SMOKE_(?:OLD|ATTEMPTED|READBACK)
 
 // AI receives only the marker identity/trust for the affected value; no plan,
 // conversation, old, attempted or readback values are restored into context.
+blocked.context.attachAssistantContext('module/tools');
 await blocked.context.sendAssistantMessage('说明为什么需要重新核验');
 const aiContext = blocked.capturedAIRequest?.context;
 assert.ok(aiContext, 'AI request context should be captured');
+assert.deepEqual(JSON.parse(JSON.stringify(aiContext.focusItems)), [{
+  ref: 'module/tools',
+  kind: 'module',
+  title: '工具模块',
+  availability: 'state_unknown',
+  valuesWithheld: true,
+}]);
 assert.deepEqual(JSON.parse(JSON.stringify(aiContext.config.pendingRefresh)), [{ key: 'reasoningEffort', markerTrust: 'untrusted_browser_hint' }]);
 assert.equal(aiContext.config.reasoningEffort, null);
 assert.equal(aiContext.config.pluginLoaderEntryCount, null);

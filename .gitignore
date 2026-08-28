@@ -4,3 +4,7 @@
 # Local-only snapshot variants and unused source reference.
 dsh-snapshot.local.js
 assets/ds-girl.png
+
+# Private preset identity sidecars. The sync script writes outside the repo by default.
+.ds-hub-private/
+preset-mapping.private.json

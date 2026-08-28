@@ -1,7 +1,7 @@
 /* Generated privacy-minimized snapshot. Review before public sharing; no conversation text or per-session records are included. */
 window.DSH_SNAPSHOT = {
   "schemaVersion": 1,
-  "capturedAt": "2026-08-27T21:32:13.100Z",
+  "capturedAt": "2026-08-28T04:02:08.249Z",
   "source": {
     "api": "loopback-dsh-web",
     "profile": "web",
@@ -9,28 +9,35 @@ window.DSH_SNAPSHOT = {
     "hostVersion": "0.0.1"
   },
   "config": {
-    "defaultPresetId": "code",
+    "presetMappingId": "preset-map-6e4e6733833aa7ece39ffc2f744dbe4f",
+    "defaultPresetId": "preset-ref-7ee4975a31903c7a127629e70532449c",
+    "defaultPresetRef": "preset-ref-7ee4975a31903c7a127629e70532449c",
+    "presetRosterRevision": "preset-roster-813473d421032fe8380ed5c5018340fa",
     "presets": [
       {
-        "id": "standard",
+        "id": "preset-ref-73501ab49eba53ef2f313bf009c7ab39",
+        "ref": "preset-ref-73501ab49eba53ef2f313bf009c7ab39",
         "trust": "system",
         "isDefault": false,
         "name": "标准模式"
       },
       {
-        "id": "code",
+        "id": "preset-ref-7ee4975a31903c7a127629e70532449c",
+        "ref": "preset-ref-7ee4975a31903c7a127629e70532449c",
         "trust": "system",
         "isDefault": true,
         "name": "PTC 模式"
       },
       {
-        "id": "minimal",
+        "id": "preset-ref-6b8d424a6d83b7d04eb48c77e913d2d0",
+        "ref": "preset-ref-6b8d424a6d83b7d04eb48c77e913d2d0",
         "trust": "system",
         "isDefault": false,
         "name": "极简模式"
       },
       {
-        "id": "cordis",
+        "id": "preset-ref-c1ca1a7ac979c0a9ca75ded1bef62dc0",
+        "ref": "preset-ref-c1ca1a7ac979c0a9ca75ded1bef62dc0",
         "trust": "system",
         "isDefault": false,
         "name": "创造模式"
@@ -38,7 +45,8 @@ window.DSH_SNAPSHOT = {
     ],
     "authorablePresets": true,
     "activePreset": {
-      "id": "code",
+      "id": "preset-ref-7ee4975a31903c7a127629e70532449c",
+      "ref": "preset-ref-7ee4975a31903c7a127629e70532449c",
       "trust": "system",
       "name": "PTC 模式"
     },
@@ -54,6 +62,42 @@ window.DSH_SNAPSHOT = {
       "maxTokens": 256000,
       "metadataNamespace": "llm-deepseek"
     },
+    "models": [
+      {
+        "provider": "deepseek-official",
+        "id": "deepseek-v4-flash",
+        "label": "DeepSeek-V4-Flash",
+        "contextWindow": 1000000,
+        "inputModalities": [
+          "text"
+        ],
+        "maxTokens": 256000,
+        "metadataNamespace": "llm-deepseek"
+      },
+      {
+        "provider": "deepseek-official",
+        "id": "deepseek-v4-pro",
+        "label": "DeepSeek-V4-Pro",
+        "contextWindow": 1000000,
+        "inputModalities": [
+          "text"
+        ],
+        "maxTokens": 256000,
+        "metadataNamespace": "llm-deepseek"
+      },
+      {
+        "provider": "deepseek-official",
+        "id": "deepseek-v4-flash-vision-exp",
+        "label": "DeepSeek-V4-Flash-Vision-Exp",
+        "contextWindow": 1000000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "maxTokens": 256000,
+        "metadataNamespace": "llm-deepseek"
+      }
+    ],
     "webSearch": {
       "model": "deepseek-v4-flash",
       "maxTokens": 4096,
@@ -79,7 +123,10 @@ window.DSH_SNAPSHOT = {
         "id": "persona",
         "moduleName": "@deepseek-ai/dsh-persona",
         "enabled": true,
-        "config": {}
+        "config": {
+          "text": "You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}."
+        },
+        "promptCopy": "included"
       },
       {
         "id": "agent-instructions",
@@ -160,7 +207,9 @@ window.DSH_SNAPSHOT = {
         "moduleName": "@deepseek-ai/dsh-compaction-tool-result-pruner",
         "enabled": true,
         "config": {
-          "thresholdChars": 8192
+          "thresholdChars": 8192,
+          "headChars": 4096,
+          "tailChars": 1024
         }
       },
       {
@@ -1267,7 +1316,7 @@ window.DSH_SNAPSHOT = {
   "skillInventory": {
     "status": "available",
     "source": "project_session",
-    "presetId": "code",
+    "presetId": "preset-ref-7ee4975a31903c7a127629e70532449c",
     "copyIncluded": false
   },
   "skills": [
@@ -1390,8 +1439,8 @@ window.DSH_SNAPSHOT = {
       "running": 0,
       "blank": 4,
       "presetCounts": {
-        "code": 7,
-        "standard": 4
+        "preset-ref-7ee4975a31903c7a127629e70532449c": 7,
+        "preset-ref-73501ab49eba53ef2f313bf009c7ab39": 4
       },
       "permissionCounts": {
         "danger-full-access": 11
@@ -1413,8 +1462,8 @@ window.DSH_SNAPSHOT = {
       "running": 0,
       "blank": 1,
       "presetCounts": {
-        "code": 2,
-        "standard": 1
+        "preset-ref-7ee4975a31903c7a127629e70532449c": 2,
+        "preset-ref-73501ab49eba53ef2f313bf009c7ab39": 1
       },
       "permissionCounts": {
         "danger-full-access": 3
@@ -1431,10 +1480,6 @@ window.DSH_SNAPSHOT = {
       },
       "recent": [],
       "daily": [
-        {
-          "date": "2026-08-21",
-          "count": 0
-        },
         {
           "date": "2026-08-22",
           "count": 0
@@ -1458,6 +1503,10 @@ window.DSH_SNAPSHOT = {
         {
           "date": "2026-08-27",
           "count": 1
+        },
+        {
+          "date": "2026-08-28",
+          "count": 0
         }
       ]
     }
