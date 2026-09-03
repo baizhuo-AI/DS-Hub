@@ -1,7 +1,7 @@
 /* Generated privacy-minimized snapshot. Review before public sharing; no conversation text or per-session records are included. */
 window.DSH_SNAPSHOT = {
   "schemaVersion": 1,
-  "capturedAt": "2026-08-28T04:02:08.249Z",
+  "capturedAt": "2026-08-28T05:44:20.070Z",
   "source": {
     "api": "loopback-dsh-web",
     "profile": "web",
@@ -9,35 +9,35 @@ window.DSH_SNAPSHOT = {
     "hostVersion": "0.0.1"
   },
   "config": {
-    "presetMappingId": "preset-map-6e4e6733833aa7ece39ffc2f744dbe4f",
-    "defaultPresetId": "preset-ref-7ee4975a31903c7a127629e70532449c",
-    "defaultPresetRef": "preset-ref-7ee4975a31903c7a127629e70532449c",
-    "presetRosterRevision": "preset-roster-813473d421032fe8380ed5c5018340fa",
+    "presetMappingId": "preset-map-87bf5f783408f8109c01254641d99b53",
+    "defaultPresetId": "preset-ref-3d4e2b39cd55bab1e44f746c30de119b",
+    "defaultPresetRef": "preset-ref-3d4e2b39cd55bab1e44f746c30de119b",
+    "presetRosterRevision": "preset-roster-e191ea8149d3d15242809382963d3199",
     "presets": [
       {
-        "id": "preset-ref-73501ab49eba53ef2f313bf009c7ab39",
-        "ref": "preset-ref-73501ab49eba53ef2f313bf009c7ab39",
+        "id": "preset-ref-5194377927e1b6569d568f3a97a358d2",
+        "ref": "preset-ref-5194377927e1b6569d568f3a97a358d2",
         "trust": "system",
         "isDefault": false,
         "name": "标准模式"
       },
       {
-        "id": "preset-ref-7ee4975a31903c7a127629e70532449c",
-        "ref": "preset-ref-7ee4975a31903c7a127629e70532449c",
+        "id": "preset-ref-3d4e2b39cd55bab1e44f746c30de119b",
+        "ref": "preset-ref-3d4e2b39cd55bab1e44f746c30de119b",
         "trust": "system",
         "isDefault": true,
         "name": "PTC 模式"
       },
       {
-        "id": "preset-ref-6b8d424a6d83b7d04eb48c77e913d2d0",
-        "ref": "preset-ref-6b8d424a6d83b7d04eb48c77e913d2d0",
+        "id": "preset-ref-39c7e9e3b513d08e38d2453e15df2944",
+        "ref": "preset-ref-39c7e9e3b513d08e38d2453e15df2944",
         "trust": "system",
         "isDefault": false,
         "name": "极简模式"
       },
       {
-        "id": "preset-ref-c1ca1a7ac979c0a9ca75ded1bef62dc0",
-        "ref": "preset-ref-c1ca1a7ac979c0a9ca75ded1bef62dc0",
+        "id": "preset-ref-511dcb3340d237bf55d12d8ac41ec184",
+        "ref": "preset-ref-511dcb3340d237bf55d12d8ac41ec184",
         "trust": "system",
         "isDefault": false,
         "name": "创造模式"
@@ -45,8 +45,8 @@ window.DSH_SNAPSHOT = {
     ],
     "authorablePresets": true,
     "activePreset": {
-      "id": "preset-ref-7ee4975a31903c7a127629e70532449c",
-      "ref": "preset-ref-7ee4975a31903c7a127629e70532449c",
+      "id": "preset-ref-3d4e2b39cd55bab1e44f746c30de119b",
+      "ref": "preset-ref-3d4e2b39cd55bab1e44f746c30de119b",
       "trust": "system",
       "name": "PTC 模式"
     },
@@ -72,7 +72,26 @@ window.DSH_SNAPSHOT = {
           "text"
         ],
         "maxTokens": 256000,
-        "metadataNamespace": "llm-deepseek"
+        "metadataNamespace": "llm-deepseek",
+        "reasoningEfforts": [
+          {
+            "id": "off",
+            "label": "Off"
+          },
+          {
+            "id": "low",
+            "label": "Low"
+          },
+          {
+            "id": "high",
+            "label": "High"
+          },
+          {
+            "id": "max",
+            "label": "Max"
+          }
+        ],
+        "defaultReasoningEffort": "high"
       },
       {
         "provider": "deepseek-official",
@@ -83,7 +102,26 @@ window.DSH_SNAPSHOT = {
           "text"
         ],
         "maxTokens": 256000,
-        "metadataNamespace": "llm-deepseek"
+        "metadataNamespace": "llm-deepseek",
+        "reasoningEfforts": [
+          {
+            "id": "off",
+            "label": "Off"
+          },
+          {
+            "id": "low",
+            "label": "Low"
+          },
+          {
+            "id": "high",
+            "label": "High"
+          },
+          {
+            "id": "max",
+            "label": "Max"
+          }
+        ],
+        "defaultReasoningEffort": "high"
       },
       {
         "provider": "deepseek-official",
@@ -95,7 +133,26 @@ window.DSH_SNAPSHOT = {
           "image"
         ],
         "maxTokens": 256000,
-        "metadataNamespace": "llm-deepseek"
+        "metadataNamespace": "llm-deepseek",
+        "reasoningEfforts": [
+          {
+            "id": "off",
+            "label": "Off"
+          },
+          {
+            "id": "low",
+            "label": "Low"
+          },
+          {
+            "id": "high",
+            "label": "High"
+          },
+          {
+            "id": "max",
+            "label": "Max"
+          }
+        ],
+        "defaultReasoningEffort": "high"
       }
     ],
     "webSearch": {
@@ -1139,152 +1196,8 @@ window.DSH_SNAPSHOT = {
       "fiberPhase": "active"
     },
     {
-      "entryId": "include:agent-presets:agent-instructions",
-      "moduleName": "@deepseek-ai/dsh-agent-instructions",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-bash",
-      "moduleName": "@deepseek-ai/dsh-tool-bash",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-pwsh",
-      "moduleName": "@deepseek-ai/dsh-tool-pwsh",
-      "enabled": false,
-      "fiberPhase": null
-    },
-    {
-      "entryId": "include:agent-presets:tool-fs",
-      "moduleName": "@deepseek-ai/dsh-tool-fs",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-fs-search",
-      "moduleName": "@deepseek-ai/dsh-tool-fs-search",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-jobs",
-      "moduleName": "@deepseek-ai/dsh-tool-jobs",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:skill-filesystem",
-      "moduleName": "@deepseek-ai/dsh-skill-filesystem",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-skill",
-      "moduleName": "@deepseek-ai/dsh-tool-skill",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-goal",
-      "moduleName": "@deepseek-ai/dsh-tool-goal",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-ask-user",
-      "moduleName": "@deepseek-ai/dsh-tool-ask-user",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-todo",
-      "moduleName": "@deepseek-ai/dsh-tool-todo",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-web",
-      "moduleName": "@deepseek-ai/dsh-tool-web",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:plan-mode",
-      "moduleName": "@deepseek-ai/dsh-plan-mode",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:compaction-basic",
-      "moduleName": "@deepseek-ai/dsh-compaction-basic",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:command-compact",
-      "moduleName": "@deepseek-ai/dsh-command-compact",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-result-pruner",
-      "moduleName": "@deepseek-ai/dsh-compaction-tool-result-pruner",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-subagent-control",
-      "moduleName": "@deepseek-ai/dsh-tool-subagent-control",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-subagent-list-agents",
-      "moduleName": "@deepseek-ai/dsh-tool-subagent-control/list-agents",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-subagent",
-      "moduleName": "@deepseek-ai/dsh-tool-subagent",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-subagent-fork",
-      "moduleName": "@deepseek-ai/dsh-tool-subagent",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-subagent-codex",
-      "moduleName": "@deepseek-ai/dsh-tool-subagent",
-      "enabled": false,
-      "fiberPhase": null
-    },
-    {
-      "entryId": "include:agent-presets:tool-subagent-claude-code",
-      "moduleName": "@deepseek-ai/dsh-tool-subagent",
-      "enabled": false,
-      "fiberPhase": null
-    },
-    {
-      "entryId": "include:agent-presets:workflow-worker-thread",
-      "moduleName": "@deepseek-ai/dsh-workflow-worker-thread",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-workflow",
-      "moduleName": "@deepseek-ai/dsh-tool-workflow",
-      "enabled": true,
-      "fiberPhase": "active"
-    },
-    {
-      "entryId": "include:agent-presets:tool-ralph",
-      "moduleName": "@deepseek-ai/dsh-tool-ralph",
+      "entryId": "include:ui-ds-hub",
+      "moduleName": "dsh-ds-hub",
       "enabled": true,
       "fiberPhase": "active"
     },
@@ -1295,187 +1208,68 @@ window.DSH_SNAPSHOT = {
       "fiberPhase": "active"
     },
     {
-      "entryId": "03e542aa",
+      "entryId": "97d515e9",
       "moduleName": "@deepseek-ai/dsh-host-directory-picker-native",
       "enabled": true,
       "fiberPhase": "active"
     },
     {
-      "entryId": "8621559e",
+      "entryId": "e2b0b70d",
       "moduleName": "@deepseek-ai/dsh-client-ui-directory-picker-native",
       "enabled": true,
       "fiberPhase": "active"
     },
     {
-      "entryId": "af372855",
+      "entryId": "8d9989f1",
       "moduleName": "@deepseek-ai/cordis-plugin-hmr",
       "enabled": true,
       "fiberPhase": "active"
     }
   ],
   "skillInventory": {
-    "status": "available",
+    "status": "unavailable",
     "source": "project_session",
-    "presetId": "preset-ref-7ee4975a31903c7a127629e70532449c",
+    "presetId": "preset-ref-3d4e2b39cd55bab1e44f746c30de119b",
     "copyIncluded": false
   },
-  "skills": [
-    {
-      "name": "lark-approval",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-apps",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-attendance",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-base",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-calendar",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-contact",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-doc",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-drive",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-event",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-im",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-mail",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-markdown",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-meeting",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-minutes",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-note",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-okr",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-openapi-explorer",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-shared",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-sheets",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-skill-maker",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-slides",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-task",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-vc",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-vc-agent",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-whiteboard",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-wiki",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-workflow-meeting-summary",
-      "modelInvocable": true
-    },
-    {
-      "name": "lark-workflow-standup-report",
-      "modelInvocable": true
-    }
-  ],
+  "skills": [],
   "sessions": {
     "all": {
-      "total": 11,
+      "total": 12,
       "running": 0,
       "blank": 4,
       "presetCounts": {
-        "preset-ref-7ee4975a31903c7a127629e70532449c": 7,
-        "preset-ref-73501ab49eba53ef2f313bf009c7ab39": 4
+        "preset-ref-3d4e2b39cd55bab1e44f746c30de119b": 12
       },
       "permissionCounts": {
-        "danger-full-access": 11
+        "danger-full-access": 12
       },
       "stats": {
-        "turns": 44,
-        "steps": 255,
-        "llmMs": 3087774,
+        "turns": 45,
+        "steps": 256,
+        "llmMs": 3089309,
         "toolMs": 291993,
-        "uncachedInputTokens": 742027,
-        "outputTokens": 218497,
+        "uncachedInputTokens": 753958,
+        "outputTokens": 218568,
         "cacheReadTokens": 20219904,
         "cacheWriteTokens": 0
       }
     },
     "project": {
       "path": "当前项目（已匿名）",
-      "total": 3,
+      "total": 0,
       "running": 0,
-      "blank": 1,
-      "presetCounts": {
-        "preset-ref-7ee4975a31903c7a127629e70532449c": 2,
-        "preset-ref-73501ab49eba53ef2f313bf009c7ab39": 1
-      },
-      "permissionCounts": {
-        "danger-full-access": 3
-      },
+      "blank": 0,
+      "presetCounts": {},
+      "permissionCounts": {},
       "stats": {
-        "turns": 12,
-        "steps": 73,
-        "llmMs": 1302461,
-        "toolMs": 131457,
-        "uncachedInputTokens": 282393,
-        "outputTokens": 77691,
-        "cacheReadTokens": 3566080,
+        "turns": 0,
+        "steps": 0,
+        "llmMs": 0,
+        "toolMs": 0,
+        "uncachedInputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
         "cacheWriteTokens": 0
       },
       "recent": [],
@@ -1498,11 +1292,11 @@ window.DSH_SNAPSHOT = {
         },
         {
           "date": "2026-08-26",
-          "count": 1
+          "count": 0
         },
         {
           "date": "2026-08-27",
-          "count": 1
+          "count": 0
         },
         {
           "date": "2026-08-28",

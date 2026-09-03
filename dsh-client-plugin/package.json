@@ -1,0 +1,30 @@
+{
+  "name": "dsh-ds-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DS Hub local UI and tool-free diagnostic assistant bridge for DSH Web",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "license": "UNLICENSED"
+}

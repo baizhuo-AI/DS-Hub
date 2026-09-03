@@ -2,13 +2,45 @@
 
 DS Hub 是一个面向普通用户的 DSH Agent 配置与运行观测原型。它把底层插件、Skill、工具、提示词和权限，整理成五个容易理解的模块：感知、记忆、心智、工具、行动。
 
-当前仓库是无构建步骤的静态原型，直接打开 `index.html` 即可体验。推荐通过本地静态服务器运行：
+前端本身仍是无构建步骤的静态原型，直接打开 `index.html` 可看界面；但 `file://` / 独立静态服务器只能做只读演示，不能调用 DSH 的真实 Provider、Loader 写桥或会话。完整体验应安装为下文的 DSH Web 同源入口。
 
 ```bash
 python3 -m http.server 8080
 ```
 
 然后访问 `http://127.0.0.1:8080`。
+
+## 安装为 DSH Web 内置入口
+
+仓库包含一个可安装的 DSH Host + Client 插件：Host 在 `127.0.0.1:3080` 同源提供 `/ds-hub/` 与受控 `/ds-hub-api/`，Client 在 DSH 侧栏底部增加入口并用 overlay/iframe 打开 DS Hub。页面的真实助手直接复用 DSH 当前 Provider、默认模型和本机 session；凭据仍只由 DSH Host 解析，不进入 DS Hub 页面。助手固定使用仓库内无工具的 `ds-hub-assistant` Preset，并按页面 `conversationId` 有界复用会话；模型变化、失败或达到轮次上限后换新，旧会话只做可恢复的归档，不删除日志。
+
+安装器默认只做预检，不会修改 `~/.dsh`。确认目标后再显式执行：
+
+```bash
+cd "demo/dsh-client-plugin"
+node scripts/install-dsh-hub.mjs
+node scripts/install-dsh-hub.mjs --apply
+# 重启 DSH Web 后
+node scripts/install-dsh-hub.mjs --verify-only
+```
+
+`--apply` 会先构建静态资源，再通过 DSH 官方 `plugin --profile web add` 安装本地包；它只在目标 Preset 不存在时复制无工具 Preset，若同名目录内容不同会拒绝覆盖。对 `cordis.patch.yml` 只更新 `DS HUB INSTALL` 标记块，保留其他文本并先生成备份。安装前会完成全量预检并对 patch 做 CAS；中途失败会逆序清理本次新建的 Preset 与 package，清理无法核验时返回 `state-unknown`。`--verify-only` 只有在 `agentPreset.list` 找到健康的 `ds-hub-assistant`，且 `pluginInventory/list` 找到 `include:ui-ds-hub / dsh-ds-hub / enabled / active` 时才返回 `verified: true`。
+
+模型链的独立验收不会读取页面配置；它只向当前 DSH Provider 发送一句固定探针，并核对 `session.models → request/header → assistant/message → turn/end`，完成后归档测试会话但不删除 DSH 日志：
+
+```bash
+node scripts/dsh-hub-live-smoke.mjs
+```
+
+这个 Host 插件还提供真实的 Loader 开关，但边界刻意很窄：只接受 Web Profile 顶层 `include:<rawId>`，预检同时绑定 `entryId + moduleName + enabled + cordis.patch.yml SHA256`，写入后必须回读相同 Loader 条目，启用时还必须看到 Fiber `active`。它只改 `DS HUB MANAGED LOADER OVERRIDES` 标记块；CAS 冲突不写，回读失败会在未发生并发修改时恢复旧文件。`include:agent-presets:*` 是当前 Agent 的 Preset 组成，不是包开关，不能走这条接口；例如截图中的两个 tool-result-pruner 行分别是关闭的 Host 基础入口和启用的当前 Preset 入口。
+
+浏览器接口为 `DS_HUB_PLUGIN_ADAPTER.capabilities({signal})`、`preflight({entryId,moduleName,desiredEnabled,signal})` 与 `setEnabled({entryId,moduleName,enabled,expectedRevision,expectedEnabled,idempotencyKey,signal})`。页面必须先确认 `capabilities().pluginManagement.loaderMutation === true`；成功只以 `setEnabled` 返回的 `canonicalValue/readback` 为准。`revision-conflict` 与 `state-conflict` 表示安全未写，`state-unknown` 表示不能断言最终状态，必须刷新回读。
+
+当前同源桥没有开放万能配置写入或第三方包安装：`pluginManagement.presetMutation` 与 `packageInstall` 会诚实返回 `false`。社区卡片可以说明候选和发起安装意图，但在 manifest、包管理器、reload 与 Inventory 证据链全部实现前，不能把按钮结果显示成“已安装”。
+
+Host 只为六个明确 settings 目标开放 `DS_HUB_CONFIG_ADAPTER.preflight/apply/readback`：默认模型组合、推理强度、忙时新消息、默认角色卡指向、网页搜索次数与新会话默认权限。模型与推理强度来自 DSH 实时 `llm.models`，页面按每个模型实际声明的档位渲染，不假设通用的 `medium/xhigh`。`/ds-hub-api/config/apply` 在 Host 内重新核对目标与模型环境 guard，只调用一次 `settings.mutate(... expectedRevision)`；成功响应后还会另发一次 `settings.describe`，浏览器随后再通过 `/config/readback` 做独立回读。支持范围可从 `capabilities().configManagement.targets` 读取，未列出的 Preset 正文/组成、插件安装和任意 JSON path 一律返回 `unsupported-target`。默认角色卡只接收当前 0600 私有映射里的 `preset-ref-*`，raw Preset ID 不进入浏览器；预检还会读取候选角色卡正文并锁定 SHA256，测试后内容漂移会在写入前被拒绝。
+
+相同 `idempotencyKey` 的已完成请求只回放同一回执，不再次写入；一旦 `settings.mutate` 没有返回可判定结果，或写后独立回读失败，Host 将该 key 标记为 `state-unknown` 并拒绝重试。这个进程内记录不能替代页面跨刷新保存的无值未知标记。配置写入与精确回读成功只表示 `adopted_unobserved`，不是隔离回归通过，也不是线上健康。
 
 ## 产品设计原则
 
@@ -23,11 +55,11 @@ python3 -m http.server 8080
 ## 当前体验
 
 - “Agent 配置”默认进入完整能力总览；左上角“快速配置”是高频修改入口，不会替代模块 → 能力 → 组件的完整配置页。
-- 快速配置一次只展开一个编辑区：切换 DSH 已可路由的 Provider/模型组合与思考深度、调整角色卡的上下文压缩和工具结果裁剪、编辑具体 Persona、以及把现有工具加入/移出当前 Agent 或修改已知参数。Provider 凭据、API Key 和自定义路由仍由原 DSH Web 管理。
+- 快速配置一次只展开一个区域。当前同源 Host 已支持切换 DSH 可路由的 Provider/模型组合与思考深度；角色卡的上下文压缩、工具结果裁剪、Persona 与工具组成展示真实同步值，但当前为只读，直到 Host 明确声明并实现对应的精确写入目标。Provider 凭据、API Key 和自定义路由仍由原 DSH Web 管理。
 - 完整能力页默认展示 DSH 图标；双击或键盘操作可切换机娘形象。
 - Agent 显示名可双击修改，只保存在当前浏览器，不会冒充 DSH 配置改名。
 - 五个模块采用“模块 → 能力 → 组件”的渐进展开方式。
-- 组件库把 166 条 Loader 挂载记录归并为 138 个插件包；中文作用名是主标题，英文包名和原始挂载记录保留在详情中。
+- 组件库按当前快照把 Host Loader 与当前角色卡组成归并到真实插件包；中文作用名是主标题，英文包名和每一条原始入口保留在详情中。相同包的 Host 入口与角色卡入口会并列解释，不再显示成两个匿名重复插件。
 - “当前 DSH 回读”和“社区预置候选”分开。
 - 运行观测只展示匿名会话统计，不读取标题和消息正文。
 - 底部横向“DS Hub 助手”可以诊断、搜索插件、生成候选配置、构建测试集、发起回归并观察采用后的新任务，用一张六步任务卡承接整套过程。
@@ -56,13 +88,15 @@ python3 -m http.server 8080
 
 ## DS Hub 助手与闭环适配器
 
-静态原型默认不调用模型、不下载插件，也不修改 DSH。真实接入由同源本机 sidecar 提供三个适配器：对话、隔离回归和配置读写。
+独立静态原型默认不调用模型、不下载插件，也不修改 DSH。仓库内 DSH Client 插件已实现同源真实对话、顶层 Host Loader 精确开关，以及下述六个 settings 目标的真实 CAS 写入与独立回读。Preset 正文/工具组成修改、隔离回归、线上 revision 观察和社区包安装仍保持关闭，不能由页面假装完成。
 
-候选至少绑定两份不能混用的基线：`baseTarget` 是本次要改的精确目标及其 namespace revision；`baseModelEnvironment` 是 `agent-default-model` 自己的 revision 与 provider/model/reasoning。涉及角色卡时还必须绑定第三份 `basePresetRoster`，同时锁住角色卡清单与默认指向。即使几个 revision 数字碰巧相同，也必须分别保存和核验。revision 只接受有限数值，或去掉首尾空白后 1–128 字符的字符串；空串不能充当 CAS 版本。配置原值保留 DSH 原生类型，`5` 不能变成 `"5"`，“排队等待”“未安装”等展示文案也不能进入 CAS。
+候选至少绑定两份不能混用的基线：`baseTarget` 是本次要改的精确目标及其 namespace revision；`baseModelEnvironment` 是 `agent-default-model` 自己的 revision 与 provider/model/reasoning。涉及角色卡时还必须绑定第三份 `basePresetRoster`，同时锁住角色卡清单、默认指向、候选 opaque ref 与候选正文摘要。即使几个 revision 数字碰巧相同，也必须分别保存和核验。revision 只接受有限数值，或去掉首尾空白后 1–128 字符的字符串；空串不能充当 CAS 版本。配置原值保留 DSH 原生类型，`5` 不能变成 `"5"`，“排队等待”“未安装”等展示文案也不能进入 CAS。
 
-页面的简单标量白名单映射如下：`permissionDefault → settings:permission#/defaultPreset`、`reasoningEffort → settings:agent-default-model#/reasoningEffort`、`busyEnter → settings:ui-conversation#/busyEnter`、`defaultPresetId → settings:agent-presets#/default`、`webSearchMaxUses → settings:web-search-deepseek#/maxUses`。快速配置的模型组合使用 `modelSelection → settings:agent-default-model#/selection`；上下文、Persona 和工具组成使用 sidecar 的受控虚拟目标 `agent-preset-ref:<opaquePresetRef>#/context-policy`、`#/persona`、`#/tools/<rowId>`，由 sidecar 在同一份 `presetRosterRevision` 下解析成真实 Preset composition，再执行读取、CAS 写入和回读。
+当前已实现的简单标量白名单映射如下：`permissionDefault → settings:permission#/defaultPreset`、`reasoningEffort → settings:agent-default-model#/reasoningEffort`、`busyEnter → settings:ui-conversation#/busyEnter`、`defaultPresetId → settings:agent-presets#/default`、`webSearchMaxUses → settings:web-search-deepseek#/maxUses`。快速配置的模型组合使用 `modelSelection → settings:agent-default-model#/selection`。上下文、Persona 和工具组成仍只是完整 sidecar 的保留契约：未来使用受控虚拟目标 `agent-preset-ref:<opaquePresetRef>#/context-policy`、`#/persona`、`#/tools/<rowId>`；当前 Host 会明确拒绝，尚不会修改 Preset composition。
 
 每次同步都会为所有观测到的 Preset 生成新的 CSPRNG 128-bit `preset-ref-*` 与新的 `presetMappingId`；公开快照不再包含 raw Preset ID，raw ID 与公开 ref 也不能直接跨快照对应。但稳定名称、默认标志和组成特征仍可能形成间接指纹，因此快照仍是需要审查的真实运行配置，不应视为匿名化数据。`ref → rawId` 只写入仓库外、权限为 `0600` 的 sidecar 私有映射。sidecar 只有在 `presetMappingId + snapshotIdentity + presetRosterRevision` 三者完全匹配，且 ref 仍属于当前公开角色卡清单时才解析引用；旧映射和历史、非当前角色卡引用均不能进入配置读写路径。系统 Preset 必须先复制为用户 Preset，不能原地覆盖；工具“移除”只改变当前 Agent 的组成，不等于卸载。插件安装目标仍为 `plugins:web:<packageName>`，使用 sidecar 自己维护的安装清单 revision 或 digest，不能冒充 DSH settings revision。
+
+下面代码块描述的是完整闭环的目标契约；当前实装能力必须以 `/ds-hub-api/capabilities` 为准，不能因为示例里出现了方法就假定 Preset 编辑、回归或观察已经可用。
 
 ```js
 // dshBridge 代表同源 sidecar。以下 value/revision/evidence 均须来自真实读取或事件，
@@ -312,6 +346,11 @@ node --check dsh-snapshot.js
 node --check scripts/sync-dsh-snapshot.mjs
 node scripts/ui-contract-smoke.mjs
 node scripts/unknown-write-smoke.mjs
+node scripts/plugin-contract-smoke.mjs
+node scripts/loader-management-smoke.mjs
+# DSH Web 已运行时，显式执行真实模型链探针：
+node scripts/dsh-hub-live-smoke.mjs
+cd dsh-client-plugin && npm test
 ```
 
 `ui-contract-smoke` 覆盖默认路由、四类快速候选、助手分析对象、伪造拖放拦截、消息摘要绑定、空 revision 拒绝、派生 proof 绑定与全局 Preset 门禁；`unknown-write-smoke` 覆盖写入状态未知后的遮蔽与重新同步恢复。同步脚本本身还会验证随机 ref、私有映射权限，以及旧 mapping / snapshot / roster 组合不能解析。它们是逻辑回归，不替代真实浏览器视觉验收和 sidecar 集成测试。

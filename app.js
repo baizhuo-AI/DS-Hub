@@ -99,6 +99,18 @@
   const SNAPSHOT_WEB_SEARCH_MAX_USES = Number.isInteger(snapshotWebSearchMaxUses) && snapshotWebSearchMaxUses > 0
     ? snapshotWebSearchMaxUses
     : 5;
+  const SNAPSHOT_CURRENT_MODEL = (Array.isArray(SNAPSHOT.config.models) ? SNAPSHOT.config.models : [])
+    .find((item) => item?.provider === SNAPSHOT.config.model.provider
+      && (item?.id || item?.model) === SNAPSHOT.config.model.model);
+  const SNAPSHOT_REASONING_EFFORTS = Array.isArray(SNAPSHOT_CURRENT_MODEL?.reasoningEfforts)
+    ? SNAPSHOT_CURRENT_MODEL.reasoningEfforts
+    : [];
+  const INITIAL_REASONING_EFFORT = String(
+    SNAPSHOT.config.model.reasoningEffort
+      || SNAPSHOT_CURRENT_MODEL?.defaultReasoningEffort
+      || SNAPSHOT_REASONING_EFFORTS[0]?.id
+      || '',
+  ).trim();
 
   function readAgentName() {
     try { return window.localStorage?.getItem('ds-hub-agent-name') || 'Deepseek Agent'; }
@@ -127,11 +139,28 @@
   const storedOptimization = readOptimizationState();
 
   const state = {
-    view: 'workshop',
+    view: 'ways',
+    waysSection: 'horizontal',
+    waysMethodFocus: 'conversation-method',
+    waysDetail: null,
+    impactPreview: null,
     quickSection: 'model',
     module: null,
     capability: null,
+    relationshipFocusRef: null,
+    relationshipStageId: null,
+    relationshipLensOpen: false,
+    relationshipLensIndex: 0,
+    extensionPath: 'root',
     componentDetail: null,
+    communityDetail: null,
+    communityReturnToLibrary: false,
+    communityInstallState: null,
+    configManagementCapability: { status: 'idle', message: '', targets: [] },
+    pluginManagementCapability: { status: 'idle', message: '', mutableEntries: [] },
+    packageInstallCapability: { status: 'idle', message: '' },
+    loaderEntryReadbacks: {},
+    loaderEntryAction: null,
     componentLimit: 12,
     libraryOpen: false,
     libraryTab: 'native',
@@ -168,7 +197,7 @@
     appliedOverrides: {},
     quickDrafts: {
       modelSelection: `${SNAPSHOT.config.model.provider}::${SNAPSHOT.config.model.model}`,
-      reasoningEffort: SNAPSHOT.config.model.reasoningEffort ?? 'medium',
+      reasoningEffort: INITIAL_REASONING_EFFORT,
       busyEnter: SNAPSHOT.config.conversation.busyEnter ?? 'queue',
       defaultPresetId: SNAPSHOT.config.defaultPresetId ?? SNAPSHOT.config.activePreset.id,
       webSearchMaxUses: SNAPSHOT_WEB_SEARCH_MAX_USES,
@@ -199,22 +228,36 @@
   let testSuiteCounter = 0;
   let assistantRequestCounter = 0;
   let observationRequestCounter = 0;
+  let communityInstallRequestCounter = 0;
+  let loaderEntryRequestCounter = 0;
   let assistantRequestControl = null;
-  let dialogReturnSelector = null;
+  let relationshipHoldTimer = null;
+  let relationshipGesture = null;
+  let suppressRelationshipClickUntil = 0;
+  let dialogReturnTarget = null;
   let lastAssistantMobileSheet = null;
 
   const MODULES = {
-    sense:  { name: '感知', en: 'Perception', body: '眼 / 耳 / 触角', icon: '⌁', desc: '决定它能接触和理解哪些当前信息' },
-    memory: { name: '记忆', en: 'Memory', body: '背部记忆匣', icon: '◫', desc: '决定它能保存什么、以后怎样找回来' },
-    mind:   { name: '心智', en: 'Mind', body: '额心脑核', icon: '◇', desc: '决定它怎样理解任务、思考和推进' },
-    tools:  { name: '工具', en: 'Tools', body: '双手', icon: '⌘', desc: '决定它具体可以使用哪些做事手段' },
-    action: { name: '行动', en: 'Action', body: '躯干 / 双腿', icon: '▷', desc: '决定它能否执行、何时确认以及怎样恢复' },
+    sense:  { name: '感知', en: 'Perception', body: '眼 / 耳 / 触角', icon: '⌁', question: '能看到什么', desc: '接收消息、文件、网页和当前环境信息' },
+    memory: { name: '记忆', en: 'Memory', body: '背部记忆匣', icon: '◫', question: '能记住什么', desc: '保留会话线索，并在需要时找回来' },
+    mind:   { name: '心智', en: 'Mind', body: '额心脑核', icon: '◇', question: '怎么想', desc: '理解任务、制定计划并决定下一步' },
+    tools:  { name: '工具', en: 'Tools', body: '双手', icon: '⌘', question: '能做什么', desc: '调用搜索、文件、代码和扩展能力' },
+    action: { name: '行动', en: 'Action', body: '躯干 / 双腿', icon: '▷', question: '怎么做', desc: '执行、确认、委派，并处理失败和恢复' },
   };
 
+  const BUILTIN_PRESET_GUIDES = Object.freeze({
+    '0.1.1-rc.2': Object.freeze({
+      '标准模式': '完整编码 Agent：包含文件编辑、Shell、检索、Skills、计划、目标、子 Agent 和工作流。',
+      'PTC 模式': '能力与标准模式相同；通过 Code Mode SDK，用一个 TypeScript 程序组合多步工具操作。',
+      '极简模式': '只保留持久 Bash 与文本替换编辑器，用更少的工具完成编码任务。',
+      '创造模式': '用于创建自定义角色卡，额外提供运行时检查、插件实验和角色卡创作指导。',
+    }),
+  });
+
   const TYPE_META = {
-    plugin: { label: '插件', short: 'P', help: 'DSH Loader 中的实际插件条目' },
+    plugin: { label: '插件', short: 'P', help: '当前 DSH 已发现的插件' },
     skill:  { label: 'Skill', short: 'S', help: '当前 Agent 可以按需读取的方法说明' },
-    tool:   { label: '工具入口', short: 'T', help: '默认 Preset 为 Agent 组装的动作入口' },
+    tool:   { label: '工具入口', short: 'T', help: '当前角色卡交给 Agent 的动作' },
     prompt: { label: '提示词来源', short: '文', help: '会向系统提示词贡献规则的实际组件' },
   };
 
@@ -229,7 +272,10 @@
     reasoningEffort: {
       target: '网页配置 → 默认模型 → 推理强度',
       targetId: 'settings:agent-default-model#/reasoningEffort',
-      allowedValues: ['low', 'medium', 'high', 'xhigh', 'max'],
+      allowedValues: [...new Set([
+        ...(SNAPSHOT.config.models || []).flatMap((model) => (model.reasoningEfforts || []).map((effort) => String(effort?.id || ''))),
+        String(SNAPSHOT.config.model.reasoningEffort || ''),
+      ].filter(Boolean))],
       configArea: 'model', targetModule: 'mind', targetCapability: 'model',
       checks: ['固定同一测试任务与模型版本', '记录质量、耗时和模型用量', '写入后重新读取推理强度', '只让新任务切换'],
     },
@@ -280,7 +326,7 @@
       { id: 'files', name: '处理文件', desc: '读取、搜索和编辑工作区文件' },
       { id: 'code', name: '运行命令和代码', desc: '执行 Shell、子进程与 Code Mode' },
       { id: 'web', name: '使用网络工具', desc: '把搜索能力作为工具交给 Agent' },
-      { id: 'extensions', name: '扩展做事方法', desc: '加载 Skill、插件、界面和扩展协议' },
+      { id: 'extensions', name: '扩展做事方法', desc: '安装和管理 Skill、插件与页面功能' },
     ],
     action: [
       { id: 'permission', name: '管理权限和确认', desc: '确定权限档位，并在需要时请求确认' },
@@ -295,6 +341,205 @@
     sense: 'external', memory: 'context', mind: 'model', tools: 'extensions', action: 'permission',
   };
 
+  const RELATIONSHIP_SPECS = Object.freeze({
+    sense: {
+      input: { kind: 'mixed', label: '输入与视觉方案', legend: '共同支持接收材料', secondaryLegend: '相近效果的视觉候选', verb: '共同支持', summary: '当前输入组件负责接住材料；视觉候选用不同算法补充图片理解，二者不是同一类关系。' },
+      default: { kind: 'alternatives', label: '同类方案', legend: '相近效果的不同方案', verb: '可以用', summary: '目标相近的输入方式放在同一组比较，不代表它们会互相调用。' },
+      clarify: { kind: 'support', label: '补充条件', legend: '共同补齐信息', verb: '帮助它', summary: '这些组件共同补齐缺失信息，属于协作支持，不是固定执行顺序。' },
+    },
+    memory: {
+      default: { kind: 'collaboration', label: '记忆协作网', legend: '共同完成这项记忆能力', verb: '共同完成', summary: '这些组件共同承担记录、整理、保存或取回职责；连线表示协作归属，不虚构调用顺序。' },
+    },
+    mind: {
+      model: { kind: 'collaboration', label: '模型调用链', legend: '共同完成一次模型调用', verb: '共同完成', summary: '默认模型、模型服务、失败重试和 Agent 循环承担不同职责；它们不是四个可以互换的模型。' },
+      default: { kind: 'layers', label: '思考层次', legend: '从不同层次影响判断', verb: '共同影响', summary: '身份、规则、计划与执行策略分层影响 Agent 的判断，不等于逐项顺序调用。' },
+    },
+    tools: {
+      default: { kind: 'toolbox', label: '工具组合', legend: '可以组合或替换', verb: '用它完成', summary: '工具可以并行组合，也可能互为替代；当前启用项和可选项分开标记。' },
+    },
+    action: {
+      permission: { kind: 'constraint', label: '权限关卡', legend: '共同限制动作', verb: '受它限制', summary: '权限与确认控制动作能否继续，属于约束关系。' },
+      sandbox: { kind: 'constraint', label: '执行边界', legend: '共同限制触达范围', verb: '限制范围', summary: '沙箱决定动作可以触达哪里，属于边界约束，不是做事工具。' },
+      default: { kind: 'collaboration', label: '执行协作网', legend: '共同完成或恢复动作', verb: '共同推进', summary: '这些组件共同承担执行、后台推进或失败恢复职责，不虚构固定调用顺序。' },
+    },
+  });
+
+  // These blueprints describe configuration roles that can be established from
+  // the synced component identity. They are not runtime invocation traces.
+  const RELATIONSHIP_BLUEPRINTS = Object.freeze({
+    'sense/input': {
+      reading: '材料先进入会话，再变成 Agent 能定位的引用；只有图片需要理解时，才额外使用视觉增强。',
+      stages: [
+        { id: 'entry', step: '第 1 步', label: '接住材料', desc: '输入框、附件入口和本地附件服务把材料收进来。', match: /attachment|input-trigger|输入|附件/i, connector: '保存并交给引用层' },
+        { id: 'reference', step: '第 2 步', label: '让 Agent 找得到', desc: '会话引用把材料变成后续可以定位的上下文。', match: /reference|引用/i, connector: '图片任务才需要增强' },
+        { id: 'vision', step: '按需', label: '理解图片内容', desc: 'OCR、视觉模型或像素工具负责看图，不能替代材料接收。', match: /vision|modlens|视觉|ocr|像素/i, candidate: true },
+      ],
+    },
+    'memory/context': {
+      reading: '先判断上下文是否过长，再压缩对话，最后裁掉过大的工具结果；三者解决的是不同环节。',
+      stages: [
+        { id: 'measure', step: '第 1 步', label: '发现快要超长', desc: '计量当前上下文，告诉后续组件什么时候需要处理。', match: /token-meter|context-pressure|context-breakdown|计量/i, connector: '达到阈值后' },
+        { id: 'compact', step: '第 2 步', label: '压缩对话内容', desc: '保留关键事实，把较早对话缩短。', match: /compaction-basic|command-compact|上下文压缩/i, connector: '工具结果仍过大时' },
+        { id: 'prune', step: '第 3 步', label: '裁剪工具结果', desc: '单独缩短长工具输出，避免它挤占全部上下文。', match: /pruner|裁剪/i },
+      ],
+    },
+    'mind/model': {
+      reading: '默认模型决定用谁；模型服务负责把请求发出去；重试负责处理失败；Agent 循环决定继续思考、使用工具还是回答。',
+      stages: [
+        { id: 'choose', step: '配置', label: '选择默认模型', desc: '决定新任务使用哪家模型服务、哪个模型和多大思考力度。', match: /agent-default-model|默认模型/i, connector: '把选择交给' },
+        { id: 'provider', step: '调用', label: '连接模型服务', desc: '模型服务连接负责把请求发给选定模型。', match: /llm|provider|模型注册|模型接入/i, exclude: /retry|重试/i, connector: '失败时交给' },
+        { id: 'retry', step: '保护', label: '处理调用失败', desc: '对允许恢复的模型错误执行有限重试。', match: /retry|重试/i, connector: '结果返回' },
+        { id: 'loop', step: '推进', label: '继续 Agent 循环', desc: '根据模型结果决定回答、调用工具或进入下一轮。', match: /agent-loop|推理循环/i },
+      ],
+    },
+    'mind/plan': {
+      reading: '计划规则决定 Agent 什么时候只思考；Agent 工具和用户命令从两条入口，共同更新目标与待办；页面负责把它们显示出来。',
+      sequence: false,
+      stages: [
+        { id: 'mode', step: '工作方式', label: '决定先规划还是直接做', desc: '规则与模式开关共同限制 Agent 当前能否执行。', match: /plan-mode|计划模式/i },
+        { id: 'state', step: '共同状态', label: '保存目标和推进轮次', desc: '这里保存长期目标，并决定任务是否继续下一轮。', componentTypes: ['plugin'], match: /dsh-goal(?:\b|-round)|目标管理|目标轮次驱动/i },
+        { id: 'commands', step: '用户入口', label: '接收用户发出的命令', desc: '用户通过命令查看、更新或整理任务状态。', componentTypes: ['plugin'], match: /command|命令/i, exclude: /client-ui|客户端界面/i },
+        { id: 'agent-tools', step: 'Agent 入口', label: '让 Agent 更新目标和待办', desc: '插件提供能力，工具入口让 Agent 真正可以调用。', match: /tool-(?:goal|todo)|目标工具|待办工具|维护长期目标|维护执行待办/i },
+        { id: 'pages', step: '页面入口', label: '让用户看见和操作', desc: '页面显示目标、计划和可用命令。', componentTypes: ['plugin'], match: /client-ui|客户端界面/i },
+      ],
+    },
+    'mind/identity': {
+      reading: '身份、项目说明和规则是提示词原料；系统提示组件把这些原料组装后再交给模型。',
+      stages: [
+        { id: 'sources', step: '来源', label: '提供身份与规则', desc: '角色、项目说明和语言设置分别贡献提示内容。', match: /persona|instructions|locale|身份|项目说明|语言/i, connector: '一起送去' },
+        { id: 'assemble', step: '组装', label: '合成系统提示', desc: '把多个提示来源合并成模型最终看到的系统提示。', match: /system-prompt|系统提示/i },
+      ],
+    },
+    'tools/files': {
+      reading: '先找到目标文件，再通过文件工具读写；观察与沙箱策略只负责限制范围，不替代文件工具。',
+      stages: [
+        { id: 'find', step: '定位', label: '找到文件或引用', desc: '搜索与引用组件先确定 Agent 要处理的目标。', match: /search|reference|搜索|引用/i, connector: '定位后交给' },
+        { id: 'operate', step: '操作', label: '读取和修改文件', desc: '文件工具和编辑器执行实际读写动作。', match: /tool-fs|editor|文件操作|编辑/i, connector: '全程受限于' },
+        { id: 'guard', step: '边界', label: '限制可访问范围', desc: '观察策略和沙箱决定哪些位置允许读取或写入。', match: /policy|observation|sandbox|策略|沙箱/i },
+      ],
+    },
+    'tools/extensions': {
+      reading: '先发现扩展，再注册到 DSH，最后把可用入口交给 Agent 或界面；社区插件尚未安装时不参与当前链路。',
+      stages: [
+        { id: 'discover', step: '发现', label: '找到扩展', desc: '清单和文件系统扫描负责发现插件与 Skill。', match: /inventory|filesystem|清单|发现/i, connector: '发现后注册' },
+        { id: 'register', step: '注册', label: '装入 DSH', desc: '插件启动、信息登记和运行组件共同把扩展接进 DSH。', match: /loader|registry|cordis|modules|注册|加载/i, connector: '可用后暴露为' },
+        { id: 'expose', step: '使用', label: '交给 Agent 或界面', desc: '工具入口和界面组件让已注册扩展可以被真正使用。', match: /tool-skill|client|ui-|api-|界面|入口/i },
+        { id: 'candidate', step: '候选', label: '社区待安装方案', desc: '这里只做发现和比较，安装回读成功前不算当前能力。', candidate: true },
+      ],
+    },
+    'action/permission': {
+      reading: '权限方案先划定默认范围；动作越界时再请求用户确认；提示词只负责让模型理解这条边界。',
+      stages: [
+        { id: 'preset', step: '默认边界', label: '先限定可做范围', desc: '权限方案和凭据引用决定新任务默认能触达哪里。', match: /permission|credential|权限|凭据/i, connector: '动作越界时' },
+        { id: 'approval', step: '人工确认', label: '向用户申请放行', desc: '审批组件负责暂停高风险动作并请求明确确认。', match: /approval|确认|审批/i, connector: '边界同时写入' },
+        { id: 'explain', step: '模型规则', label: '让 Agent 理解边界', desc: '审批策略说明进入提示词，避免模型把确认当作普通对话。', match: /prompt|策略说明/i },
+      ],
+    },
+    'action/delegate': {
+      reading: '子 Agent 核心维护生命周期；创建器负责启动；控制工具负责查看和干预；结果组件负责回传。',
+      stages: [
+        { id: 'core', step: '底座', label: '维护子 Agent 生命周期', desc: '核心服务保存子 Agent 的身份、状态和协作关系。', match: /@deepseek-ai\/dsh-subagent(?:\s|$)|协作核心/i, connector: '由创建器启动' },
+        { id: 'spawn', step: '创建', label: '创建或派生子 Agent', desc: '进程内创建和派生运行器决定子 Agent 如何启动。', match: /spawn|fork|创建运行器|派生运行器/i, connector: '通过工具管理' },
+        { id: 'control', step: '控制', label: '查看、委派和干预', desc: '控制与委派工具是主 Agent 真正可调用的动作入口。', match: /tool-subagent|管理工具|委派工具/i, connector: '完成后' },
+        { id: 'report', step: '回传', label: '展示并交回结果', desc: '结果回传和操作界面把状态、产物交回主 Agent 与用户。', match: /report|client-ui|结果回传|操作界面/i },
+      ],
+    },
+  });
+
+  // The extension capability is the densest real DSH surface. Unlike the
+  // smaller capabilities, its components do not form one honest linear flow:
+  // one chain reaches the Agent, while the rest provide runtime, Host, client,
+  // and Web UI support. Keep every synced component visible and fail open into
+  // an explicit "待确认归属" group when a new DSH component appears.
+  const EXTENSION_SYSTEM_GROUPS = Object.freeze([
+    {
+      id: 'skill', label: 'Skill 方法链', eyebrow: '真正交给 Agent 使用', tone: 'primary',
+      desc: '从发现本地 Skill，到把“查找并使用 Skill”作为动作入口交给 Agent；状态标识是旁支，不是主链。',
+      relation: '四步主链 + 一条状态旁支',
+      items: [
+        { title: '本地 Skill 发现', role: '① 发现', relation: '扫描本地目录，找到可以加载的 Skill。' },
+        { title: 'Skill 核心服务', role: '② 管理', relation: '接住发现结果，维护 Skill 的可用状态。' },
+        { title: 'Skill 使用入口', role: '③ 暴露入口', relation: '把核心服务包装成 Agent 可以使用的工具能力。' },
+        { title: '查找并使用 Skill', role: '④ Agent 调用', relation: '当前角色卡里的真实动作入口，Agent 从这里查找并读取 Skill。' },
+        { title: 'Skill 状态标识', role: '旁支 · 显示状态', relation: '只负责在界面显示 Skill 状态，不是 Agent 调用主链的一步。', branch: true },
+      ],
+    },
+    {
+      id: 'foundation', label: '插件启动准备', eyebrow: '所有插件共用',
+      desc: '先读设置，再登记插件信息，最后准备把插件启动起来。',
+      relation: '共同完成插件启动前的准备',
+      items: [
+        { title: 'Cordis加载入口', role: '开始启动' },
+        { title: 'Cordis插件热更新', role: '开发时刷新' },
+        { title: '类型系统注册中心', role: '登记信息' },
+        { title: '类型系统加载器', role: '创建实例' },
+        { title: '设置文件', role: '读取配置' },
+      ],
+    },
+    {
+      id: 'host', label: '后台服务', eyebrow: '在后台接住请求',
+      desc: '接住网页和 Agent 的请求，返回插件清单，或执行需要在后台完成的能力。',
+      relation: '共同让后台能够接收并处理请求',
+      items: [
+        { title: 'Cordis主机运行器', role: '启动后台插件' },
+        { title: 'Web 服务宿主', role: '提供网页服务' },
+        { title: 'API网关', role: '接收请求' },
+        { title: '主机API 代理', role: '转接后台能力' },
+        { title: '主机插件清单', role: '列出已装插件' },
+      ],
+    },
+    {
+      id: 'client', label: '网页连接', eyebrow: '让网页连上后台',
+      desc: '让网页拿到后台状态并装上对应功能；它让界面工作，但不会直接增加 Agent 的做事能力。',
+      relation: '共同维持网页与后台的连接',
+      items: [
+        { title: '客户端运行时', role: '启动网页功能' },
+        { title: 'Cordis客户端运行器', role: '启动网页插件' },
+        { title: '客户端模块', role: '装配网页功能' },
+        { title: '客户端连接', role: '连接后台' },
+        { title: '远程 API 连接', role: '连接外部服务' },
+        { title: '客户端热更新', role: '开发时刷新' },
+      ],
+    },
+    {
+      id: 'ui', label: '网页界面', eyebrow: '16 项只负责看见和操作', tone: 'ui',
+      desc: '这些组件组成 DS Hub 页面：后台能力可能仍在，但关闭对应组件会失去那块界面或管理入口。',
+      relation: '按界面责任分成四组，不代表调用顺序',
+      subgroups: [
+        { id: 'shell', label: '界面骨架', desc: '决定 Web 的外观和基础渲染。' },
+        { id: 'workspace', label: '工作区域', desc: '提供侧栏、工具和交付物入口。' },
+        { id: 'manage', label: '配置管理', desc: '提供设置、插件、角色卡和 Skill 管理页。' },
+        { id: 'observe', label: '观察反馈', desc: '查看轨迹并收集消息反馈。' },
+      ],
+      items: [
+        { title: '客户端界面主题', role: '主题', subgroup: 'shell' },
+        { title: '客户端界面布局', role: '布局', subgroup: 'shell' },
+        { title: '客户端界面渲染器', role: '渲染器', subgroup: 'shell' },
+        { title: '客户端界面品牌官方', role: '品牌', subgroup: 'shell' },
+        { title: '客户端界面侧栏', role: '侧栏', subgroup: 'workspace' },
+        { title: '客户端界面工具', role: '工具界面', subgroup: 'workspace' },
+        { title: '客户端界面Cordis', role: '插件界面', subgroup: 'workspace' },
+        { title: '客户端界面交付物', role: '交付物', subgroup: 'workspace' },
+        { title: '客户端界面设置', role: '设置入口', subgroup: 'manage' },
+        { title: '客户端界面设置通用', role: '通用设置', subgroup: 'manage' },
+        { title: '客户端界面设置插件清单', role: '插件清单设置', subgroup: 'manage' },
+        { title: '客户端界面设置插件列表', role: '插件列表设置', subgroup: 'manage' },
+        { title: '客户端界面Agent角色卡', role: '角色卡', subgroup: 'manage' },
+        { title: '客户端界面Skill', role: 'Skill 管理', subgroup: 'manage' },
+        { title: '客户端界面运行轨迹', role: '运行轨迹', subgroup: 'observe' },
+        { title: '客户端界面消息反馈', role: '消息反馈', subgroup: 'observe' },
+      ],
+    },
+    {
+      id: 'cross', label: '跨能力工具', eyebrow: '在这里登记，实际服务记忆模块', tone: 'cross',
+      desc: '它出现在当前角色卡的工具清单里，所以会被扩展系统发现；真正解决的是“控制上下文长度”。',
+      relation: '从工具清单跨接到记忆能力',
+      items: [
+        { title: '执行工具结果裁剪', role: '上下文裁剪工具', relation: '当前角色卡已组装的动作入口；功能责任属于记忆 → 控制上下文长度。' },
+      ],
+    },
+  ]);
+
   // Community candidates are research-backed presets, not part of the local DSH snapshot.
   // Popularity is a point-in-time npm signal (2026-08-20 through 2026-08-26).
   const COMMUNITY_COMPONENTS = [
@@ -303,6 +548,9 @@
       name: 'DSH 社区插件市场', packageName: 'dshmarket',
       desc: '在 DSH 内浏览、安装、更新和卸载社区插件。',
       downloads: 145091, license: 'MIT', version: '1.34.0',
+      latestVersion: '1.35.0', versionStatus: '有新版 v1.35.0；目录固定 v1.34.0', auditedAt: '2026-08-28',
+      provenanceReview: '目录记录包含 npm Provenance 与源码提交；本次未实时复核。',
+      localCompatibility: '目录记录为初步兼容；尚未实装，安装前仍需实时复核。',
       repo: 'https://github.com/dsh-market/dsh-market',
       risk: '会改动当前配置和插件安装状态；安装、升级和卸载都需要逐项确认。',
     },
@@ -311,6 +559,9 @@
       name: '增强侧边工作台', packageName: 'dsh-better-sidebar',
       desc: '把文件、编辑器、终端、Git 与浏览器集中到侧边工作台。',
       downloads: 120348, license: 'MIT', version: '0.16.1',
+      latestVersion: '0.16.1', versionStatus: '目录固定版本已是 npm 最新版', auditedAt: '2026-08-28',
+      provenanceReview: '目录记录包含 npm Provenance；本次未实时复核。',
+      localCompatibility: '本机依赖快照存在 peer 差异，需隔离兼容实测；尚未实装。',
       repo: 'https://github.com/omdsh-dev/DSH-better-sidebar',
       risk: '同时触达终端、Git、文件与浏览器，启用前应核对每一类权限边界。',
     },
@@ -319,6 +570,9 @@
       name: '任务看板与定时执行', packageName: '@linxin666/dsh-client-ui-task-board',
       desc: '用真实会话执行任务，并提供看板与定时调度。',
       downloads: 103035, license: 'Apache-2.0', version: '0.3.6',
+      latestVersion: '0.3.6', versionStatus: '目录固定版本已是 npm 最新版', auditedAt: '2026-08-28',
+      provenanceReview: '仅有 npm SHA-512；缺少 Provenance 与 gitHead，需人工来源审核。',
+      localCompatibility: '本机声明初检通过；来源待人工审核，尚未实装。',
       repo: 'https://github.com/zhu1090093659/dsh-web',
       risk: '可能创建真实会话和定时任务；预置时保持关闭，启用前确认触发范围。',
     },
@@ -327,6 +581,9 @@
       name: '配置诊断与恢复', packageName: '@linxin666/dsh-doctor',
       desc: '诊断当前配置，并提供受控修复、健康监控和恢复入口。',
       downloads: 59509, license: 'BSD-3-Clause', version: '0.3.6',
+      latestVersion: '0.3.6', versionStatus: '目录固定版本已是 npm 最新版', auditedAt: '2026-08-28',
+      provenanceReview: '仅有 npm SHA-512；缺少 Provenance 与 gitHead，需人工来源审核。',
+      localCompatibility: '本机 react-dom peer 声明与当前解析版本不同，需隔离兼容实测；尚未实装。',
       repo: 'https://github.com/zhu1090093659/dsh-web',
       risk: '具备修复配置的能力；应用前必须展示差异、备份与回滚入口。',
     },
@@ -335,6 +592,9 @@
       name: '视觉理解 ModLens', packageName: '@liustack/modlens',
       desc: '为文本模型补充图片理解、OCR 与版面证据。',
       downloads: 54888, license: 'MIT', version: '3.25.2',
+      latestVersion: '3.25.2', versionStatus: '目录固定版本已是 npm 最新版', auditedAt: '2026-08-28',
+      provenanceReview: '目录记录包含 npm Provenance 与源码提交；本次未实时复核。',
+      localCompatibility: '目录记录为初步兼容；尚未实装，安装前仍需实时复核。',
       repo: 'https://github.com/liustack/modlens',
       risk: '图片可能进入外部处理链；需检查隐私策略，并避免与另一视觉路由重复启用。',
     },
@@ -343,6 +603,9 @@
       name: '上下文透视', packageName: 'dsh-context',
       desc: '查看上下文组成、增长、压缩、剪枝和注入变化。',
       downloads: 31212, license: 'Apache-2.0', version: '0.35.0',
+      latestVersion: '0.36.0', versionStatus: '有新版 v0.36.0；目录固定 v0.35.0', auditedAt: '2026-08-28',
+      provenanceReview: '目录记录包含 npm Provenance 与源码提交；本次未实时复核。',
+      localCompatibility: '目录记录为初步兼容；尚未实装，安装前仍需实时复核。',
       repo: 'https://github.com/bowenliang123/dsh-context',
       risk: '会展示上下文和提示词内容；共享截图或日志前需要做隐私检查。',
     },
@@ -351,6 +614,9 @@
       name: '多 Agent 团队协作', packageName: '@nanmicoder/dsh-agent-teams',
       desc: '组织多 Agent 团队、依赖任务、消息协作与活动面板。',
       downloads: 21288, license: 'MIT', version: '0.1.14',
+      latestVersion: '0.1.14', versionStatus: '目录固定版本已是 npm 最新版', auditedAt: '2026-08-28',
+      provenanceReview: '目录记录包含 npm Provenance 与源码提交；本次未实时复核。',
+      localCompatibility: '目录记录为初步兼容；尚未实装，安装前仍需实时复核。',
       repo: 'https://github.com/NanmiCoder/dsh-agent-teams',
       risk: '可能创建子 Agent、任务和消息；默认关闭自动执行，先限制并发与预算。',
     },
@@ -359,6 +625,9 @@
       name: '视觉路由与像素工具', packageName: 'dsh-vision-router',
       desc: '为纯文本会话增加视觉路由、OCR、定位和像素工具。',
       downloads: 20320, license: 'MIT', version: '2.0.1',
+      latestVersion: '2.0.1', versionStatus: '目录固定版本已是 npm 最新版', auditedAt: '2026-08-28',
+      provenanceReview: '目录记录包含 npm Provenance，但包未提供 gitHead；本次未实时复核。',
+      localCompatibility: '目录记录为初步兼容；尚未实装，安装前仍需实时复核。',
       repo: 'https://github.com/ysr666/dsh-vision-router',
       risk: '与 ModLens 能力重叠；两者选一测试，并核对图片外发与模型调用范围。',
     },
@@ -499,8 +768,120 @@
     webserver: 'Web 服务', worker: '工作', workflow: '工作流', workspace: '工作区',
   };
 
+  // Keep the synced technical identity intact, but translate it at the UI edge.
+  // The first layer answers "what is this for?"; raw package names stay in
+  // secondary technical details for debugging and support.
+  const BEGINNER_COMPONENT_NAMES = Object.freeze({
+    '本地 Skill 发现': '找到本地 Skill',
+    'Skill 核心服务': '管理 Skill',
+    'Skill 使用入口': '把 Skill 交给 Agent',
+    '查找并使用 Skill': 'Agent 查找 Skill',
+    'Skill 状态标识': '显示 Skill 状态',
+    'Cordis加载入口': '插件启动入口',
+    'Cordis插件热更新': '开发时自动刷新插件',
+    '类型系统注册中心': '登记插件信息',
+    '类型系统加载器': '创建插件实例',
+    'Cordis主机运行器': '启动后台插件',
+    'Web 服务宿主': '提供网页服务',
+    'API网关': '接收所有请求',
+    '主机API 代理': '转接后台能力',
+    '主机插件清单': '列出已装插件',
+    '客户端运行时': '启动网页功能',
+    'Cordis客户端运行器': '启动网页插件',
+    '客户端模块': '装配网页功能',
+    '客户端连接': '连接网页与后台',
+    '远程 API 连接': '连接外部服务',
+    '客户端热更新': '开发时自动刷新网页',
+    '客户端界面主题': '页面主题',
+    '客户端界面布局': '页面布局',
+    '客户端界面渲染器': '绘制页面',
+    '客户端界面品牌官方': '官方品牌样式',
+    '客户端界面侧栏': '页面侧栏',
+    '客户端界面工具': '工具操作区',
+    '客户端界面Cordis': '插件操作区',
+    '客户端界面交付物': '成果查看区',
+    '客户端界面设置': '设置入口',
+    '客户端界面设置通用': '通用设置',
+    '客户端界面设置插件清单': '已装插件设置',
+    '客户端界面设置插件列表': '插件列表设置',
+    '客户端界面Agent角色卡': '角色卡设置',
+    '客户端界面Skill': 'Skill 设置',
+    '客户端界面运行轨迹': '任务过程',
+    '客户端界面消息反馈': '消息反馈',
+    '执行工具结果裁剪': '缩短过长的工具结果',
+    '计划模式规则': '只规划、不执行的规则',
+    '计划模式': '切换规划与执行',
+    '目标管理': '保存长期目标',
+    '目标轮次驱动': '按目标推进下一轮',
+    '命令系统': '接收用户命令',
+    '反馈命令': '提交任务反馈',
+    '目标命令': '查看或更新目标',
+    '压缩命令': '主动缩短对话',
+    '待办工具': '启用待办能力',
+    '目标工具': '启用目标能力',
+    '客户端界面命令系统': '命令入口页面',
+    '客户端界面目标': '目标页面',
+    '客户端界面计划': '计划页面',
+  });
+
+  const BEGINNER_COMPONENT_DESCRIPTIONS = Object.freeze({
+    '计划模式规则': '规定规划阶段只能分析和制定计划。',
+    '计划模式': '控制任务当前处于规划还是执行状态。',
+    '目标管理': '保存长期目标和当前进度。',
+    '目标轮次驱动': '根据目标决定是否继续下一轮。',
+    '命令系统': '接收用户输入的任务命令。',
+    '反馈命令': '把用户反馈交给任务处理流程。',
+    '目标命令': '让用户查看或更新长期目标。',
+    '压缩命令': '让用户主动缩短过长的对话。',
+    '待办工具': '为 Agent 准备待办相关能力。',
+    '目标工具': '为 Agent 准备目标相关能力。',
+    '维护长期目标': 'Agent 可以读取或更新长期目标。',
+    '维护执行待办': 'Agent 可以读取或更新当前待办。',
+    '客户端界面命令系统': '提供用户输入命令的页面入口。',
+    '客户端界面目标': '显示并管理长期目标。',
+    '客户端界面计划': '显示当前计划和执行进度。',
+  });
+
+  function beginnerComponentName(value) {
+    return BEGINNER_COMPONENT_NAMES[String(value || '')] || String(value || '');
+  }
+
+  function beginnerComponentDescription(item) {
+    return BEGINNER_COMPONENT_DESCRIPTIONS[String(item?.title || item?.name || '')]
+      || beginnerUiCopy(item?.desc || '');
+  }
+
+  function beginnerUiCopy(value) {
+    let result = String(value || '');
+    Object.entries(BEGINNER_COMPONENT_NAMES)
+      .sort(([left], [right]) => right.length - left.length)
+      .forEach(([technical, plain]) => { result = result.replaceAll(technical, plain); });
+    return result
+      .replaceAll('Web Profile / Host', 'DSH 后台')
+      .replaceAll('DSH Loader', 'DSH 插件清单')
+      .replaceAll('Host Loader', '后台插件入口')
+      .replaceAll('Loader 入口', '使用位置')
+      .replaceAll('Loader', '插件启动器')
+      .replaceAll('Provider', '模型服务')
+      .replaceAll('Cordis', '插件底层')
+      .replaceAll('客户端', '网页')
+      .replaceAll('Host', 'DSH 后台')
+      .replaceAll('API', '系统接口')
+      .replaceAll('Web', '网页')
+      .replaceAll('运行时', '运行环境')
+      .replaceAll('Preset', '角色卡')
+      .replaceAll('Fiber', '运行状态');
+  }
+
   function esc(value) {
     return String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+  }
+
+  function inlineJsString(value) {
+    const json = JSON.stringify(String(value ?? ''))
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
+    return esc(json);
   }
 
   function stableContentHash(value) {
@@ -552,6 +933,12 @@
     return '运行时注入';
   }
 
+  function loaderEntryIdentity(packageName, entry) {
+    return [packageName, entry?.moduleName, entry?.entryId, entry?.scope]
+      .map((value) => encodeURIComponent(String(value || '')))
+      .join('|');
+  }
+
   function groupPluginRows(rows) {
     const groups = new Map();
     for (const row of rows) {
@@ -559,13 +946,16 @@
       const familyId = pluginFamilyId(packageName);
       const group = groups.get(familyId) || { familyId, packageName, packages: new Set(), entries: [] };
       group.packages.add(packageName);
-      group.entries.push({
+      const entry = {
         entryId: row.entryId,
         moduleName: row.moduleName,
+        packageName,
         enabled: Boolean(row.enabled),
         fiberPhase: row.fiberPhase,
         scope: componentScope(row),
-      });
+      };
+      entry.identity = loaderEntryIdentity(packageName, entry);
+      group.entries.push(entry);
       groups.set(familyId, group);
     }
     return [...groups.values()].map((group) => {
@@ -590,7 +980,42 @@
     });
   }
 
-  const PLUGIN_GROUPS = groupPluginRows(SNAPSHOT.plugins);
+  function pluginInventoryRows() {
+    const rows = Array.isArray(SNAPSHOT.plugins) ? SNAPSHOT.plugins.map((row) => ({ ...row })) : [];
+    const seen = new Set(rows.map((row) => `${row.moduleName}\0${row.entryId}`));
+    for (const presetRow of Array.isArray(SNAPSHOT.config.presetRows) ? SNAPSHOT.config.presetRows : []) {
+      const moduleName = String(presetRow?.moduleName || '').trim();
+      const rowId = String(presetRow?.id || '').trim();
+      if (!moduleName || !rowId) continue;
+      const entryId = `include:agent-presets:${rowId}`;
+      const key = `${moduleName}\0${entryId}`;
+      if (seen.has(key)) continue;
+      rows.push({
+        entryId,
+        moduleName,
+        enabled: Boolean(presetRow.enabled),
+        fiberPhase: presetRow.enabled ? 'active' : null,
+      });
+      seen.add(key);
+    }
+    return rows;
+  }
+
+  let PLUGIN_GROUPS = groupPluginRows(pluginInventoryRows());
+
+  function effectivePluginRows() {
+    return pluginInventoryRows().map((row) => {
+      const packageName = pluginPackageName(row.moduleName);
+      const identity = loaderEntryIdentity(packageName, { ...row, scope: componentScope(row) });
+      const readback = state.loaderEntryReadbacks[identity];
+      return readback ? { ...row, enabled: readback.enabled, fiberPhase: readback.fiberPhase ?? null } : row;
+    });
+  }
+
+  function refreshPluginInventoryPresentation() {
+    PLUGIN_GROUPS = groupPluginRows(effectivePluginRows());
+    rebuildCapabilityIndex();
+  }
 
   function classifyPlugin(row) {
     const s = `${row.moduleName} ${row.entryId}`.toLowerCase();
@@ -721,7 +1146,7 @@
 
   function quickReasoningLabel(value) {
     const labels = {
-      none: '关闭', minimal: '极简', low: '较低', medium: '中等', high: '较高', xhigh: '很高', max: '最高',
+      none: '关闭', off: '关闭', minimal: '极简', low: '较低', medium: '中等', high: '较高', xhigh: '很高', max: '最高',
     };
     return labels[value] ? `${labels[value]}（${value}）` : value || '未记录';
   }
@@ -756,8 +1181,8 @@
     if (tech.includes('dsh-web-search-deepseek')) return `使用 DeepSeek 搜索模型；当前每次任务最多 ${effectiveWebSearchMaxUses()} 次。`;
     if (tech.includes('dsh-permission-presets')) return `默认权限方案是 ${effectivePermissionDefault()}。`;
     if (tech.includes('dsh-agent-default-model')) return `默认使用 ${SNAPSHOT.config.model.model}，推理强度 ${effectiveReasoningEffort()}。`;
-    if (tech.includes('client-ui')) return '这是 Web 界面的实际功能组件，不直接增加 Agent 的推理能力。';
-    return `为“${ability.name}”提供运行支持；${row.entryCount > 1 ? `${row.entryCount} 条加载记录已归并，` : ''}状态来自当前 DSH Loader 回读。`;
+    if (tech.includes('client-ui')) return '这是网页里的实际功能组件，不直接增加 Agent 的推理能力。';
+    return `为“${ability.name}”提供运行支持；${row.entryCount > 1 ? `${row.entryCount} 个使用位置已合并显示，` : ''}状态来自当前 DSH 插件清单。`;
   }
 
   const toolNames = {
@@ -885,13 +1310,18 @@
     for (const installed of Object.values(state.verifiedInstalls)) {
       const catalogItem = COMMUNITY_COMPONENTS.find((item) => item.packageName === installed.packageName);
       if (!catalogItem || PLUGIN_GROUPS.some((item) => item.packageName === installed.packageName)) continue;
-      const entries = installed.manifestEntries.map((entry) => ({
-        entryId: entry.entryId,
-        moduleName: entry.moduleName,
-        enabled: entry.moduleName === installed.inventory.moduleName && entry.entryId === installed.inventory.entryId,
-        fiberPhase: entry.moduleName === installed.inventory.moduleName && entry.entryId === installed.inventory.entryId ? installed.inventory.fiberPhase : null,
-        scope: '本次采用回读',
-      }));
+      const entries = installed.manifestEntries.map((entry) => {
+        const normalizedEntry = {
+          entryId: entry.entryId,
+          moduleName: entry.moduleName,
+          packageName: installed.packageName,
+          enabled: entry.moduleName === installed.inventory.moduleName && entry.entryId === installed.inventory.entryId,
+          fiberPhase: entry.moduleName === installed.inventory.moduleName && entry.entryId === installed.inventory.entryId ? installed.inventory.fiberPhase : null,
+          scope: '本次采用回读',
+        };
+        normalizedEntry.identity = loaderEntryIdentity(installed.packageName, normalizedEntry);
+        return normalizedEntry;
+      });
       add(catalogItem.moduleKey, catalogItem.capabilityId, {
         type: 'plugin',
         name: catalogItem.name,
@@ -1007,9 +1437,46 @@
     return identity ? `component/${moduleKey}/${capabilityId}/${component.type}/${encodeURIComponent(identity)}` : '';
   }
 
+  function componentLocationFromRef(ref) {
+    const value = String(ref || '').trim().slice(0, 500);
+    const parts = value.split('/');
+    if (parts[0] !== 'component' || parts.length !== 5 || !MODULES[parts[1]] || !TYPE_META[parts[3]]) return null;
+    let identity;
+    try { identity = decodeURIComponent(parts[4]); } catch (_) { return null; }
+    let moduleKey = parts[1];
+    let ability = CAPABILITIES[moduleKey]?.find((item) => item.id === parts[2]);
+    let component = ability?.components.find((item) => item.type === parts[3] && componentContextIdentity(item) === identity);
+    if (!component) {
+      const relocated = ALL_COMPONENTS.find((item) => item.component.type === parts[3] && componentContextIdentity(item.component) === identity);
+      if (relocated) {
+        moduleKey = relocated.moduleKey;
+        ability = relocated.ability;
+        component = relocated.component;
+      }
+    }
+    return ability && component ? { ref: value, moduleKey, ability, component } : null;
+  }
+
   function resolveAssistantContextRef(ref) {
     const value = String(ref || '').trim().slice(0, 500);
     const parts = value.split('/');
+    if (parts[0] === 'workway' && parts.length === 2) {
+      const item = workWayObjectById(parts[1]);
+      if (!item) return null;
+      const section = WORK_WAY_SECTIONS.find((candidate) => candidate.id === item.section);
+      return state.restoredPendingRefresh
+        ? { ref: value, kind: 'workway', title: item.title, availability: 'state_unknown', valuesWithheld: true }
+        : {
+          ref: value,
+          kind: 'workway',
+          title: item.title,
+          path: `工作方式 → ${section?.title || '当前配置'} → ${item.title}`,
+          summary: `${item.short}；${item.change}`,
+          status: item.status,
+          evidence: item.evidence,
+          source: { kind: 'dsh_snapshot', capturedAt: SNAPSHOT.capturedAt },
+        };
+    }
     if (parts[0] === 'module' && parts.length === 2 && MODULES[parts[1]]) {
       const module = MODULES[parts[1]];
       return state.restoredPendingRefresh
@@ -1023,20 +1490,18 @@
         ? { ref: value, kind: 'capability', title: ability.name, availability: 'state_unknown', valuesWithheld: true }
         : { ref: value, kind: 'capability', title: ability.name, path: `${MODULES[parts[1]].name} → ${ability.name}`, summary: ability.desc, status: 'available', source: { kind: 'dsh_snapshot', capturedAt: SNAPSHOT.capturedAt } };
     }
-    if (parts[0] === 'component' && parts.length === 5 && MODULES[parts[1]] && TYPE_META[parts[3]]) {
-      const ability = CAPABILITIES[parts[1]]?.find((item) => item.id === parts[2]);
-      let identity;
-      try { identity = decodeURIComponent(parts[4]); } catch (_) { return null; }
-      const component = ability?.components.find((item) => item.type === parts[3] && componentContextIdentity(item) === identity);
-      if (!ability || !component) return null;
+    if (parts[0] === 'component') {
+      const found = componentLocationFromRef(value);
+      if (!found) return null;
+      const { ability, component, moduleKey } = found;
       return state.restoredPendingRefresh
-        ? { ref: value, kind: component.type, title: component.name, availability: 'state_unknown', valuesWithheld: true }
+        ? { ref: value, kind: component.type, title: beginnerComponentName(component.name), availability: 'state_unknown', valuesWithheld: true }
         : {
           ref: value,
           kind: component.type,
-          title: component.name,
-          path: `${MODULES[parts[1]].name} → ${ability.name} → ${TYPE_META[component.type].label}`,
-          summary: shortSentence(component.desc, 160),
+          title: beginnerComponentName(component.name),
+          path: `${MODULES[moduleKey].name} → ${ability.name} → ${TYPE_META[component.type].label}`,
+          summary: beginnerUiCopy(shortSentence(component.desc, 160)),
           type: component.type,
           tech: component.tech,
           status: componentStatusLabel(component),
@@ -1060,10 +1525,9 @@
     state.assistantContextRefs.push(item.ref);
     state.assistantAnnouncement = `已加入「${item.title}」；尚未发送，也未修改配置`;
     if (state.componentDetail) {
-      const [moduleKey, capabilityId, indexText] = state.componentDetail.split(':');
-      dialogReturnSelector = `[data-component-ref="${moduleKey}-${capabilityId}-${indexText}"]`;
+      dialogReturnTarget = { kind: 'data', attribute: 'data-component-ref', value: state.componentDetail };
     } else {
-      dialogReturnSelector = `[data-assistant-source-ref="${item.ref}"]`;
+      dialogReturnTarget = { kind: 'data', attribute: 'data-assistant-source-ref', value: item.ref };
     }
     state.componentDetail = null;
     state.libraryOpen = false;
@@ -1124,7 +1588,7 @@
   function renderAssistantContextTray() {
     const items = currentAssistantFocusItems();
     if (!items.length) return '<div class="assistant-drop-hint"><span class="assistant-drop-desktop">可把模块、能力或组件拖到这里</span><span class="assistant-drop-mobile">点组件上的「分析」加入这里</span><small>只添加分析上下文，不会自动修改配置</small></div>';
-    return `<div class="assistant-context-tray" role="group" aria-label="分析对象，共 ${items.length} 项"><div class="assistant-context-label"><span>下一条消息将分析</span><small>仅用于下一条回答，不会自动修改配置</small></div><div class="assistant-context-chips">${items.map((item) => `<span class="assistant-context-chip"><i>${esc(TYPE_META[item.kind]?.short || (item.kind === 'module' ? '模' : item.kind === 'capability' ? '能' : '·'))}</i><b title="${esc(item.path || item.title)}">${esc(item.title)}</b><button type="button" onclick="removeAssistantContext('${esc(item.ref)}')" aria-label="移除${esc(item.title)}">×</button></span>`).join('')}</div></div>`;
+    return `<div class="assistant-context-tray" role="group" aria-label="分析对象，共 ${items.length} 项"><div class="assistant-context-label"><span>下一条消息将分析</span><small>仅用于下一条回答，不会自动修改配置</small></div><div class="assistant-context-chips">${items.map((item) => `<span class="assistant-context-chip"><i>${esc(TYPE_META[item.kind]?.short || (item.kind === 'module' ? '模' : item.kind === 'capability' ? '能' : '·'))}</i><b title="${esc(item.path || item.title)}">${esc(item.title)}</b><button type="button" onclick="removeAssistantContext(${inlineJsString(item.ref)})" aria-label="移除${esc(item.title)}">×</button></span>`).join('')}</div></div>`;
   }
 
   function formatNumber(value) {
@@ -1173,7 +1637,7 @@
   function componentTypeLabel(component) {
     const base = TYPE_META[component.type].label;
     if (!component.entryCount || component.entryCount < 2) return base;
-    return component.type === 'plugin' ? `${base} · ${component.entryCount} 条记录` : `${base} · ${component.entryCount} 个入口`;
+    return component.type === 'plugin' ? `${base} · ${component.entryCount} 个使用位置` : `${base} · ${component.entryCount} 个入口`;
   }
 
   function buildRecommendations() {
@@ -1323,14 +1787,19 @@
   }
 
   function renderTopbar() {
-    const snapshotDate = String(SNAPSHOT.capturedAt || '').slice(5, 10).replace('-', '/');
+    const liveInDsh = Boolean(window.__DS_HUB_RUNTIME_CONFIG__ && window.DS_HUB_AI_ADAPTER);
+    const runtimeEntry = liveInDsh
+      ? '<span class="runtime-pill live" title="当前页面已连接本机 DSH；发送时会核验模型服务、模型和角色卡">● DSH 已连接</span>'
+      : '<a class="runtime-pill" href="http://127.0.0.1:3080/ds-hub/" title="在 DSH 内打开，可使用真实模型服务和受控配置修改">打开 DSH 版 ↗</a>';
+    const repositoryActive = ['workshop', 'module', 'llm', 'flow'].includes(state.view);
     return `<div class="topbar">
-      <div class="logo"><span class="lg-ico"><img src="assets/dsh-icon.svg" alt="" width="19" height="19"></span>DS <em>Hub</em></div>
+      <button type="button" class="logo" onclick="goWays()" aria-label="返回 DS Hub 首页"><span class="lg-ico"><img src="assets/dsh-icon.svg" alt="" width="19" height="19"></span>DS <em>Hub</em></button>
       <div class="top-sep"></div>
       <button type="button" class="quick-entry ${state.view === 'quick' ? 'on' : ''}" onclick="goQuick()" aria-current="${state.view === 'quick' ? 'page' : 'false'}"><span>⚡</span>快速配置</button>
-      <span class="build-pill" title="DSH 版本 · 本机配置快照时间">DSH ${esc(SNAPSHOT.source.packageVersion)} · 本机快照 ${esc(snapshotDate)}</span>
+      ${runtimeEntry}
       <nav class="main-tabs" aria-label="主要功能">
-        <button class="${state.view !== 'trial' && state.view !== 'observe' && state.view !== 'quick' ? 'on' : ''}" aria-current="${state.view !== 'trial' && state.view !== 'observe' && state.view !== 'quick' ? 'page' : 'false'}" onclick="goWorkshop()">Agent 配置</button>
+        <button class="${state.view === 'ways' ? 'on' : ''}" aria-current="${state.view === 'ways' ? 'page' : 'false'}" onclick="goWays()">工作方式</button>
+        <button class="${repositoryActive ? 'on' : ''}" aria-current="${repositoryActive ? 'page' : 'false'}" onclick="goWorkshop()">能力仓库</button>
         <button class="${state.view === 'observe' ? 'on' : ''}" aria-current="${state.view === 'observe' ? 'page' : 'false'}" onclick="goObserve()">运行观测</button>
         <button class="${state.view === 'trial' ? 'on' : ''}" aria-current="${state.view === 'trial' ? 'page' : 'false'}" onclick="goTrial()">效果测试</button>
       </nav>
@@ -1373,6 +1842,35 @@
     return availableModelCatalog().find((item) => item.provider === provider && item.id === model) || availableModelCatalog()[0];
   }
 
+  function modelReasoningEfforts(model) {
+    const rows = Array.isArray(model?.reasoningEfforts) ? model.reasoningEfforts : [];
+    const seen = new Set();
+    const efforts = rows.map((item) => {
+      const id = String(item?.id || '').trim();
+      const label = String(item?.label || item?.name || id).trim();
+      if (!id || id.length > 80 || /[\u0000-\u001f]/.test(id) || seen.has(id)) return null;
+      seen.add(id);
+      return { id, label: label || id };
+    }).filter(Boolean);
+    if (efforts.length) return efforts;
+    const isCurrent = model?.provider === SNAPSHOT.config.model.provider
+      && (model?.id || model?.model) === SNAPSHOT.config.model.model;
+    const current = String(SNAPSHOT.config.model.reasoningEffort || '').trim();
+    return isCurrent && current ? [{ id: current, label: quickReasoningLabel(current).split('（')[0] }] : [];
+  }
+
+  function modelSupportsReasoningEffort(model, effort) {
+    return modelReasoningEfforts(model).some((item) => item.id === String(effort || ''));
+  }
+
+  function effectiveModelCatalogEntry() {
+    const selection = state.appliedOverrides.modelSelection || SNAPSHOT.config.model;
+    return availableModelCatalog().find((item) => item.provider === selection.provider && item.id === (selection.model || selection.id))
+      || availableModelCatalog().find((item) => item.provider === SNAPSHOT.config.model.provider
+        && item.id === SNAPSHOT.config.model.model)
+      || null;
+  }
+
   function quickSectionBlocked(section) {
     const keys = {
       model: ['modelSelection', 'reasoningEffort'],
@@ -1390,22 +1888,49 @@
 
   function quickSectionSummary(section) {
     if (quickSectionBlocked(section)) return '当前值等待重新核验';
+    const mutationState = quickSectionMutationState(section);
+    const prefix = mutationState === 'checking' ? '核对连接中 · ' : mutationState === 'readonly' ? '仅查看 · ' : '';
     if (section === 'model') {
       const model = selectedDraftModel() || SNAPSHOT.config.model;
-      return `${model.label || model.id || model.model} · ${quickReasoningLabel(state.quickDrafts.reasoningEffort).split('（')[0]}`;
+      return `${prefix}${model.label || model.id || model.model} · ${quickReasoningLabel(state.quickDrafts.reasoningEffort).split('（')[0]}`;
     }
-    if (section === 'context') return state.quickDrafts.contextMode === 'auto' ? '自动整理 · 平衡保留' : state.quickDrafts.contextMode === 'manual' ? '仅手动整理' : '关闭自动整理';
-    if (section === 'prompt') return state.quickDrafts.personaText ? '可编辑角色与行为要求' : '提示词正文等待 live 读取';
+    if (section === 'context') return `${prefix}${state.quickDrafts.contextMode === 'auto' ? '自动整理 · 平衡保留' : state.quickDrafts.contextMode === 'manual' ? '仅手动整理' : '关闭自动整理'}`;
+    if (section === 'prompt') return `${prefix}${state.quickDrafts.personaText ? '角色与行为要求' : '提示词正文未公开'}`;
     const tools = presetToolRows();
-    return `${tools.filter((item) => item.enabled).length}/${tools.length} 组已加入当前角色卡`;
+    return `${prefix}${tools.filter((item) => item.enabled).length}/${tools.length} 组已加入当前角色卡`;
+  }
+
+  function quickSectionMutationState(section) {
+    if (['idle', 'checking'].includes(state.configManagementCapability.status)) return 'checking';
+    if (state.configManagementCapability.status !== 'ready') return 'readonly';
+    if (section === 'model') {
+      return configTargetMutationReady(PENDING_REFRESH_META.modelSelection.targetId)
+        && configTargetMutationReady(PENDING_REFRESH_META.reasoningEffort.targetId) ? 'ready' : 'readonly';
+    }
+    const presetRef = presetRefOf();
+    const suffix = section === 'context' ? 'context-policy' : section === 'prompt' ? 'persona' : 'tools/*';
+    const targetId = validPresetRef(presetRef) ? `agent-preset-ref:${presetRef}#/${suffix}` : '';
+    return presetCompositionMutationReady(targetId) ? 'ready' : 'readonly';
+  }
+
+  function quickMutationMessage(section) {
+    const status = quickSectionMutationState(section);
+    if (status === 'checking') return '正在核对本机 DSH 是否开放这项修改。';
+    if (status === 'readonly') {
+      return section === 'model'
+        ? '当前 DSH 没有开放这项基础设置写入；这里只展示已同步值。'
+        : '当前 DSH 暂未开放角色卡写入；这里只能查看，不能保存。';
+    }
+    return '';
   }
 
   function renderQuickNav() {
+    const canMutate = (section) => quickSectionMutationState(section) === 'ready';
     const sections = [
-      { id: 'model', index: '01', title: '模型接入', desc: '换默认模型与思考深度' },
-      { id: 'context', index: '02', title: '会话与上下文', desc: '决定何时整理、保留多少' },
-      { id: 'prompt', index: '03', title: 'Agent 与提示词', desc: '直接编辑角色与行为要求' },
-      { id: 'tools', index: '04', title: '工具层', desc: '加入、停用和调整工具' },
+      { id: 'model', index: '01', title: '模型接入', desc: canMutate('model') ? '换默认模型与思考深度' : '查看默认模型与思考深度' },
+      { id: 'context', index: '02', title: '会话与上下文', desc: canMutate('context') ? '决定何时整理、保留多少' : '查看当前上下文处理方式' },
+      { id: 'prompt', index: '03', title: 'Agent 与提示词', desc: canMutate('prompt') ? '编辑角色与行为要求' : '查看角色与行为要求' },
+      { id: 'tools', index: '04', title: '工具层', desc: canMutate('tools') ? '加入、停用和调整工具' : '查看当前工具组成' },
     ];
     return `<nav class="quick-section-nav" aria-label="快速配置项目">${sections.map((item) => `<button type="button" class="${state.quickSection === item.id ? 'on' : ''}" onclick="selectQuickSection('${item.id}')" aria-current="${state.quickSection === item.id ? 'step' : 'false'}"><span>${item.index}</span><span><b>${item.title}</b><small>${item.desc}</small><em>${esc(quickSectionSummary(item.id))}</em></span></button>`).join('')}</nav>`;
   }
@@ -1413,27 +1938,32 @@
   function renderQuickModelEditor() {
     const models = availableModelCatalog();
     const selected = selectedDraftModel() || SNAPSHOT.config.model;
+    const reasoningEfforts = modelReasoningEfforts(selected);
     const blocked = quickSectionBlocked('model');
+    const mutationReady = quickSectionMutationState('model') === 'ready';
+    const controlsDisabled = blocked || !mutationReady;
     if (blocked) return renderQuickPendingEditor('model', '模型接入');
-    return `<section class="quick-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>新建 Agent 默认</span><h2 id="quick-editor-title" tabindex="-1">换模型</h2><p>Provider 接入、API Key 和自定义路由仍由原 DSH Web 管理；这里仅列出 DSH 已声明可用的模型组合。</p></div><button type="button" onclick="quickConfigAsk('model')">交给助手分析</button></div>
-      <div class="quick-form-grid"><label class="quick-field span-two"><span>Provider 与模型</span><select id="quick-model-selection" onchange="updateQuickDraft('modelSelection',this.value)" ${blocked ? 'disabled' : ''}>${models.map((item) => { const value = `${item.provider}::${item.id}`; return `<option value="${esc(value)}"${value === state.quickDrafts.modelSelection ? ' selected' : ''}>${esc(item.label)} · ${esc(item.provider)}</option>`; }).join('')}</select><small>来自本次 DSH 同步目录，不在目录中的组合不会进入候选。</small></label>
-      <label class="quick-field"><span>思考深度</span><select onchange="updateQuickDraft('reasoningEffort',this.value)" ${blocked ? 'disabled' : ''}>${PROPOSAL_POLICIES.reasoningEffort.allowedValues.map((value) => `<option value="${value}"${value === state.quickDrafts.reasoningEffort ? ' selected' : ''}>${esc(quickReasoningLabel(value))}</option>`).join('')}</select></label>
+    return `<section class="quick-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>新建 Agent 默认</span><h2 id="quick-editor-title" tabindex="-1">换模型</h2><p>这里只显示 DSH 当前可用的模型；密钥和连接方式仍在原设置页管理。</p></div><button type="button" onclick="quickConfigAsk('model')">交给助手分析</button></div>
+      <div class="quick-form-grid"><label class="quick-field span-two"><span>模型服务与模型</span><select id="quick-model-selection" onchange="updateQuickDraft('modelSelection',this.value)" ${controlsDisabled ? 'disabled' : ''}>${models.map((item) => { const value = `${item.provider}::${item.id}`; return `<option value="${esc(value)}"${value === state.quickDrafts.modelSelection ? ' selected' : ''}>${esc(item.label)} · ${esc(item.provider)}</option>`; }).join('')}</select><small>来自当前 DSH 模型目录。</small></label>
+      <label class="quick-field"><span>思考深度</span><select onchange="updateQuickDraft('reasoningEffort',this.value)" ${controlsDisabled || !reasoningEfforts.length ? 'disabled' : ''}>${reasoningEfforts.length ? reasoningEfforts.map((item) => `<option value="${esc(item.id)}"${item.id === state.quickDrafts.reasoningEffort ? ' selected' : ''}>${esc(item.label === item.id ? quickReasoningLabel(item.id) : `${item.label}（${item.id}）`)}</option>`).join('') : '<option>该模型未声明推理档位</option>'}</select><small>来自所选模型的可用档位。</small></label>
       <div class="quick-model-facts"><span><small>上下文窗口</small><b>${formatNumber(selected.contextWindow || SNAPSHOT.config.model.contextWindow)} tokens</b></span><span><small>输入</small><b>${esc(quickInputModalities(selected.inputModalities || SNAPSHOT.config.model.inputModalities))}</b></span><span><small>最大输出</small><b>${formatNumber(selected.maxTokens || SNAPSHOT.config.model.maxTokens)} tokens</b></span></div></div>
-      <div class="quick-editor-actions"><span>${blocked ? '当前值等待重新核验，已暂停生成候选。' : '只影响采用后的新 Agent；已运行会话不会被静默切换。'}</span><button type="button" onclick="prepareModelSelectionCandidate()" ${blocked ? 'disabled' : ''}>保存为候选</button></div></section>`;
+      <div class="quick-editor-actions"><span>${mutationReady ? '只影响采用后的新 Agent；已运行会话不会被静默切换。' : esc(quickMutationMessage('model'))}</span><button type="button" onclick="prepareModelSelectionCandidate()" ${controlsDisabled ? 'disabled' : ''}>${mutationReady ? '保存为候选' : '当前只读'}</button></div></section>`;
   }
 
   function renderQuickContextEditor() {
     const blocked = quickSectionBlocked('context');
+    const mutationReady = quickSectionMutationState('context') === 'ready';
+    const controlsDisabled = blocked || !mutationReady;
     if (blocked) return renderQuickPendingEditor('context', '会话与上下文');
     const modes = [
       { id: 'auto', title: '自动整理', desc: '接近容量阈值时自动压缩，保留近期任务线索。' },
       { id: 'manual', title: '仅手动整理', desc: '保留 /compact，但不自动触发。' },
       { id: 'off', title: '关闭整理', desc: '不自动压缩；长任务更容易撞到上下文上限。' },
     ];
-    return `<section class="quick-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>当前角色卡 · ${esc(effectiveDefaultPreset().name)}</span><h2 id="quick-editor-title" tabindex="-1">上下文处理方式</h2><p>这里调整真正的压缩与工具结果裁剪；“忙时新消息”是会话交互偏好，不再冒充上下文策略。</p></div><button type="button" onclick="quickConfigAsk('context')">交给助手分析</button></div>
-      <div class="context-mode-grid">${modes.map((item) => `<button type="button" data-context-mode="${item.id}" class="${state.quickDrafts.contextMode === item.id ? 'on' : ''}" onclick="setQuickContextMode('${item.id}')" aria-pressed="${state.quickDrafts.contextMode === item.id}" ${blocked ? 'disabled' : ''}><b>${item.title}</b><span>${item.desc}</span></button>`).join('')}</div>
-      <label class="quick-field context-prune"><span>工具结果多长后开始裁剪</span><select onchange="updateQuickDraft('pruneThreshold',this.value)" ${blocked ? 'disabled' : ''}>${[4096,8192,16384].map((value) => `<option value="${value}"${Number(state.quickDrafts.pruneThreshold) === value ? ' selected' : ''}>${formatNumber(value)} 字符${value === 8192 ? ' · 平衡' : value < 8192 ? ' · 更早收拢' : ' · 保留更多'}</option>`).join('')}</select><small>不会改变模型标称上下文窗口，只影响工具结果在角色卡里的保留策略。</small></label>
-      <div class="quick-editor-actions"><span>${effectiveDefaultPreset().trust === 'system' ? '当前为系统角色卡；采用时会先复制成个人角色卡，不覆盖系统文件。' : '修改会生成角色卡候选，先隔离回归。'}</span><button type="button" onclick="prepareContextPolicyCandidate()" ${blocked ? 'disabled' : ''}>保存为候选</button></div></section>`;
+    return `<section class="quick-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>当前角色卡 · ${esc(effectiveDefaultPreset().name)}</span><h2 id="quick-editor-title" tabindex="-1">上下文处理方式</h2><p>${mutationReady ? '这里调整真正的压缩与工具结果裁剪' : '这里展示真实的压缩与工具结果裁剪配置'}；“忙时新消息”是会话交互偏好，不再冒充上下文策略。</p></div><button type="button" onclick="quickConfigAsk('context')">交给助手分析</button></div>
+      <div class="context-mode-grid">${modes.map((item) => `<button type="button" data-context-mode="${item.id}" class="${state.quickDrafts.contextMode === item.id ? 'on' : ''}" onclick="setQuickContextMode('${item.id}')" aria-pressed="${state.quickDrafts.contextMode === item.id}" ${controlsDisabled ? 'disabled' : ''}><b>${item.title}</b><span>${item.desc}</span></button>`).join('')}</div>
+      <label class="quick-field context-prune"><span>工具结果多长后开始裁剪</span><select onchange="updateQuickDraft('pruneThreshold',this.value)" ${controlsDisabled ? 'disabled' : ''}>${[4096,8192,16384].map((value) => `<option value="${value}"${Number(state.quickDrafts.pruneThreshold) === value ? ' selected' : ''}>${formatNumber(value)} 字符${value === 8192 ? ' · 平衡' : value < 8192 ? ' · 更早收拢' : ' · 保留更多'}</option>`).join('')}</select><small>不会改变模型标称上下文窗口，只影响工具结果在角色卡里的保留策略。</small></label>
+      <div class="quick-editor-actions"><span>${mutationReady ? (effectiveDefaultPreset().trust === 'system' ? '当前为系统角色卡；采用时会先复制成个人角色卡，不覆盖系统文件。' : '修改会生成角色卡候选，先隔离回归。') : esc(quickMutationMessage('context'))}</span><button type="button" onclick="prepareContextPolicyCandidate()" ${controlsDisabled ? 'disabled' : ''}>${mutationReady ? '保存为候选' : '当前只读'}</button></div></section>`;
   }
 
   function renderQuickPromptEditor() {
@@ -1444,29 +1974,33 @@
       && state.quickPersonaHydration?.presetMappingId === SNAPSHOT.config.presetMappingId
       ? state.quickPersonaHydration : null;
     const promptAvailable = Boolean(state.quickDrafts.personaText || hydration || SNAPSHOT.config.persona?.status === 'available');
+    const mutationReady = quickSectionMutationState('prompt') === 'ready';
     const blocked = quickSectionBlocked('prompt') || !promptAvailable;
+    const controlsDisabled = blocked || !mutationReady;
     if (quickSectionBlocked('prompt')) return renderQuickPendingEditor('prompt', 'Agent 与提示词');
-    return `<section class="quick-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>Persona · 角色与行为要求</span><h2 id="quick-editor-title" tabindex="-1">编辑具体提示词</h2><p>只编辑当前角色卡的 Persona。项目说明仍来自 AGENTS.md 等工作区文件，运行规则与工具策略也保持分层。</p></div><button type="button" data-assistant-source-ref="component/mind/identity/prompt/${encodeURIComponent('@deepseek-ai/dsh-persona')}" onclick="attachAssistantContext('component/mind/identity/prompt/${encodeURIComponent('@deepseek-ai/dsh-persona')}')">交给助手分析</button></div>
-      <label class="quick-field prompt-field"><span>角色与行为要求</span><textarea rows="11" maxlength="8000" oninput="updateQuickDraft('personaText',this.value)" ${blocked ? 'disabled' : ''} placeholder="${promptAvailable ? '' : '当前公开快照未包含提示词正文；连接本机 DSH live adapter 后可编辑。'}">${esc(state.quickDrafts.personaText)}</textarea><small>${promptAvailable ? `${state.quickDrafts.personaText.length} / 8000 字符 · 不写入 localStorage` : '没有正文证据时不会显示伪造模板，也不会生成候选。'}</small></label>
-      <div class="prompt-source-strip"><span><b>Persona</b>此处可改</span><span><b>项目说明</b>${esc(quickInstructionStatus(presetRow('agent-instructions')))}</span><span><b>运行与工具规则</b>分层只读</span></div>
-      <div class="quick-editor-actions"><span>${preset.trust === 'system' ? '采用时复制为个人角色卡，再写入并回读；系统角色卡保持不变。' : promptAvailable ? '正文来自本次内存中的 live readback；修改先成为候选。' : '用户角色卡正文默认不写入公开快照，需要从本机 DSH 临时读取。'}</span>${!promptAvailable ? `<button type="button" onclick="hydrateQuickPersona()" ${state.quickPersonaHydrating || !configPresetHydratorReady() || !validPresetRef(presetRef) ? 'disabled' : ''}>${state.quickPersonaHydrating ? '正在读取…' : configPresetHydratorReady() ? '读取当前提示词' : '等待本机连接'}</button>` : `<button type="button" onclick="preparePersonaCandidate()" ${blocked ? 'disabled' : ''}>保存为候选</button>`}</div></section>`;
+    return `<section class="quick-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>Persona · 角色与行为要求</span><h2 id="quick-editor-title" tabindex="-1">${mutationReady ? '编辑' : '查看'}具体提示词</h2><p>当前角色卡的 Persona 与项目说明、运行规则和工具策略保持分层。</p></div><button type="button" data-assistant-source-ref="component/mind/identity/prompt/${encodeURIComponent('@deepseek-ai/dsh-persona')}" onclick="attachAssistantContext('component/mind/identity/prompt/${encodeURIComponent('@deepseek-ai/dsh-persona')}')">交给助手分析</button></div>
+      <label class="quick-field prompt-field"><span>角色与行为要求</span><textarea rows="11" maxlength="8000" oninput="updateQuickDraft('personaText',this.value)" ${controlsDisabled ? 'disabled' : ''} placeholder="${promptAvailable ? '' : '当前公开快照未包含提示词正文。'}">${esc(state.quickDrafts.personaText)}</textarea><small>${promptAvailable ? `${state.quickDrafts.personaText.length} / 8000 字符 · 不写入 localStorage` : '没有正文证据时不会显示伪造模板。'}</small></label>
+      <div class="prompt-source-strip"><span><b>Persona</b>${mutationReady ? '可生成候选' : '当前只读'}</span><span><b>项目说明</b>${esc(quickInstructionStatus(presetRow('agent-instructions')))}</span><span><b>运行与工具规则</b>分层只读</span></div>
+      <div class="quick-editor-actions"><span>${mutationReady ? (preset.trust === 'system' ? '采用时复制为个人角色卡，再写入并回读；系统角色卡保持不变。' : promptAvailable ? '正文来自本次内存中的 live readback；修改先成为候选。' : '用户角色卡正文需要从本机 DSH 临时读取。') : esc(quickMutationMessage('prompt'))}</span>${!mutationReady ? '<button type="button" disabled>当前只读</button>' : !promptAvailable ? `<button type="button" onclick="hydrateQuickPersona()" ${state.quickPersonaHydrating || !configPresetHydratorReady() || !validPresetRef(presetRef) ? 'disabled' : ''}>${state.quickPersonaHydrating ? '正在读取…' : configPresetHydratorReady() ? '读取当前提示词' : '等待本机连接'}</button>` : `<button type="button" onclick="preparePersonaCandidate()" ${blocked ? 'disabled' : ''}>保存为候选</button>`}</div></section>`;
   }
 
   function renderToolConfigEditor(row) {
     const entries = editableToolConfigEntries(row);
-    if (state.quickToolEditing !== row.id || !entries.length) return '';
-    return `<div class="tool-inline-editor"><div>${entries.map(([key, value]) => { const draft = state.quickToolEdits[row.id]?.[key] ?? value; return `<label><span>${esc(key)}</span><input value="${esc(draft)}" oninput="updateQuickToolConfig('${esc(row.id)}','${esc(key)}',this.value)" aria-label="${esc(row.name)} ${esc(key)}"></label>`; }).join('')}</div><button type="button" onclick="prepareToolConfigCandidate('${esc(row.id)}')">保存参数候选</button></div>`;
+    if (state.quickToolEditing !== row.id || !entries.length || quickSectionMutationState('tools') !== 'ready') return '';
+    return `<div class="tool-inline-editor"><div>${entries.map(([key, value]) => { const draft = state.quickToolEdits[row.id]?.[key] ?? value; return `<label><span>${esc(key)}</span><input value="${esc(draft)}" oninput="updateQuickToolConfig(${inlineJsString(row.id)},${inlineJsString(key)},this.value)" aria-label="${esc(row.name)} ${esc(key)}"></label>`; }).join('')}</div><button type="button" onclick="prepareToolConfigCandidate(${inlineJsString(row.id)})">保存参数候选</button></div>`;
   }
 
   function renderQuickToolsEditor() {
     const query = state.quickToolQuery.trim().toLowerCase();
     const tools = presetToolRows().filter((row) => !query || `${row.name} ${row.packageName} ${row.id}`.toLowerCase().includes(query));
     const blocked = quickSectionBlocked('tools');
+    const mutationReady = quickSectionMutationState('tools') === 'ready';
+    const controlsDisabled = blocked || !mutationReady;
     if (blocked) return renderQuickPendingEditor('tools', '工具层');
-    return `<section class="quick-editor tools-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>当前角色卡 · ${esc(effectiveDefaultPreset().name)}</span><h2 id="quick-editor-title" tabindex="-1">增删改工具</h2><p>“移除”只会从这个 Agent 的角色卡停用，不等于卸载插件；新插件仍需先安装并回读。</p></div><button type="button" onclick="quickConfigAsk('tools')">交给助手分析</button></div>
+    return `<section class="quick-editor tools-editor" aria-labelledby="quick-editor-title"><div class="quick-editor-head"><div><span>当前角色卡 · ${esc(effectiveDefaultPreset().name)}</span><h2 id="quick-editor-title" tabindex="-1">${mutationReady ? '增删改工具' : '查看工具组成'}</h2><p>${mutationReady ? '“移除”只会让当前 Agent 不再使用，不会卸载插件。' : '当前只能查看工具组成，暂不能修改。'}</p></div><button type="button" onclick="quickConfigAsk('tools')">交给助手分析</button></div>
       <label class="tool-search"><span class="sr-only">搜索角色卡工具</span><input value="${esc(state.quickToolQuery)}" oninput="filterQuickTools(this.value,event)" oncompositionend="filterQuickTools(this.value,event)" placeholder="搜索中文用途、插件名或入口"></label>
-      <div class="quick-tool-list">${tools.length ? tools.map((row) => { const canEdit = editableToolConfigEntries(row).length > 0; const ref = `component/${classifyTool(row)[0]}/${classifyTool(row)[1]}/tool/${encodeURIComponent(`${row.packageName}|${row.id}`)}`; return `<article class="quick-tool-row" draggable="true" ondragstart="startContextDrag(event,'${ref}')" ondragend="endContextDrag(event)"><div class="quick-tool-main"><span class="type-ico tool">T</span><div><b>${esc(row.name)}</b><small>${esc(row.packageName)} · ${esc(row.id)}</small></div><span class="tag ${row.enabled ? 'ok' : ''}">${row.enabled ? '已加入' : '可加入'}</span></div><p>${row.enabled ? '当前角色卡可以调用这个工具入口。' : '工具插件已存在，但当前角色卡没有启用这个入口。'}</p><div class="quick-tool-actions"><button type="button" data-assistant-source-ref="${ref}" onclick="attachAssistantContext('${ref}')">分析</button>${canEdit ? `<button type="button" data-tool-editor="${esc(row.id)}" onclick="toggleQuickToolEditor('${esc(row.id)}')">${state.quickToolEditing === row.id ? '收起参数' : '编辑参数'}</button>` : ''}<button type="button" class="${row.enabled ? 'remove' : 'add'}" onclick="prepareToolStateCandidate('${esc(row.id)}',${!row.enabled})" ${blocked ? 'disabled' : ''}>${row.enabled ? '从 Agent 移除' : '加入 Agent'}</button></div>${renderToolConfigEditor(row)}</article>`; }).join('') : '<div class="quick-tools-empty">没有找到匹配工具。</div>'}</div>
-      <div class="quick-editor-actions"><span>${blocked ? '角色卡当前值待核验，已暂停工具候选。' : '这里只改角色卡组成；插件安装、启用和卸载是另一条部署链。'}</span><button type="button" onclick="openLibrary('native')">查看完整组件库</button></div></section>`;
+      <div class="quick-tool-list">${tools.length ? tools.map((row) => { const canEdit = editableToolConfigEntries(row).length > 0; const ref = `component/${classifyTool(row)[0]}/${classifyTool(row)[1]}/tool/${encodeURIComponent(`${row.packageName}|${row.id}`)}`; return `<article class="quick-tool-row" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(ref)})" ondragend="endContextDrag(event)"><div class="quick-tool-main"><span class="type-ico tool">T</span><div><b>${esc(row.name)}</b><small>${esc(row.packageName)} · ${esc(row.id)}</small></div><span class="tag ${row.enabled ? 'ok' : ''}">${row.enabled ? '已加入' : '可加入'}</span></div><p>${row.enabled ? '当前角色卡可以调用这个工具入口。' : '工具插件已存在，但当前角色卡没有启用这个入口。'}</p><div class="quick-tool-actions"><button type="button" data-assistant-source-ref="${esc(ref)}" onclick="attachAssistantContext(${inlineJsString(ref)})">分析</button>${canEdit ? `<button type="button" data-tool-editor="${esc(row.id)}" onclick="toggleQuickToolEditor(${inlineJsString(row.id)})" ${controlsDisabled ? 'disabled' : ''}>${state.quickToolEditing === row.id ? '收起参数' : '编辑参数'}</button>` : ''}<button type="button" class="${row.enabled ? 'remove' : 'add'}" onclick="prepareToolStateCandidate(${inlineJsString(row.id)},${!row.enabled})" ${controlsDisabled ? 'disabled' : ''}>${mutationReady ? (row.enabled ? '从 Agent 移除' : '加入 Agent') : '当前只读'}</button></div>${renderToolConfigEditor(row)}</article>`; }).join('') : '<div class="quick-tools-empty">没有找到匹配工具。</div>'}</div>
+      <div class="quick-editor-actions"><span>${mutationReady ? '这里只改角色卡组成；插件安装、启用和卸载是另一条部署链。' : esc(quickMutationMessage('tools'))}</span><button type="button" onclick="openLibrary('native')">查看完整组件库</button></div></section>`;
   }
 
   function renderQuickConfig() {
@@ -1507,6 +2041,14 @@
     return `${CAPABILITIES[key].length} 类能力 · ${enabled}/${components.length} 个组件生效`;
   }
 
+  function moduleHomeSummary(key) {
+    const components = moduleComponents(key);
+    const enabled = components.filter((component) => component.status === 'using').length;
+    if (components.some((component) => component.status === 'error')) return '有组件需要检查';
+    if (!enabled) return '当前没有组件生效';
+    return `${enabled} 个组件正在工作`;
+  }
+
   function linkSVG() {
     const links = [
       { key: 'sense', d: 'M 320 150 C 312 140, 304 128, 296 118', x: 320, y: 150 },
@@ -1525,12 +2067,25 @@
     const module = MODULES[key];
     const status = partStatus(key);
     const ref = moduleContextRef(key);
-    return `<button type="button" class="mod-card st-${status}" style="${style}" onclick="openModule('${key}')" draggable="true" ondragstart="startContextDrag(event,'${ref}')" ondragend="endContextDrag(event)" aria-label="查看${module.name}模块，可拖入助手分析">
-      <div class="mod-head"><div><div class="mod-name">${module.name}</div><div class="mod-en">${module.en} · ${module.body}</div></div><span class="mod-dot ${status}"></span></div>
+    return `<button type="button" class="mod-card st-${status}" style="${style}" onclick="openModule(${inlineJsString(key)})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(ref)})" ondragend="endContextDrag(event)" aria-label="查看${module.name}模块，可拖入助手分析">
+      <div class="mod-head"><div><div class="mod-name">${module.name}</div><div class="mod-question">${module.question}</div></div><span class="mod-dot ${status}"></span></div>
       <div class="mod-desc">${module.desc}</div>
-      <div class="mod-sum"><span class="tag ok">${moduleSummary(key)}</span></div>
-      <div class="mod-cta">查看真实组件 →</div>
+      <div class="mod-sum"><span class="tag ${status === 'warn' ? 'warn' : status === 'ok' ? 'ok' : ''}">${moduleHomeSummary(key)}</span></div>
+      <div class="mod-cta">查看组成 →</div>
     </button>`;
+  }
+
+  function renderHomeStart() {
+    const liveInDsh = Boolean(window.__DS_HUB_RUNTIME_CONFIG__ && window.DS_HUB_AI_ADAPTER);
+    const connection = liveInDsh
+      ? '<span class="home-connection live"><i></i>已连接本机 DSH；发送时核验当前模型服务与模型</span>'
+      : '<span class="home-connection"><i></i>离线预览；可查看配置，真实对话与修改需在 DSH 中打开</span>';
+    return `<section class="home-start" aria-labelledby="home-start-title">
+      <div class="home-start-copy"><span>从目标开始</span><h2 id="home-start-title">你想让这个 Agent 做什么？</h2><p>不用先理解插件和参数。直接说想实现的结果，助手会带你查看现状、准备修改并验证效果。</p></div>
+      <div class="home-goal" role="group" aria-label="描述 Agent 目标"><label for="home-goal-input" class="sr-only">描述你想让 Agent 完成的事</label><input id="home-goal-input" value="${esc(state.assistantDraft)}" oninput="updateAssistantDraft(this.value)" onkeydown="homeGoalKeydown(event)" placeholder="例如：让它搜索网页，并把结果整理成研究报告"><button type="button" onclick="startHomeGoal()">开始</button></div>
+      <div class="home-scenarios" aria-label="常见起点"><button type="button" onclick="startHomeScenario('ability')"><b>增加一种能力</b><span>让它学会一件新事情</span></button><button type="button" onclick="startHomeScenario('problem')"><b>解决一个问题</b><span>查清哪里没有按预期工作</span></button><button type="button" onclick="goQuick()"><b>调整现有设置</b><span>换模型、上下文、提示词或工具</span></button></div>
+      <div class="home-start-foot">${connection}</div>
+    </section>`;
   }
 
   function renderRecommendations() {
@@ -1560,34 +2115,289 @@
       <h1 class="page-title agent-title">${state.agentNameEditing
         ? `<input id="agent-name-input" class="agent-name-input" value="${esc(state.agentName)}" onkeydown="agentNameInputKeydown(event)" onblur="saveAgentName(this.value)" maxlength="48" aria-label="Agent 名称">`
         : `<button type="button" class="agent-name-display" onclick="agentNameClick(event)" ondblclick="startAgentRename()" title="双击改名" aria-label="${esc(state.agentName)}，双击改名">${esc(state.agentName)}</button>`}</h1>
-      <div class="legend"><span><i class="lg-dot" style="background:var(--ok)"></i>当前生效</span><span><i class="lg-dot" style="background:var(--weak)"></i>当前未生效</span><span><i class="lg-dot" style="background:var(--blue)"></i>按用途分组，方便理解</span></div>
+      <div class="legend"><span><i class="lg-dot" style="background:var(--ok)"></i>当前生效</span><span><i class="lg-dot" style="background:var(--weak)"></i>当前未生效</span></div>
     </div>
+    ${renderHomeStart()}
     <div class="stage-wrap"><div class="mecha-stage">
-      <div class="attire"><span class="a-label">当前角色卡</span><span class="a-name">${esc(currentPreset.name)}</span><span class="chip">默认</span><span class="chip">${currentPreset.trust === 'system' ? '系统内置' : '用户创建'}</span><button type="button" onclick="openPresetDrawer()">查看完整配置</button></div>
+      <div class="attire"><span class="a-label">当前角色卡</span><span class="a-name">${esc(currentPreset.name)}</span><span class="chip">默认</span><span class="chip">${currentPreset.trust === 'system' ? '系统内置' : '用户创建'}</span><button type="button" onclick="openPresetDrawer()">查看角色卡</button></div>
       <div class="mascot-holder">${renderCoreAvatar()}</div>${linkSVG()}
       ${modCard('sense', 'left:20px;top:34px')}${modCard('mind', 'left:708px;top:34px')}${modCard('memory', 'left:20px;top:330px')}${modCard('tools', 'left:708px;top:210px')}${modCard('action', 'left:708px;top:396px')}
     </div></div>
     ${renderRecommendations()}
-    <div class="note-bar"><b>快照日期：</b>${esc(String(SNAPSHOT.capturedAt).slice(0, 10))}。点击任一模块查看当前配置；社区候选与本次已回读安装的组件会分开标注。</div>
     ${state.presetDrawer ? renderPresetDrawer() : ''}`;
+  }
+
+  const WORK_WAY_SECTIONS = Object.freeze([
+    { id: 'horizontal', icon: '→', title: '横向处理链', short: '一条消息怎么进、怎么出' },
+    { id: 'vertical', icon: '↓', title: '纵向任务方法', short: '一件事具体怎么想清楚' },
+    { id: 'hook', icon: '↳', title: '自动动作', short: '到达条件时自动发生' },
+    { id: 'rule', icon: '□', title: '常驻规则', short: '从头到尾都要遵守' },
+  ]);
+
+  function workWayPresetResource(id, fallback) {
+    const row = presetRow(id);
+    return {
+      id,
+      label: fallback,
+      tech: row?.moduleName || id,
+      enabled: row?.enabled !== false,
+      found: Boolean(row),
+    };
+  }
+
+  function workWayObjects() {
+    const currentPreset = effectiveDefaultPreset();
+    const modelLabel = `${SNAPSHOT.config.model.provider} / ${SNAPSHOT.config.model.model}`;
+    return [
+      {
+        id: 'receive', section: 'horizontal', order: 1, title: '收到消息', short: '接住用户输入、文件和引用内容', timing: '每条新消息进入时', cognition: ['感知'],
+        resources: [{ label: 'DSH 会话入口', tech: 'conversation input', enabled: true, found: true }],
+        relation: '把材料交给“分析消息”', change: '如果接入新的消息来源，Agent 能收到的材料会变多；不会自动变得更会判断。',
+      },
+      {
+        id: 'understand', section: 'horizontal', order: 2, title: '分析消息', short: '理解意图、上下文和当前缺少的信息', timing: '收到材料之后', cognition: ['感知', '记忆', '思考'],
+        resources: [workWayPresetResource('persona', '角色设定'), workWayPresetResource('agent-instructions', '项目说明'), { label: '当前模型', tech: modelLabel, enabled: true, found: true }],
+        relation: '信息不足时先追问；信息够用则进入“选择处理方法”', change: '换模型或角色设定会改变理解方式和追问倾向；项目说明缺失时更容易偏离当前项目。',
+      },
+      {
+        id: 'choose', section: 'horizontal', order: 3, title: '选择处理方法', short: '根据任务类型选择一条纵向方法', timing: '意图和条件基本清楚之后', cognition: ['记忆', '思考'],
+        resources: [workWayPresetResource('plan-mode', '计划模式'), workWayPresetResource('tool-goal', '目标管理'), workWayPresetResource('tool-todo', '待办管理')],
+        relation: '从这里进入纵向任务方法；完成后回到横轴继续核对', change: '调整选择规则会改变不同任务采用的方法，不一定改变可用工具。',
+      },
+      {
+        id: 'execute', section: 'horizontal', order: 4, title: '执行处理', short: '沿纵向方法推进，按需使用 Skill、工具或子 Agent', timing: '选定处理方法之后', cognition: ['思考', '工具', '行动'],
+        resources: [workWayPresetResource('tool-skill', '使用 Skill'), workWayPresetResource('tool-workflow', '运行多阶段任务'), workWayPresetResource('tool-subagent', '委派子任务')],
+        relation: '纵向方法决定先后逻辑，工具决定每一步能做什么', change: '增删工具会直接改变“能做什么”；替换方法主要改变“按什么逻辑做”。',
+      },
+      {
+        id: 'verify', section: 'horizontal', order: 5, title: '核对并组织', short: '检查事实、完成度，再组织成合适的表达', timing: '纵向方法得到结果之后', cognition: ['记忆', '思考', '行动'],
+        resources: [workWayPresetResource('agent-instructions', '项目说明'), workWayPresetResource('tool-goal', '完成状态')],
+        relation: '通过则发送；不通过则回到纵向方法继续处理', change: '放宽核对会减少来回，但更容易把未验证内容当成结论。',
+      },
+      {
+        id: 'deliver', section: 'horizontal', order: 6, title: '发送结果', short: '把回复、产物和下一步发给用户', timing: '核对通过之后', cognition: ['行动'],
+        resources: [workWayPresetResource('tool-presentation', '结果呈现')],
+        relation: '等待用户继续对话；新消息再次从横轴起点进入', change: '调整呈现方式会改变输出格式，不会改变前面已经完成的工作。',
+      },
+      {
+        id: 'conversation-method', section: 'vertical', title: '诊断式对话', short: '先了解现状，再分析原因，最后给出行动建议', timing: '用户在咨询问题、寻求判断或建议时', cognition: ['感知', '记忆', '思考', '行动'],
+        steps: ['了解现状', '分析具体原因', '给出行动建议'],
+        resources: [workWayPresetResource('tool-ask-user', '向用户追问'), workWayPresetResource('agent-instructions', '项目说明'), { label: '专用诊断 Skill', tech: '尚未绑定', enabled: false, found: false }],
+        relation: '从横轴“选择处理方法”进入，完成后回到“核对并组织”', change: '换成其他方法后，Agent 追问、分析和给建议的顺序会改变；工具本身不会自动变化。',
+        forcedStatus: 'partial', evidence: '这是产品方法模板；当前配置具备通用能力，但未发现专用诊断 Skill 的绑定记录',
+      },
+      {
+        id: 'plan-method', section: 'vertical', title: '执行型任务', short: '先确认目标和计划，再执行并验收', timing: '用户要求完成一项有明确交付物的任务时', cognition: ['记忆', '思考', '工具', '行动'],
+        steps: ['确认目标', '制定计划', '执行动作', '验收结果'],
+        resources: [workWayPresetResource('plan-mode', '计划模式'), workWayPresetResource('tool-goal', '目标管理'), workWayPresetResource('tool-todo', '待办管理')],
+        relation: '从横轴“选择处理方法”进入，验收后回到“核对并组织”', change: '关闭后仍能完成简单任务，但复杂任务更容易漏步骤或过早结束。',
+      },
+      {
+        id: 'workflow-method', section: 'vertical', title: '复杂项目', short: '拆分阶段、分配任务，再汇总和恢复推进', timing: '任务需要多阶段执行、委派或中途恢复时', cognition: ['记忆', '思考', '工具', '行动'],
+        steps: ['拆分阶段', '分配任务', '汇总结果', '继续或恢复'],
+        resources: [workWayPresetResource('workflow-worker-thread', '阶段运行器'), workWayPresetResource('tool-workflow', '多阶段任务入口')],
+        relation: '从横轴“选择处理方法”进入，阶段完成后回到“核对并组织”', change: '关闭后消息仍可处理，但长任务失去分阶段与恢复入口。',
+      },
+      {
+        id: 'ralph-method', section: 'vertical', title: '迭代优化', short: '设定标准、生成版本、评估差距并继续改进', timing: '目标明确、允许多轮试验和改进时', cognition: ['记忆', '思考', '工具', '行动'],
+        steps: ['设定通过标准', '生成一个版本', '评估差距', '继续改进'],
+        resources: [workWayPresetResource('tool-ralph', '持续迭代')],
+        relation: '从横轴“选择处理方法”进入，每轮评估后决定返回改进或进入核对', change: '关闭后不会自动反复改进；开启过宽则可能增加耗时和模型用量。',
+      },
+      {
+        id: 'preset-hook', section: 'hook', title: '新任务套用默认角色卡', short: `创建新任务时自动使用“${currentPreset.name}”`, timing: '新任务创建时', cognition: ['思考', '工具', '行动'],
+        resources: [{ label: '默认角色卡', tech: currentPreset.name, enabled: true, found: true }],
+        relation: '发生在“收到任务”之前，只影响新任务', change: '替换后，新任务的身份、提示词和工具入口可能一起变化；当前任务通常保持原配置。',
+      },
+      {
+        id: 'compact-hook', section: 'hook', title: '对话过长时自动整理', short: '上下文接近上限时压缩较早内容', timing: '对话过长、接近模型上下文上限时', cognition: ['记忆', '思考'],
+        resources: [workWayPresetResource('compaction-basic', '自动整理上下文')],
+        relation: '可能发生在理解、规划或调用能力之前', change: '关闭后能保留更多原文，但长对话更容易超过上限；替换摘要策略会改变保留重点。',
+      },
+      {
+        id: 'prune-hook', section: 'hook', title: '工具结果过长时裁短', short: '保留结果开头和结尾，减少无关内容占用', timing: '单次工具结果超过当前阈值时', cognition: ['感知', '记忆'],
+        resources: [workWayPresetResource('tool-result-pruner', '工具结果裁短')],
+        relation: '发生在工具返回之后、Agent 继续判断之前', change: '关闭后模型能看到完整结果，但上下文消耗更大；阈值过小可能丢掉中间证据。',
+      },
+      {
+        id: 'identity-rule', section: 'rule', title: '按当前身份做事', short: '规定 Agent 的角色、语气和基本职责', timing: '整个任务期间', cognition: ['思考', '行动'],
+        resources: [workWayPresetResource('persona', '角色设定')],
+        relation: '覆盖主流程、局部方法和自动动作', change: '替换后会改变默认立场和表达方式，也可能影响工具选择；需检查与项目说明是否冲突。',
+      },
+      {
+        id: 'project-rule', section: 'rule', title: '遵守当前项目说明', short: '把项目目录里的说明作为做事边界', timing: '进入项目且找到说明文件时', cognition: ['感知', '记忆', '思考', '行动'],
+        resources: [workWayPresetResource('agent-instructions', '项目说明')],
+        relation: '约束所有会修改项目的步骤', change: '关闭后 Agent 可能忽略项目自己的命名、测试和安全要求。',
+      },
+      {
+        id: 'permission-rule', section: 'rule', title: '按默认权限执行', short: `新任务默认权限为 ${SNAPSHOT.config.permission.defaultPreset}`, timing: '每次准备执行外部动作时', cognition: ['工具', '行动'],
+        resources: [{ label: '默认权限', tech: SNAPSHOT.config.permission.defaultPreset, enabled: true, found: true }],
+        relation: '决定哪些动作可直接执行、哪些需要确认', change: '放宽会减少确认但扩大风险面；收紧会更安全，也可能让部分工具无法完成任务。',
+      },
+      {
+        id: 'web-limit-rule', section: 'rule', title: '限制网页搜索次数', short: `每个任务最多搜索 ${SNAPSHOT_WEB_SEARCH_MAX_USES} 次`, timing: '每次准备搜索公开网页时', cognition: ['工具', '行动'],
+        resources: [workWayPresetResource('tool-web', '网页搜索')],
+        relation: '只约束网页搜索，不限制本地文件检索', change: '调高可能提高资料覆盖度，也会增加耗时和用量；调低可能让查证不完整。',
+      },
+      {
+        id: 'busy-rule', section: 'rule', title: '运行中收到新消息先排队', short: SNAPSHOT.config.conversation.busyEnter === 'queue' ? '当前任务完成后再处理新消息' : '新消息会引导当前任务调整方向', timing: 'Agent 正在运行时收到新消息', cognition: ['感知', '记忆', '行动'],
+        resources: [{ label: '消息处理方式', tech: SNAPSHOT.config.conversation.busyEnter || 'queue', enabled: true, found: true }],
+        relation: '影响进行中的任务与下一条消息的先后顺序', change: '改为立即引导会更灵活，但当前任务可能中途改变方向；排队更稳定，但反馈不会马上生效。',
+      },
+    ].map((item) => {
+      const resources = item.resources || [];
+      const foundResources = resources.filter((resource) => resource.found !== false);
+      const activeResources = foundResources.filter((resource) => resource.enabled !== false);
+      return {
+        ...item,
+        resources,
+        status: item.forcedStatus || (!foundResources.length ? 'unknown' : activeResources.length === foundResources.length ? 'active' : activeResources.length ? 'partial' : 'off'),
+        evidence: item.evidence || '根据当前 DSH 配置判断；不是某次运行轨迹',
+      };
+    });
+  }
+
+  function workWayObjectById(id) {
+    return workWayObjects().find((item) => item.id === id) || null;
+  }
+
+  function workWayStatus(item) {
+    if (item.status === 'active') return '<span class="ways-state active">当前可用</span>';
+    if (item.status === 'partial') return '<span class="ways-state partial">部分可用</span>';
+    if (item.status === 'off') return '<span class="ways-state off">当前关闭</span>';
+    return '<span class="ways-state off">尚未确认</span>';
+  }
+
+  function selectedVerticalMethod() {
+    return workWayObjectById(state.waysMethodFocus)
+      || workWayObjects().find((item) => item.section === 'vertical')
+      || null;
+  }
+
+  function renderVerticalSteps(item, compact = false) {
+    if (!item?.steps?.length) return '';
+    return `<div class="ways-vertical-steps ${compact ? 'compact' : ''}" role="list" aria-label="${esc(item.title)}的处理步骤">${item.steps.map((step, index) => `<div class="ways-vertical-step-wrap" role="listitem"><button type="button" onclick="openWaysDetail('${item.id}')" data-way-id="${esc(item.id)}"><span>${index + 1}</span><b>${esc(step)}</b></button>${index < item.steps.length - 1 ? '<i aria-hidden="true">↓</i>' : ''}</div>`).join('')}</div>`;
+  }
+
+  function renderWaysFlow(items) {
+    const method = selectedVerticalMethod();
+    return `<div class="ways-intro"><b>横轴管消息流转</b><span>每条消息都从左到右推进；分析后选择一条纵向方法，完成后再回来核对和发送。</span></div>
+      <div class="ways-axis-board"><div class="ways-axis-label horizontal"><span>横轴</span><b>消息处理链</b></div><div class="ways-flow-track" role="list" aria-label="消息处理链">
+        ${items.map((item, index) => `<div class="ways-flow-step-wrap" role="listitem"><button type="button" class="ways-flow-step" data-way-id="${esc(item.id)}" onclick="openWaysDetail('${item.id}')"><span class="ways-step-index">${index + 1}</span><b>${esc(item.title)}</b><small>${esc(item.short)}</small><span class="ways-cognition">${item.cognition.map(esc).join(' · ')}</span></button>${index < items.length - 1 ? '<span class="ways-arrow" aria-hidden="true">→</span>' : ''}</div>`).join('')}
+      </div><div class="ways-axis-junction"><span>从“选择处理方法”进入纵轴</span><i aria-hidden="true">↓</i></div>
+      <section class="ways-axis-vertical-preview"><header><div><span class="ways-axis-kicker">纵轴 · 当前方法</span><h3>${esc(method?.title || '尚未选择')}</h3><p>${esc(method?.short || '选择一条任务方法')}</p></div><button type="button" onclick="selectWaysSection('vertical')">切换方法</button></header>${renderVerticalSteps(method, true)}<footer><span>完成后回到横轴</span><b>核对并组织 → 发送结果</b></footer></section></div>
+      <div class="ways-cross-map" aria-label="其他工作方式与主流程的关系">
+        <button type="button" onclick="selectWaysSection('vertical')"><b>纵向方法</b><span>决定具体任务按什么逻辑处理</span><i>查看 →</i></button>
+        <button type="button" onclick="selectWaysSection('hook')"><b>自动动作</b><span>条件满足时在两条轴的节点前后触发</span><i>查看 →</i></button>
+        <button type="button" onclick="selectWaysSection('rule')"><b>常驻规则</b><span>不占步骤，但始终约束两条轴</span><i>查看 →</i></button>
+      </div>`;
+  }
+
+  function renderWaysMethods(items) {
+    const selected = items.find((item) => item.id === state.waysMethodFocus) || items[0];
+    return `<div class="ways-intro"><b>纵轴管处理逻辑</b><span>同一条消息处理链，可以根据任务类型换用不同方法；方法可由 Skill、提示词或工作流实现。</span></div>
+      <div class="ways-method-workbench"><nav aria-label="纵向任务方法">${items.map((item) => `<button type="button" class="${selected?.id === item.id ? 'on' : ''}" aria-pressed="${selected?.id === item.id}" onclick="focusWaysMethod('${item.id}')"><span><b>${esc(item.title)}</b><small>${esc(item.short)}</small></span>${workWayStatus(item)}</button>`).join('')}</nav><section class="ways-method-focus"><header><div><span>当前纵向方法</span><h3>${esc(selected?.title || '尚未选择')}</h3><p>${esc(selected?.timing || '')}</p></div><button type="button" data-way-id="${esc(selected?.id || '')}" onclick="openWaysDetail('${selected?.id || ''}')">查看配置与影响</button></header><div class="ways-method-entry"><span>从横轴进入</span><b>选择处理方法</b><i>↓</i></div>${renderVerticalSteps(selected)}<div class="ways-method-return"><i>↩</i><span>完成后回到横轴</span><b>核对并组织</b></div><footer><span>实现资源</span><div>${(selected?.resources || []).map((resource) => `<em class="${resource.found === false ? 'unbound' : resource.enabled === false ? 'off' : ''}">${esc(resource.label)}</em>`).join('')}</div><small>${esc(selected?.evidence || '')}</small></footer></section></div>`;
+  }
+
+  function renderWaysHooks(items) {
+    return `<div class="ways-intro"><b>条件到了就自动发生</b><span>它们不需要 Agent 主动选择，也不是主流程中的固定一步。</span></div>
+      <div class="ways-hook-line">${items.map((item, index) => `<div class="ways-hook-stop"><span class="ways-hook-order">${index + 1}</span><button type="button" data-way-id="${esc(item.id)}" onclick="openWaysDetail('${item.id}')"><small>${esc(item.timing)}</small><b>${esc(item.title)}</b><span>${esc(item.short)}</span>${workWayStatus(item)}</button></div>`).join('')}</div>`;
+  }
+
+  function renderWaysRules(items) {
+    return `<div class="ways-intro"><b>规则不负责做事，只负责划边界</b><span>无论主流程调用哪种方法或工具，都要遵守当前生效的规则。</span></div>
+      <div class="ways-rule-frame"><div class="ways-rule-core"><img src="assets/dsh-icon.svg" alt="" width="34" height="34"><b>${esc(state.agentName)}</b><span>当前任务</span></div>${items.map((item, index) => `<button type="button" class="ways-rule-band" style="--rule-index:${index}" data-way-id="${esc(item.id)}" onclick="openWaysDetail('${item.id}')"><span>${index + 1}</span><b>${esc(item.title)}</b><small>${esc(item.short)}</small>${workWayStatus(item)}<i>›</i></button>`).join('')}</div>`;
+  }
+
+  function renderWaysDetail() {
+    if (!state.waysDetail || state.impactPreview) return '';
+    const item = workWayObjectById(state.waysDetail);
+    if (!item) return '';
+    const section = WORK_WAY_SECTIONS.find((candidate) => candidate.id === item.section);
+    return `<div class="plugin-dialog-layer ways-dialog-layer" data-dialog-layer="ways-detail" onclick="closeWaysDialogFromBackdrop(event,'detail')"><section class="plugin-dialog ways-dialog" role="dialog" aria-modal="true" aria-labelledby="ways-dialog-title" tabindex="-1">
+      <header class="plugin-dialog-head"><div class="plugin-dialog-title"><span class="ways-dialog-icon">${esc(section?.icon || '·')}</span><div><span>${esc(section?.title || '工作方式')}</span><h2 id="ways-dialog-title">${esc(item.title)}</h2><p>${esc(item.short)}</p></div></div><button type="button" class="plugin-dialog-close" onclick="closeWaysDetail()" aria-label="关闭详情">✕</button></header>
+      <div class="plugin-dialog-body ways-dialog-body">
+        <div class="ways-plain-summary"><span>什么时候生效</span><b>${esc(item.timing)}</b><p>${esc(item.relation)}</p></div>
+        <section class="ways-detail-section"><h3>它靠什么实现</h3><div class="ways-resource-list">${item.resources.map((resource) => `<div><span class="ways-resource-dot ${resource.enabled === false ? 'off' : ''}"></span><b>${esc(resource.label)}</b><small>${resource.enabled === false ? '当前关闭' : resource.found === false ? '当前未发现' : '当前配置可见'}</small><code>${esc(resource.tech)}</code></div>`).join('')}</div></section>
+        <section class="ways-detail-section"><h3>会用到哪些认知能力</h3><div class="ways-cognition-list">${item.cognition.map((name) => `<span>${esc(name)}</span>`).join('')}</div><p>认知模块是 Agent 的构成，不代表这里一定按这个顺序调用。</p></section>
+        <section class="ways-change-box"><span>换掉它会怎样</span><p>${esc(item.change)}</p><button type="button" onclick="openImpactPreview('${item.id}')">查看完整影响</button></section>
+        <p class="ways-evidence">${esc(item.evidence)}</p>
+      </div>
+      <footer class="plugin-dialog-foot"><button type="button" class="secondary" onclick="askWaysAssistant('${item.id}')">交给助手分析</button><button type="button" class="primary" onclick="openImpactPreview('${item.id}')">评估修改影响</button></footer>
+    </section></div>`;
+  }
+
+  function workWayImpact(item) {
+    const sectionEffects = {
+      horizontal: { scope: '所有经过该消息处理节点的任务', order: '可能改变消息流转的先后、跳过或返回位置', migration: '保留原处理链，再让新消息切换' },
+      vertical: { scope: '选择这项方法的任务；其他任务方法不受影响', order: '改变任务内部的分析与行动顺序', migration: '检查入口仍从“选择处理方法”进入，出口仍能回到“核对并组织”' },
+      hook: { scope: '满足触发条件的任务', order: '改变某个步骤之前或之后自动发生的动作', migration: '先在隔离任务中触发一次并核对结果' },
+      rule: { scope: '规则生效范围内的所有任务', order: '通常不增加步骤，但会允许、阻止或改变每一步', migration: '检查与其他常驻规则是否冲突' },
+    }[item.section];
+    return {
+      behavior: item.change,
+      scope: sectionEffects.scope,
+      capability: `涉及 ${item.cognition.join('、')}；具体增减取决于替换资源。`,
+      order: sectionEffects.order,
+      permission: item.section === 'rule' && item.id === 'permission-rule' ? '会直接改变外部动作的授权边界。' : '当前没有证据表明权限会变化；替换资源后仍需重新检查。',
+      migration: sectionEffects.migration,
+      tests: `至少验证：正常路径、无需触发路径、失败或回退路径；并核对“${item.title}”前后的实际运行记录。`,
+      rollback: '保留当前配置版本；新配置未通过前不替换，失败时恢复原资源与原顺序。',
+    };
+  }
+
+  function renderImpactPreview() {
+    if (!state.impactPreview) return '';
+    const item = workWayObjectById(state.impactPreview);
+    if (!item) return '';
+    const impact = workWayImpact(item);
+    const rows = [
+      ['用户会感受到什么', impact.behavior], ['影响哪些任务', impact.scope], ['能力会怎么变', impact.capability], ['先后顺序怎么变', impact.order],
+      ['权限会不会变', impact.permission], ['切换前要处理什么', impact.migration], ['怎么验证', impact.tests], ['出问题怎么恢复', impact.rollback],
+    ];
+    return `<div class="plugin-dialog-layer ways-dialog-layer impact-layer" data-dialog-layer="impact" onclick="closeWaysDialogFromBackdrop(event,'impact')"><section class="plugin-dialog ways-dialog impact-dialog" role="dialog" aria-modal="true" aria-labelledby="impact-dialog-title" tabindex="-1">
+      <header class="plugin-dialog-head"><div class="plugin-dialog-title"><span class="ways-dialog-icon">↔</span><div><span>修改前先看影响</span><h2 id="impact-dialog-title">${esc(item.title)}</h2><p>这里只生成评估，不会修改 DSH 配置。</p></div></div><button type="button" class="plugin-dialog-close" onclick="closeImpactPreview()" aria-label="关闭影响预览">✕</button></header>
+      <div class="plugin-dialog-body"><div class="impact-evidence"><span class="tag cy">根据当前配置判断</span><span class="tag warn">尚未运行验证</span></div><div class="impact-grid">${rows.map(([label, value]) => `<section><span>${esc(label)}</span><p>${esc(value)}</p></section>`).join('')}</div></div>
+      <footer class="plugin-dialog-foot"><button type="button" class="secondary" onclick="closeImpactPreview()">返回详情</button><button type="button" class="primary" onclick="draftWaysChange('${item.id}')">让助手生成候选方案</button></footer>
+    </section></div>`;
+  }
+
+  function renderWays() {
+    const sections = WORK_WAY_SECTIONS;
+    const items = workWayObjects().filter((item) => item.section === state.waysSection);
+    const section = sections.find((item) => item.id === state.waysSection) || sections[0];
+    const sourceLabel = window.__DS_HUB_RUNTIME_CONFIG__ && window.DS_HUB_AI_ADAPTER ? '当前 DSH 配置' : '本机 DSH 快照';
+    const content = state.waysSection === 'horizontal' ? renderWaysFlow(items)
+      : state.waysSection === 'vertical' ? renderWaysMethods(items)
+        : state.waysSection === 'hook' ? renderWaysHooks(items) : renderWaysRules(items);
+    return `<header class="ways-page-head"><div><span class="ways-eyebrow">${esc(state.agentName)}</span><h1>工作方式</h1><p>调整 Agent 怎样完成任务。工具决定“能做什么”，这里决定“什么时候、按什么方法去做”。</p></div><div class="ways-head-actions"><span class="ways-config-source">${sourceLabel}</span><button type="button" onclick="goWorkshop()">查看能力仓库 →</button></div></header>
+      <section class="ways-workspace">
+        <nav class="ways-section-tabs" aria-label="工作方式类型">${sections.map((item) => `<button type="button" class="${state.waysSection === item.id ? 'on' : ''}" aria-current="${state.waysSection === item.id ? 'page' : 'false'}" onclick="selectWaysSection('${item.id}')"><i>${esc(item.icon)}</i><span><b>${esc(item.title)}</b><small>${esc(item.short)}</small></span><em>${workWayObjects().filter((candidate) => candidate.section === item.id).length}</em></button>`).join('')}</nav>
+        <div class="ways-stage"><header><div><span>${esc(section.title)}</span><h2>${esc(section.short)}</h2></div><small>点开任一项，查看真实资源和替换影响</small></header>${content}</div>
+      </section>${renderWaysDetail()}${renderImpactPreview()}`;
+  }
+
+  function presetGuide(preset) {
+    const syncedDescription = String(preset?.description || '').trim();
+    if (syncedDescription) return { text: syncedDescription, source: '本机角色卡说明' };
+    const bundled = BUILTIN_PRESET_GUIDES[SNAPSHOT.source.packageVersion]?.[preset?.name];
+    if (preset?.trust === 'system' && bundled) return { text: bundled, source: `DSH ${SNAPSHOT.source.packageVersion} 随附说明` };
+    return { text: '用途说明尚未同步；可以先让助手结合当前配置解释，再决定是否切换。', source: '当前快照' };
   }
 
   function renderPresetDrawer() {
     const preset = effectiveDefaultPreset();
-    return `<div class="drawer-mask" onclick="closePresetDrawer()"></div><aside class="drawer" role="dialog" aria-modal="true" tabindex="-1" aria-label="Agent Preset 详情">
-      <button class="d-close" onclick="closePresetDrawer()" aria-label="关闭">✕</button>
-      <h3>${esc(preset.name)} <span class="tag cy">${preset.trust === 'system' ? '系统内置' : '用户创建'}</span></h3>
-      <div class="d-sub">${esc(preset.description)}</div>
-      <div class="plain-explain"><b>它是什么：</b>这是当前 DSH 的完整 Agent 组装，不只是角色卡。身份提示只是其中的 persona 一项。</div>
-      <div class="detail-sec"><h4>当前默认值</h4>
-        <div class="detail-line"><b>配置引用</b><span>本次快照已安全映射</span></div>
-        <div class="detail-line"><b>来源</b><span>${preset.trust === 'system' ? '系统随附' : '用户目录'}</span></div>
-        <div class="detail-line"><b>工具呈现</b><span>${SNAPSHOT.config.presetRows.some((row) => row.id === 'tool-presentation') ? 'Code Mode' : '原生工具调用'}</span></div>
-        <div class="detail-line"><b>组装行</b><span>${SNAPSHOT.config.presetRows.length} 个插件行</span></div>
+    const presetTargetReady = configTargetMutationReady(PROPOSAL_POLICIES.defaultPresetId.targetId);
+    const checking = ['idle', 'checking'].includes(state.configManagementCapability.status);
+    return `<div class="plugin-dialog-layer" data-dialog-layer="preset" onclick="closePresetDialogFromBackdrop(event)"><section class="plugin-dialog preset-dialog" role="dialog" aria-modal="true" aria-labelledby="preset-dialog-title" tabindex="-1">
+      <header class="plugin-dialog-head"><div class="plugin-dialog-title"><span class="type-ico prompt">文</span><div><span>当前角色卡</span><h2 id="preset-dialog-title">${esc(preset.name)}</h2><p>角色卡是一套 Agent 预设，包含默认做事方式和工具入口；切换只影响新会话。</p></div></div><button type="button" class="plugin-dialog-close" onclick="closePresetDrawer()" aria-label="关闭角色卡详情">✕</button></header>
+      <div class="plugin-dialog-body"><div class="preset-current-facts"><span><small>来源</small><b>${preset.trust === 'system' ? 'DSH 系统随附' : '用户目录'}</b></span><span><small>工具呈现</small><b>${SNAPSHOT.config.presetRows.some((row) => row.id === 'tool-presentation') ? 'Code Mode' : '原生工具调用'}</b></span><span><small>当前组成</small><b>${SNAPSHOT.config.presetRows.length} 个配置入口</b></span></div>
+        <div class="preset-dialog-section-head"><div><span>本机可用</span><h3>选择一张角色卡</h3></div><small>切换先保存为候选，不会立即改变 DSH。</small></div>
+        <div class="preset-choice-list">${SNAPSHOT.config.presets.map((item) => { const guide = presetGuide(item); const isCurrent = item.id === preset.id; return `<article class="preset-choice ${isCurrent ? 'on' : ''}"><div class="preset-choice-head"><div><h3>${esc(item.name || '未命名角色卡')}</h3><span>${item.trust === 'system' ? '系统内置' : '用户创建'}</span></div>${isCurrent ? '<span class="tag vio">当前默认</span>' : ''}</div><p>${esc(guide.text)}</p><div class="preset-choice-foot"><small>${esc(guide.source)}</small>${isCurrent ? '<span class="preset-choice-current">正在使用</span>' : `<button type="button" onclick="preparePresetSelection(${inlineJsString(item.id)})" ${presetTargetReady ? '' : 'disabled'}>${presetTargetReady ? '生成切换候选' : checking ? '检测中…' : '当前只读'}</button>`}</div></article>`; }).join('')}</div>
+        <div class="preset-create"><div><b>需要一张新的角色卡？</b><span>助手可以先梳理目标、提示词和测试；确认前不会修改配置。</span></div><button type="button" onclick="startPresetCreation()">让助手先梳理</button></div>
       </div>
-      <div class="detail-sec"><h4>DSH 实际可用的角色卡</h4>${SNAPSHOT.config.presets.map((item) => `<div class="id-card ${item.isDefault ? 'on' : ''}"><div class="id-name">${esc(item.name || '未命名角色卡')} ${item.isDefault ? '<span class="tag vio">默认</span>' : ''}</div><div class="cr-tech">${item.trust === 'system' ? '系统内置' : '用户创建'} · 本次快照已映射</div><div style="font-size:12px;color:var(--muted);margin-top:6px">${esc(item.description || item.broken || '无说明')}</div></div>`).join('')}</div>
-      <div class="note-bar">当前页面为只读详情。要切换角色卡，请回到个性化快速配置并先生成候选。</div>
-    </aside>`;
+      <footer class="plugin-dialog-foot"><button type="button" class="secondary" onclick="closePresetDrawer();goQuick()">打开快速配置</button><button type="button" class="primary" onclick="closePresetDrawer()">完成</button></footer>
+    </section></div>`;
   }
 
   function activeCapability(key) {
@@ -1597,6 +2407,605 @@
   function orbitPoint(index, count) {
     const angle = (-90 + index * (360 / count)) * Math.PI / 180;
     return { x: 50 + Math.cos(angle) * 39, y: 50 + Math.sin(angle) * 35 };
+  }
+
+  function relationshipSpec(moduleKey, capabilityId) {
+    const group = RELATIONSHIP_SPECS[moduleKey] || {};
+    return group[capabilityId] || group.default || RELATIONSHIP_SPECS.tools.default;
+  }
+
+  function communityRelationshipRef(item) {
+    return `community/${encodeURIComponent(item.packageName)}`;
+  }
+
+  function relationshipAllItems(moduleKey, ability) {
+    if (!ability) return [];
+    const spec = relationshipSpec(moduleKey, ability.id);
+    const currentRows = ability.components.map((component, index) => ({
+      ref: componentContextRef(moduleKey, ability.id, component),
+      kind: 'component',
+      moduleKey,
+      capabilityId: ability.id,
+      index,
+      title: component.name,
+      desc: shortSentence(component.desc, 96),
+      tech: component.tech,
+      componentType: component.type,
+      evidence: component.evidence,
+      scope: component.scope,
+      status: component.status,
+      statusLabel: componentStatusLabel(component),
+      typeLabel: componentTypeLabel(component),
+      sourceLabel: '当前配置',
+      relationship: spec.kind === 'mixed' ? 'support' : spec.kind,
+    })).filter((item) => item.ref).sort((a, b) => {
+      const rank = (item) => item.status === 'using' ? 0 : item.status === 'error' ? 1 : 2;
+      return rank(a) - rank(b) || a.title.localeCompare(b.title, 'zh-CN');
+    });
+    const communityRows = communityFor(moduleKey, ability.id).map((item) => ({
+      ref: communityRelationshipRef(item),
+      kind: 'community',
+      id: item.id,
+      packageName: item.packageName,
+      title: item.name,
+      desc: shortSentence(item.desc, 96),
+      tech: item.packageName,
+      componentType: 'plugin',
+      evidence: '社区目录记录',
+      scope: '尚未安装',
+      status: 'candidate',
+      statusLabel: '候选未安装',
+      typeLabel: '社区方案',
+      sourceLabel: spec.kind === 'mixed' ? '视觉候选' : '社区候选',
+      relationship: spec.kind === 'mixed' ? 'alternative' : spec.kind,
+    }));
+    return [...currentRows, ...communityRows];
+  }
+
+  function relationshipItems(moduleKey, ability) {
+    if (!ability) return [];
+    const spec = relationshipSpec(moduleKey, ability.id);
+    const allRows = relationshipAllItems(moduleKey, ability);
+    const currentRows = allRows.filter((item) => item.kind !== 'community');
+    const communityRows = allRows.filter((item) => item.kind === 'community');
+    const currentLimit = spec.kind === 'alternatives' ? 4 : 6;
+    const candidateLimit = spec.kind === 'alternatives' ? 3 : 1;
+    const rows = [...currentRows.slice(0, currentLimit), ...communityRows.slice(0, candidateLimit)].slice(0, 7);
+    const focused = allRows.find((item) => item.ref === state.relationshipFocusRef);
+    return focused && !rows.includes(focused) ? [focused, ...rows.slice(0, 6)] : rows;
+  }
+
+  function currentRelationshipItems() {
+    const moduleKey = state.module;
+    const ability = moduleKey ? activeCapability(moduleKey) : null;
+    return ability ? relationshipItems(moduleKey, ability) : [];
+  }
+
+  function currentRelationshipAllItems() {
+    const moduleKey = state.module;
+    const ability = moduleKey ? activeCapability(moduleKey) : null;
+    return ability ? relationshipAllItems(moduleKey, ability) : [];
+  }
+
+  function relationshipLayout(kind, count, focused = false) {
+    if (!count) return [];
+    if (focused || ['alternatives', 'collaboration', 'support', 'toolbox', 'mixed'].includes(kind)) {
+      return Array.from({ length: count }, (_, index) => {
+        const angle = (-90 + index * (360 / count)) * Math.PI / 180;
+        return { x: 50 + Math.cos(angle) * 38, y: 53 + Math.sin(angle) * 32 };
+      });
+    }
+    if (kind === 'layers') {
+      return Array.from({ length: count }, (_, index) => ({
+        x: 23 + (index % 3) * 27,
+        y: 47 + Math.floor(index / 3) * 30,
+      }));
+    }
+    if (kind === 'constraint') {
+      const points = [{ x: 18, y: 30 }, { x: 82, y: 30 }, { x: 18, y: 74 }, { x: 82, y: 74 }, { x: 50, y: 84 }, { x: 50, y: 20 }];
+      return Array.from({ length: count }, (_, index) => points[index % points.length]);
+    }
+    return Array.from({ length: count }, (_, index) => orbitPoint(index, count));
+  }
+
+  function relationshipLensPosition(index, count, selectedIndex) {
+    const angle = (index - selectedIndex) * (Math.PI * 2 / Math.max(1, count));
+    const depth = (Math.cos(angle) + 1) / 2;
+    return {
+      x: 50 + Math.sin(angle) * 38,
+      y: 59 + Math.cos(angle) * 10,
+      scale: .72 + depth * .36,
+      opacity: .48 + depth * .52,
+      z: Math.round(depth * 20) + 5,
+      front: depth > .94,
+    };
+  }
+
+  function relationshipEdges(kind, centerPoint, points, items) {
+    return points.map((point, index) => ({
+      from: kind === 'constraint' ? point : centerPoint,
+      to: kind === 'constraint' ? centerPoint : point,
+      arrow: kind === 'constraint',
+      relationship: items[index]?.relationship || kind,
+    }));
+  }
+
+  function renderRelationshipNode(item, point, index, lens) {
+    const classes = ['relationship-node', `relation-${item.relationship}`, item.kind === 'community' ? 'candidate' : '', item.status === 'off' ? 'off' : '', item.status === 'error' ? 'error' : '', point.front ? 'lens-front' : ''].filter(Boolean).join(' ');
+    const lensStyle = lens ? `--node-scale:${point.scale.toFixed(3)};--node-opacity:${point.opacity.toFixed(3)};--node-z:${point.z};` : '';
+    const title = beginnerComponentName(item.title);
+    return `<button type="button" class="${classes}" style="--rx:${point.x.toFixed(2)}%;--ry:${point.y.toFixed(2)}%;${lensStyle}" data-relationship-ref="${esc(item.ref)}" data-relationship-index="${index}" onclick="openRelationshipItem(event,${inlineJsString(item.ref)})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(item.ref)})" ondragend="endContextDrag(event)" aria-label="${esc(title)}，${esc(item.statusLabel)}；点击查看详情，也可拖入助手分析"><span class="relationship-node-top"><i>${esc(item.sourceLabel)}</i><em>${esc(item.statusLabel)}</em></span><b>${esc(title)}</b><p>${esc(beginnerUiCopy(item.desc))}</p><small>${esc(item.typeLabel)}</small></button>`;
+  }
+
+  function relationshipItemSearchText(item) {
+    return `${item.title || ''} ${item.desc || ''} ${item.tech || ''} ${item.ref || ''} ${item.typeLabel || ''}`;
+  }
+
+  function genericRelationshipStages(spec, items) {
+    if (spec.kind === 'alternatives') {
+      return [{ id: 'alternatives', step: '同类可选', label: '解决同一个问题', desc: '这些方案目标相近；先比较效果和代价，不要把并列误读成调用顺序。', items }];
+    }
+    if (spec.kind === 'mixed') {
+      const current = items.filter((item) => item.kind !== 'community');
+      const candidates = items.filter((item) => item.kind === 'community');
+      return [
+        current.length ? { id: 'current', step: '当前链路', label: '已经参与这项能力', desc: '这些组件来自本机配置。', connector: candidates.length ? '需要额外效果时再考虑' : '', items: current } : null,
+        candidates.length ? { id: 'candidate', step: '可选增强', label: '尚未进入当前配置', desc: '安装、启用并回读成功前，只能作为比较对象。', items: candidates } : null,
+      ].filter(Boolean);
+    }
+    const remaining = new Set(items.map((item) => item.ref));
+    const definitions = [
+      { id: 'prompt', step: '规则', label: '先定做事边界', desc: '告诉 Agent 哪些事能做、应该怎样判断。', match: (item) => item.componentType === 'prompt' },
+      { id: 'skill', step: '方法', label: '需要时读取做法', desc: '为 Agent 补充具体的操作方法。', match: (item) => item.componentType === 'skill' },
+      { id: 'tool', step: 'Agent 入口', label: '给 Agent 可调用的动作', desc: '这些是 Agent 真正能够发起的动作。', match: (item) => item.componentType === 'tool' },
+      { id: 'command', step: '用户入口', label: '接收用户操作', desc: '接收命令、反馈或其他用户操作。', match: (item) => item.kind !== 'community' && item.componentType === 'plugin' && /command|命令|feedback|反馈/i.test(relationshipItemSearchText(item)) },
+      { id: 'surface', step: '页面入口', label: '让用户看见和操作', desc: '把状态和操作入口显示在页面上。', match: (item) => item.kind !== 'community' && item.componentType === 'plugin' && /client-ui|client-|客户端界面|网页界面/i.test(relationshipItemSearchText(item)) },
+      { id: 'service', step: '背后工作', label: '保存状态并完成处理', desc: '这些组件在后台完成这项能力。', match: (item) => item.kind !== 'community' && item.componentType === 'plugin' },
+      { id: 'community', step: '可选方案', label: '尚未安装', desc: '安装并确认可用后才会进入当前配置。', match: (item) => item.kind === 'community', optional: true },
+    ];
+    const stages = definitions.map((definition) => {
+      const rows = items.filter((item) => remaining.has(item.ref) && definition.match(item));
+      rows.forEach((item) => remaining.delete(item.ref));
+      return rows.length ? { ...definition, items: rows, match: undefined } : null;
+    }).filter(Boolean);
+    if (stages.length > 1 && !['layers', 'constraint'].includes(spec.kind)) {
+      stages.slice(0, -1).forEach((stage) => { stage.connector = '共同支撑，不代表调用'; });
+    }
+    if (spec.kind === 'layers') stages.slice(0, -1).forEach((stage) => { stage.connector = '一起影响最终判断'; });
+    if (spec.kind === 'constraint') stages.slice(0, -1).forEach((stage) => { stage.connector = '共同形成边界'; });
+    return stages;
+  }
+
+  function relationshipStagePlan(moduleKey, ability, items) {
+    const blueprint = RELATIONSHIP_BLUEPRINTS[`${moduleKey}/${ability.id}`];
+    const spec = relationshipSpec(moduleKey, ability.id);
+    if (!blueprint) {
+      return {
+        reading: spec.summary,
+        stages: genericRelationshipStages(spec, items),
+        explicitSequence: false,
+      };
+    }
+    const remaining = new Set(items.map((item) => item.ref));
+    const stages = blueprint.stages.map((stage) => {
+      const rows = items.filter((item) => {
+        if (!remaining.has(item.ref)) return false;
+        if (stage.candidate && item.kind !== 'community') return false;
+        if (!stage.candidate && item.kind === 'community') return false;
+        const searchText = relationshipItemSearchText(item);
+        return (!stage.componentTypes || stage.componentTypes.includes(item.componentType))
+          && (!stage.match || stage.match.test(searchText))
+          && (!stage.exclude || !stage.exclude.test(searchText));
+      });
+      rows.forEach((item) => remaining.delete(item.ref));
+      return rows.length ? { ...stage, items: rows } : null;
+    }).filter(Boolean);
+    const unassigned = items.filter((item) => remaining.has(item.ref) && item.kind !== 'community');
+    if (unassigned.length) {
+      stages.push({
+        id: 'other',
+        step: '共同支持',
+        label: '其他已归类组件',
+        desc: '当前快照能确认它属于这项能力，但没有足够证据把它放进更具体的前后步骤。',
+        items: unassigned,
+      });
+    }
+    const unassignedCandidates = items.filter((item) => remaining.has(item.ref) && item.kind === 'community');
+    if (unassignedCandidates.length) {
+      stages.push({
+        id: 'optional-candidate',
+        step: '可选观察',
+        label: '社区增强方案',
+        desc: '它们尚未安装，不属于上面的当前职责链；这里只方便比较。',
+        optional: true,
+        items: unassignedCandidates,
+      });
+    }
+    return { reading: blueprint.reading, stages, explicitSequence: blueprint.sequence !== false };
+  }
+
+  function relationshipImpact(item, spec, stage) {
+    if (item.kind === 'community') return '它还没有安装，不影响当前 Agent；安装后仍需单独测试和回读。';
+    if (item.status === 'off') return '它当前未启用，所以现在不承担这一步；启用前先确认是否与同阶段组件重复。';
+    if (item.status === 'error') return '它已配置但运行状态异常；先修复或停用，避免把“已配置”误当成“能正常工作”。';
+    if (spec.kind === 'constraint') return `停用后，“${stage.label}”这层保护可能减少；必须用越权用例回归确认。`;
+    if (item.componentType === 'tool') return `停用后，Agent 会少掉“${beginnerComponentName(item.title)}”这个动作入口。`;
+    if (item.componentType === 'skill') return `停用后，Agent 不能再主动读取“${beginnerComponentName(item.title)}”这套做事方法。`;
+    if (item.componentType === 'prompt') return `停用后，“${stage.label}”对应的规则不再注入模型。`;
+    return `停用后可能影响“${stage.label}”；当前快照没有调用轨迹，实际影响要用测试确认。`;
+  }
+
+  function relationshipWithText(item, stage, stages, explicitSequence) {
+    if (item.kind === 'community') return `它是“${stage.label}”里的未安装候选，不参与当前配置。`;
+    const sequenceStages = stages.filter((row) => !row.optional && !row.candidate);
+    const stageIndex = sequenceStages.indexOf(stage);
+    const peers = stage.items.filter((row) => row.ref !== item.ref).map((row) => beginnerComponentName(row.title));
+    const parts = [];
+    if (explicitSequence && stageIndex > 0) parts.push(`前一环节是“${sequenceStages[stageIndex - 1].label}”`);
+    if (explicitSequence && stageIndex >= 0 && stageIndex < sequenceStages.length - 1) parts.push(`后一环节是“${sequenceStages[stageIndex + 1].label}”`);
+    if (peers.length) parts.push(`同阶段还有${peers.slice(0, 2).map((name) => `“${name}”`).join('、')}${peers.length > 2 ? `等 ${peers.length} 项` : ''}`);
+    if (!parts.length) return `它单独承担“${stage.label}”；当前没有可证明的插件间调用关系。`;
+    return `${parts.join('；')}。${explicitSequence ? '这里的前后表示职责链，不等于已经观察到运行调用。' : '它们共同参与，但当前没有可证明的调用顺序。'}`;
+  }
+
+  function renderRelationshipStoryCard(item, stage, selected) {
+    const classes = ['relationship-role-card', selected ? 'selected' : '', item.kind === 'community' ? 'candidate' : '', item.status === 'off' ? 'off' : '', item.status === 'error' ? 'error' : ''].filter(Boolean).join(' ');
+    return `<button type="button" class="${classes}" data-relationship-ref="${esc(item.ref)}" onclick="focusRelationshipItem(${inlineJsString(item.ref)})" onkeydown="relationshipRoleCardKeydown(event,${inlineJsString(item.ref)})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(item.ref)})" ondragend="endContextDrag(event)" aria-pressed="${selected}"><span class="relationship-role-top"><i>${esc(stage.step)}</i><em>${esc(item.statusLabel)}</em></span><b>${esc(beginnerComponentName(item.title))}</b><p>${esc(beginnerComponentDescription(item))}</p><small>${esc(item.typeLabel)} · ${selected ? '正在查看' : '点一下查看关系'}</small></button>`;
+  }
+
+  function renderRelationshipInspector(selected, selectedStage, plan, spec) {
+    if (!selected || !selectedStage) return '';
+    return `<aside class="relationship-inspector" aria-live="polite"><div class="relationship-inspector-head"><div><span>${esc(selectedStage.step)} · ${esc(selectedStage.label)}</span><h4>${esc(beginnerComponentName(selected.title))}</h4><details class="inline-tech-name"><summary>查看技术名称</summary><small>${esc(selected.tech || selected.typeLabel)}</small></details></div><div class="relationship-inspector-head-actions"><span class="tag ${selected.status === 'using' ? 'ok' : selected.status === 'error' ? 'warn' : ''}">${esc(selected.statusLabel)}</span><button type="button" onclick="openRelationshipItem(event,${inlineJsString(selected.ref)})">查看完整配置</button><button type="button" class="primary" onclick="attachAssistantContext(${inlineJsString(selected.ref)})">交给助手分析</button></div></div><div class="relationship-inspector-grid"><div><b>它负责什么</b><p>${esc(beginnerComponentDescription(selected))}</p></div><div><b>它和谁有关</b><p>${esc(beginnerUiCopy(relationshipWithText(selected, selectedStage, plan.stages, plan.explicitSequence)))}</p></div><div><b>${selected.kind === 'community' ? '装上前要知道' : '关掉后会怎样'}</b><p>${esc(beginnerUiCopy(relationshipImpact(selected, spec, selectedStage)))}</p></div></div></aside>`;
+  }
+
+  function renderRelationshipHierarchy(moduleKey, ability, spec, items, plan) {
+    const stages = plan.stages.map((stage) => ({ ...stage, items: stage.items.filter((item) => item.kind !== 'community') })).filter((stage) => stage.items.length);
+    const reachable = stages.reduce((sum, stage) => sum + stage.items.length, 0);
+    const activeStage = stages.find((stage) => stage.id === state.relationshipStageId) || null;
+    if (!activeStage) {
+      return `<div class="relationship-depth"><div class="relationship-depth-summary"><span>${reachable}/${ability.components.length}</span><div><b>全部组件都能继续查看</b><p>${esc(beginnerUiCopy(plan.reading))}</p></div></div><div class="relationship-depth-map" aria-label="${esc(ability.name)}的组件分组">${stages.map((stage, index) => `<button type="button" class="relationship-depth-stage" onclick="openRelationshipStage(${inlineJsString(stage.id)})" aria-label="查看${esc(stage.label)}的 ${stage.items.length} 个组件"><span>${esc(stage.step)}</span><strong>${esc(stage.label)}</strong><p>${esc(beginnerUiCopy(stage.desc))}</p><em>${stage.items.length} 个组件　→</em>${index < stages.length - 1 ? '<i aria-hidden="true"></i>' : ''}</button>`).join('')}</div></div>`;
+    }
+    const selected = activeStage.items.find((item) => item.ref === state.relationshipFocusRef)
+      || activeStage.items.find((item) => item.status === 'using')
+      || activeStage.items[0];
+    return `<div class="relationship-depth detail"><div class="relationship-depth-nav"><button type="button" onclick="closeRelationshipStage()">← 全部 ${reachable} 个组件</button><span>${esc(ability.name)} › ${esc(activeStage.label)}</span><b>${activeStage.items.length} 个</b></div><section class="relationship-depth-detail" aria-label="${esc(activeStage.label)}" tabindex="-1"><header><span>${esc(activeStage.step)}</span><h4>${esc(activeStage.label)}</h4><p>${esc(beginnerUiCopy(activeStage.desc))}</p></header><div class="relationship-depth-items">${activeStage.items.map((item) => renderRelationshipStoryCard(item, activeStage, item.ref === selected?.ref)).join('')}</div>${renderRelationshipInspector(selected, activeStage, plan, spec)}</section></div>`;
+  }
+
+  function renderRelationshipStory(moduleKey, ability, spec, items) {
+    const plan = relationshipStagePlan(moduleKey, ability, items);
+    if (ability.components.length > 7) return renderRelationshipHierarchy(moduleKey, ability, spec, items, plan);
+    const selected = items.find((item) => item.ref === state.relationshipFocusRef)
+      || plan.stages.flatMap((stage) => stage.items).find((item) => item.kind !== 'community' && item.status === 'using')
+      || items[0];
+    const selectedStage = plan.stages.find((stage) => stage.items.some((item) => item.ref === selected?.ref)) || plan.stages[0];
+    const stagesHtml = plan.stages.map((stage, index) => {
+      const nextStage = plan.stages[index + 1];
+      const optionalLink = Boolean(nextStage?.optional || nextStage?.candidate);
+      const connector = nextStage
+        ? `<div class="relationship-step-link ${optionalLink ? 'optional' : ''}" aria-hidden="true"><span>${esc(optionalLink ? '另有可选项' : stage.connector || (plan.explicitSequence ? '进入下一环节' : '共同参与'))}</span><b>${optionalLink || !plan.explicitSequence ? '＋' : '→'}</b></div>`
+        : '';
+      return `<section class="relationship-stage" aria-label="${esc(stage.label)}"><header><span>${esc(stage.step)}</span><h4>${esc(stage.label)}</h4><p>${esc(beginnerUiCopy(stage.desc))}</p></header><div class="relationship-stage-items">${stage.items.map((item) => renderRelationshipStoryCard(item, stage, item.ref === selected?.ref)).join('')}</div></section>${connector}`;
+    }).join('');
+    const inspector = renderRelationshipInspector(selected, selectedStage, plan, spec);
+    return `<div class="relationship-story"><div class="relationship-reading"><span>先这样读</span><b>${esc(beginnerUiCopy(plan.reading))}</b></div><div class="relationship-stage-flow ${plan.explicitSequence ? 'is-sequence' : 'is-combination'}">${stagesHtml}</div>${inspector}</div>`;
+  }
+
+  function extensionSystemPlan(items) {
+    const currentItems = items.filter((item) => item.kind !== 'community');
+    const remaining = new Set(currentItems.map((item) => item.ref));
+    const groups = EXTENSION_SYSTEM_GROUPS.map((group) => {
+      const rows = group.items.map((definition) => {
+        const item = currentItems.find((row) => remaining.has(row.ref) && row.title === definition.title);
+        if (!item) return null;
+        remaining.delete(item.ref);
+        return { ...item, extensionRole: definition.role, extensionRelation: definition.relation || '', extensionBranch: Boolean(definition.branch), extensionSubgroup: definition.subgroup || '', extensionReplace: definition.replace || '' };
+      }).filter(Boolean);
+      return { ...group, items: rows };
+    }).filter((group) => group.items.length);
+    const unassigned = currentItems.filter((item) => remaining.has(item.ref));
+    if (unassigned.length) {
+      groups.push({
+        id: 'unassigned', label: '待确认归属', eyebrow: '新出现的组件', tone: 'unknown',
+        desc: '当前快照确认这些组件属于扩展能力，但产品归类还没有跟上；先保留真实身份，不把它们藏起来。',
+        relation: '尚无足够证据确定与其他组件的责任关系',
+        items: unassigned.map((item) => ({ ...item, extensionRole: '待确认', extensionRelation: '' })),
+      });
+    }
+    return {
+      groups,
+      currentCount: currentItems.length,
+      classifiedCount: groups.reduce((sum, group) => sum + group.items.length, 0),
+      communityCount: items.filter((item) => item.kind === 'community').length,
+    };
+  }
+
+  function extensionImpactText(item, group) {
+    if (item.status === 'off') return '它当前未启用，不参与这块系统；启用前先确认同组是否已有重复责任。';
+    if (item.status === 'error') return '它当前状态异常；相关责任可能不稳定，先修复或停用，再跑对应路径的回归。';
+    if (group.id === 'ui') return '关闭后，对应网页或管理入口可能消失；这不等于 Agent 的后台能力也被删除。';
+    if (group.id === 'skill' && item.title === 'Skill 状态标识') return '关闭后主要失去 Skill 状态提示；Agent 的 Skill 工具是否仍可用，要单独检查主链。';
+    if (group.id === 'skill' && item.componentType === 'tool') return '关闭后，Agent 会直接失去“查找并使用 Skill”这个动作入口。';
+    if (group.id === 'cross') return '关闭后，Agent 会少掉工具结果裁剪入口；影响应在“记忆 → 控制上下文长度”中回归。';
+    if (group.id === 'foundation') return '关闭后，扩展的登记、装载或配置读取可能受影响；它可能波及多个上层组件。';
+    if (group.id === 'host') return '关闭后，对应后台服务可能不可用；网页可能因此拿不到数据或功能。';
+    if (group.id === 'client') return '关闭后，网页与后台的连接可能中断；后台服务不一定同时停用。';
+    return `关闭后可能影响“${group.label}”；当前没有运行轨迹，实际影响仍需用测试确认。`;
+  }
+
+  function extensionRelationText(item, group) {
+    if (item.extensionRelation) return item.extensionRelation;
+    if (group.id === 'ui' && item.extensionSubgroup) {
+      const subgroup = group.subgroups?.find((row) => row.id === item.extensionSubgroup);
+      const peers = group.items.filter((row) => row.extensionSubgroup === item.extensionSubgroup && row.ref !== item.ref);
+      const peerNames = peers.map((row) => `“${row.title}”`).join('、');
+      return `它位于“${subgroup?.label || 'Web 界面'}”，与${peerNames || '当前界面组件'}共同完成这一块界面；这是界面责任分组，不是调用顺序。`;
+    }
+    const peers = group.items.filter((row) => row.ref !== item.ref);
+    const peerNames = peers.slice(0, 3).map((row) => `“${row.title}”`).join('、');
+    return `${group.relation}；它与${peerNames}${peers.length > 3 ? `等 ${peers.length} 项` : ''}处在同一责任区。这里不等于已经观察到调用顺序。`;
+  }
+
+  function renderExtensionSystemNode(item, selected) {
+    const classes = ['extension-system-node', selected ? 'selected' : '', item.status === 'off' ? 'off' : '', item.status === 'error' ? 'error' : '', item.extensionBranch ? 'branch' : ''].filter(Boolean).join(' ');
+    const title = beginnerComponentName(item.title);
+    return `<button type="button" class="${classes}" data-extension-component="${esc(item.ref)}" data-relationship-ref="${esc(item.ref)}" onclick="focusRelationshipItem(${inlineJsString(item.ref)})" onkeydown="relationshipRoleCardKeydown(event,${inlineJsString(item.ref)})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(item.ref)})" ondragend="endContextDrag(event)" aria-pressed="${selected}" aria-label="${esc(title)}，${esc(item.extensionRole)}，${esc(item.statusLabel)}；点击查看关系，也可拖入助手分析"><span class="extension-system-node-top"><i>${esc(item.extensionRole)}</i><em><span aria-hidden="true"></span>${esc(item.statusLabel)}</em></span><b>${esc(title)}</b><small>${esc(item.typeLabel)}</small></button>`;
+  }
+
+  function renderExtensionGroupInspector(item, group) {
+    return `<aside class="extension-group-inspector" aria-live="polite"><div class="extension-group-inspector-head"><div><span>${esc(group.label)} · ${esc(item.extensionRole)}</span><h4>${esc(beginnerComponentName(item.title))}</h4><details class="inline-tech-name"><summary>查看技术名称</summary><small>${esc(item.tech || item.typeLabel)}</small></details></div><div><span class="tag ${item.status === 'using' ? 'ok' : item.status === 'error' ? 'warn' : ''}">${esc(item.statusLabel)}</span><button type="button" onclick="openRelationshipItem(event,${inlineJsString(item.ref)})">查看完整配置</button><button type="button" class="primary" onclick="attachAssistantContext(${inlineJsString(item.ref)})">交给助手分析</button></div></div><div class="extension-group-inspector-grid"><div><b>它负责什么</b><p>${esc(beginnerUiCopy(item.desc))}</p></div><div><b>它和谁有关</b><p>${esc(beginnerUiCopy(extensionRelationText(item, group)))}</p></div><div><b>关掉后会怎样</b><p>${esc(beginnerUiCopy(extensionImpactText(item, group)))}</p></div></div></aside>`;
+  }
+
+  function renderExtensionSystemGroup(group, selected) {
+    const selectedItem = group.items.find((item) => item.ref === selected?.ref);
+    const content = group.subgroups?.length
+      ? `<div class="extension-subgroup-grid">${group.subgroups.map((subgroup) => {
+        const rows = group.items.filter((item) => item.extensionSubgroup === subgroup.id);
+        if (!rows.length) return '';
+        return `<section class="extension-subgroup"><header><b>${esc(subgroup.label)}</b><span>${esc(beginnerUiCopy(subgroup.desc))}</span><em>${rows.length} 项</em></header><div class="extension-component-grid">${rows.map((item) => renderExtensionSystemNode(item, item.ref === selected?.ref)).join('')}</div></section>`;
+      }).join('')}</div>`
+      : `<div class="extension-component-grid ${group.id === 'skill' ? 'is-flow' : ''}">${group.items.map((item) => renderExtensionSystemNode(item, item.ref === selected?.ref)).join('')}</div>`;
+    return `<section class="extension-system-group group-${esc(group.id)} ${group.tone ? `tone-${esc(group.tone)}` : ''}" data-group-count="${group.items.length}" aria-labelledby="extension-group-${esc(group.id)}"><header class="extension-system-group-head"><div><span>${esc(beginnerUiCopy(group.eyebrow))}</span><h4 id="extension-group-${esc(group.id)}">${esc(beginnerUiCopy(group.label))} <em>${group.items.length}</em></h4><p>${esc(beginnerUiCopy(group.desc))}</p></div><small>${esc(beginnerUiCopy(group.relation))}</small></header>${content}${selectedItem ? renderExtensionGroupInspector(selectedItem, group) : ''}</section>`;
+  }
+
+  function extensionHierarchyGroup(plan, id) {
+    return plan.groups.find((group) => group.id === id) || null;
+  }
+
+  function extensionHierarchyParent(path) {
+    if (path.startsWith('runtime/')) return 'runtime';
+    if (path.startsWith('ui/')) return 'ui';
+    return path === 'root' ? null : 'root';
+  }
+
+  function extensionHierarchyLabel(path, plan) {
+    const labels = {
+      root: '扩展做事方法',
+      skill: 'Agent 查找并使用 Skill',
+      runtime: '启动 DSH',
+      'runtime/config': '读取启动设置',
+      'runtime/load': '准备并启动插件',
+      'runtime/host': '启动后台服务',
+      'runtime/client': '连接网页',
+      ui: '用户打开网页',
+      cross: '结果过长时',
+      unassigned: '待确认归属',
+    };
+    if (labels[path]) return labels[path];
+    const [parent, child] = path.split('/');
+    if (parent === 'ui') return extensionHierarchyGroup(plan, 'ui')?.subgroups?.find((item) => item.id === child)?.label || child;
+    return path;
+  }
+
+  function extensionHierarchyCrumbs(path, plan) {
+    const paths = path === 'root'
+      ? ['root']
+      : path.includes('/')
+        ? ['root', path.split('/')[0], path]
+        : ['root', path];
+    return `<nav class="extension-hierarchy-crumbs" aria-label="扩展组件层级">${paths.map((item, index) => index === paths.length - 1
+      ? `<span aria-current="page">${esc(extensionHierarchyLabel(item, plan))}</span>`
+      : `<button type="button" onclick="openExtensionLevel(${inlineJsString(item)})">${esc(extensionHierarchyLabel(item, plan))}</button><i aria-hidden="true">›</i>`).join('')}</nav>`;
+  }
+
+  function renderExtensionFlowBranch({ path, when, title, count, action, tone = '' }) {
+    return `<button type="button" class="extension-flow-branch ${tone}" data-extension-level="${esc(path)}" onclick="openExtensionLevel(${inlineJsString(path)})" aria-label="${esc(when)}，${esc(title)}，${count} 个组件"><span>${esc(when)}</span><b>${esc(title)}</b><small>${esc(action)}</small><em>${count}</em><i aria-hidden="true">→</i></button>`;
+  }
+
+  function renderExtensionFlowOverview(plan) {
+    const skill = extensionHierarchyGroup(plan, 'skill');
+    const ui = extensionHierarchyGroup(plan, 'ui');
+    const cross = extensionHierarchyGroup(plan, 'cross');
+    const runtimeGroups = plan.groups.filter((group) => ['foundation', 'host', 'client'].includes(group.id));
+    const runtimeCount = runtimeGroups.reduce((sum, group) => sum + group.items.length, 0);
+    const branches = [
+      skill ? renderExtensionFlowBranch({ path: 'skill', when: 'Agent 做任务时', title: '查找并使用 Skill', count: skill.items.length, action: '找到 → 管理 → 交给 Agent', tone: 'agent' }) : '',
+      renderExtensionFlowBranch({ path: 'runtime', when: 'DSH 启动时', title: '让插件真正运行', count: runtimeCount, action: '读设置 → 准备插件 → 启动后台 → 连接网页', tone: 'runtime' }),
+      ui ? renderExtensionFlowBranch({ path: 'ui', when: '用户打开网页时', title: '显示、配置与观察', count: ui.items.length, action: '先画出页面，再同时加上功能', tone: 'interface' }) : '',
+      cross ? renderExtensionFlowBranch({ path: 'cross', when: '工具结果太长时', title: '转到记忆模块处理', count: cross.items.length, action: '裁剪结果，避免挤满上下文', tone: 'cross' }) : '',
+    ].filter(Boolean).join('');
+    return `<section class="extension-flow-canvas overview" data-extension-level-current tabindex="-1" aria-labelledby="extension-flow-root"><div class="extension-flow-overview"><div class="extension-flow-origin"><span>当前能力</span><h4 id="extension-flow-root">扩展做事方法</h4><b>${plan.currentCount} 个组件</b></div><div class="extension-flow-fan" aria-hidden="true"><i></i></div><div class="extension-flow-branches">${branches}</div></div></section>`;
+  }
+
+  function renderExtensionFlowStage({ path, step, title, count, action, tech }) {
+    return `<button type="button" class="extension-flow-stage-node" data-extension-level="${esc(path)}" onclick="openExtensionLevel(${inlineJsString(path)})" aria-label="${esc(step)}，${esc(title)}，${count} 个组件"><span>${esc(step)}</span><b>${esc(title)}</b><small>${esc(action)}</small><em>${count} 个</em><i>${esc(tech)}</i></button>`;
+  }
+
+  function renderExtensionFlowRuntime(plan) {
+    const foundation = extensionHierarchyGroup(plan, 'foundation');
+    const host = extensionHierarchyGroup(plan, 'host');
+    const client = extensionHierarchyGroup(plan, 'client');
+    const configCount = foundation?.items.filter((item) => item.title === '设置文件').length || 0;
+    const loadCount = Math.max(0, (foundation?.items.length || 0) - configCount);
+    const stages = [
+      renderExtensionFlowStage({ path: 'runtime/config', step: '1', title: '读取启动设置', count: configCount, action: '确定要启动哪些插件', tech: '启动设置' }),
+      renderExtensionFlowStage({ path: 'runtime/load', step: '2', title: '准备并启动插件', count: loadCount, action: '登记插件信息并创建实例', tech: '启动准备' }),
+      renderExtensionFlowStage({ path: 'runtime/host', step: '3', title: '启动后台服务', count: host?.items.length || 0, action: '接收请求并返回结果', tech: '后台服务' }),
+      renderExtensionFlowStage({ path: 'runtime/client', step: '4', title: '连接网页', count: client?.items.length || 0, action: '让页面拿到数据和功能', tech: '网页连接' }),
+    ];
+    return `<section class="extension-flow-canvas timeline" data-extension-level-current tabindex="-1" aria-labelledby="extension-flow-runtime"><header class="extension-flow-canvas-head"><span>典型启动路径</span><h4 id="extension-flow-runtime">DSH 怎样让插件可用</h4></header><div class="extension-flow-timeline">${stages.map((stage, index) => `${stage}${index < stages.length - 1 ? '<span class="extension-flow-arrow" aria-hidden="true">→</span>' : ''}`).join('')}</div></section>`;
+  }
+
+  function renderExtensionFlowUi(plan) {
+    const group = extensionHierarchyGroup(plan, 'ui');
+    const countFor = (id) => group?.items.filter((item) => item.extensionSubgroup === id).length || 0;
+    const shell = renderExtensionFlowStage({ path: 'ui/shell', step: '先', title: '画出页面', count: countFor('shell'), action: '主题、布局与渲染', tech: '界面骨架' });
+    const branches = [
+      renderExtensionFlowStage({ path: 'ui/workspace', step: '同时', title: '提供工作区域', count: countFor('workspace'), action: '侧栏、工具和成果', tech: '工作区域' }),
+      renderExtensionFlowStage({ path: 'ui/manage', step: '同时', title: '提供配置页面', count: countFor('manage'), action: '设置、插件与角色卡', tech: '配置' }),
+      renderExtensionFlowStage({ path: 'ui/observe', step: '同时', title: '显示运行反馈', count: countFor('observe'), action: '任务过程与消息反馈', tech: '观察' }),
+    ].join('');
+    return `<section class="extension-flow-canvas ui" data-extension-level-current tabindex="-1" aria-labelledby="extension-flow-ui"><header class="extension-flow-canvas-head"><span>页面出现顺序</span><h4 id="extension-flow-ui">先画出页面，再同时加上功能</h4></header><div class="extension-flow-ui-map"><div class="extension-flow-ui-origin"><span>网页已连接后台</span></div>${shell}<div class="extension-flow-split" aria-hidden="true"><i></i></div><div class="extension-flow-ui-branches">${branches}</div></div></section>`;
+  }
+
+  function extensionLeafContext(path, plan) {
+    let group = null;
+    let rows = [];
+    let label = '';
+    if (path === 'skill' || path === 'cross' || path === 'unassigned') {
+      group = extensionHierarchyGroup(plan, path);
+      rows = group?.items || [];
+      label = extensionHierarchyLabel(path, plan);
+    } else if (path.startsWith('runtime/')) {
+      const id = path.split('/')[1];
+      group = id === 'config' || id === 'load' ? extensionHierarchyGroup(plan, 'foundation') : extensionHierarchyGroup(plan, id);
+      rows = group?.items || [];
+      if (id === 'config') rows = rows.filter((item) => item.title === '设置文件');
+      if (id === 'load') rows = rows.filter((item) => item.title !== '设置文件');
+      label = extensionHierarchyLabel(path, plan);
+    } else if (path.startsWith('ui/')) {
+      group = extensionHierarchyGroup(plan, 'ui');
+      const subgroup = group?.subgroups?.find((item) => item.id === path.split('/')[1]);
+      rows = group?.items.filter((item) => item.extensionSubgroup === subgroup?.id) || [];
+      label = subgroup?.label || '';
+    }
+    if (!group) return null;
+    return { group: { ...group, label, items: rows, subgroups: null }, rows, label };
+  }
+
+  function extensionFlowSpec(path, rows) {
+    const specs = {
+      skill: { origin: 'Agent 需要一种新方法', summary: '发现 → 管理 → 暴露 → 调用；状态显示走旁路', points: { '$origin': [5, 45], '本地 Skill 发现': [20, 45], 'Skill 核心服务': [39, 45], 'Skill 使用入口': [58, 45], '查找并使用 Skill': [78, 45], 'Skill 状态标识': [39, 78] }, edges: [['$origin', '本地 Skill 发现', 'sequence'], ['本地 Skill 发现', 'Skill 核心服务', 'sequence'], ['Skill 核心服务', 'Skill 使用入口', 'sequence'], ['Skill 使用入口', '查找并使用 Skill', 'sequence'], ['Skill 核心服务', 'Skill 状态标识', 'optional']] },
+      'runtime/config': { origin: 'DSH 开始启动', summary: '先读取当前设置', points: { '$origin': [12, 50], '设置文件': [50, 50] }, edges: [['$origin', '设置文件', 'sequence']] },
+      'runtime/load': { origin: '已读取启动设置', summary: '按顺序启动；开发时刷新是可选步骤', points: { '$origin': [4, 50], 'Cordis加载入口': [25, 50], '类型系统注册中心': [49, 28], '类型系统加载器': [73, 28], 'Cordis插件热更新': [49, 76] }, edges: [['$origin', 'Cordis加载入口', 'sequence'], ['Cordis加载入口', '类型系统注册中心', 'support'], ['类型系统注册中心', '类型系统加载器', 'sequence'], ['Cordis加载入口', 'Cordis插件热更新', 'optional']] },
+      'runtime/host': { origin: '插件已准备好', summary: '先启动后台和网页服务，再同时开放两类后台能力', points: { '$origin': [3, 50], 'Cordis主机运行器': [17, 50], 'Web 服务宿主': [36, 50], 'API网关': [55, 50], '主机API 代理': [78, 30], '主机插件清单': [78, 72] }, edges: [['$origin', 'Cordis主机运行器', 'sequence'], ['Cordis主机运行器', 'Web 服务宿主', 'sequence'], ['Web 服务宿主', 'API网关', 'sequence'], ['API网关', '主机API 代理', 'parallel'], ['API网关', '主机插件清单', 'parallel']] },
+      'runtime/client': { origin: '后台服务已启动', summary: '网页功能启动后同时装配，再连接后台和外部服务', points: { '$origin': [3, 50], '客户端运行时': [18, 50], 'Cordis客户端运行器': [38, 27], '客户端模块': [38, 72], '客户端连接': [58, 50], '远程 API 连接': [79, 28], '客户端热更新': [79, 75] }, edges: [['$origin', '客户端运行时', 'sequence'], ['客户端运行时', 'Cordis客户端运行器', 'parallel'], ['客户端运行时', '客户端模块', 'parallel'], ['Cordis客户端运行器', '客户端连接', 'support'], ['客户端模块', '客户端连接', 'support'], ['客户端连接', '远程 API 连接', 'sequence'], ['客户端模块', '客户端热更新', 'optional']] },
+      'ui/shell': { origin: '网页已连接后台', summary: '页面绘制居中，主题、布局和品牌共同影响结果', points: { '$origin': [5, 50], '客户端界面渲染器': [38, 50], '客户端界面主题': [72, 18], '客户端界面布局': [72, 42], '客户端界面品牌官方': [72, 72] }, edges: [['$origin', '客户端界面渲染器', 'sequence'], ['客户端界面主题', '客户端界面渲染器', 'support'], ['客户端界面布局', '客户端界面渲染器', 'support'], ['客户端界面品牌官方', '客户端界面渲染器', 'support']] },
+      'ui/workspace': { origin: '页面骨架已完成', summary: '四个工作区域可以同时显示', points: { '$origin': [8, 50], '客户端界面侧栏': [53, 14], '客户端界面工具': [53, 38], '客户端界面Cordis': [53, 62], '客户端界面交付物': [53, 86] }, edges: [['$origin', '客户端界面侧栏', 'parallel'], ['$origin', '客户端界面工具', 'parallel'], ['$origin', '客户端界面Cordis', 'parallel'], ['$origin', '客户端界面交付物', 'parallel']] },
+      'ui/manage': { origin: '页面骨架已完成', summary: '先出现设置入口，再同时加上其他管理页', points: { '$origin': [3, 50], '客户端界面设置': [23, 50], '客户端界面设置通用': [63, 10], '客户端界面设置插件清单': [63, 27], '客户端界面设置插件列表': [63, 45], '客户端界面Agent角色卡': [63, 64], '客户端界面Skill': [63, 83] }, edges: [['$origin', '客户端界面设置', 'sequence'], ['客户端界面设置', '客户端界面设置通用', 'parallel'], ['客户端界面设置', '客户端界面设置插件清单', 'parallel'], ['客户端界面设置', '客户端界面设置插件列表', 'parallel'], ['客户端界面设置', '客户端界面Agent角色卡', 'parallel'], ['客户端界面设置', '客户端界面Skill', 'parallel']] },
+      'ui/observe': { origin: 'Agent 正在运行', summary: '任务过程和消息反馈同时收集不同信息', points: { '$origin': [10, 50], '客户端界面运行轨迹': [55, 30], '客户端界面消息反馈': [55, 70] }, edges: [['$origin', '客户端界面运行轨迹', 'parallel'], ['$origin', '客户端界面消息反馈', 'parallel']] },
+      cross: { origin: '工具结果超过上下文需要', summary: '跨到记忆模块继续处理', points: { '$origin': [12, 50], '执行工具结果裁剪': [56, 50] }, edges: [['$origin', '执行工具结果裁剪', 'sequence']] },
+    };
+    if (specs[path]) return specs[path];
+    const points = { '$origin': [6, 50] };
+    rows.forEach((item, index) => { points[item.title] = [38 + (index % 2) * 34, 18 + Math.floor(index / 2) * 28]; });
+    return { origin: '进入这一层', summary: '当前关系尚待确认', points, edges: rows.map((item) => ['$origin', item.title, 'support']) };
+  }
+
+  function extensionReplacementMeta(item, path) {
+    const identity = `${item.title} ${item.tech || ''}`;
+    if (/热更新|hmr/i.test(identity) || item.title === 'Skill 状态标识') return { kind: 'optional', label: '可直接停用', text: '这是辅助功能。关闭后只会失去自动刷新或状态提示。' };
+    if (path === 'ui/shell') return { kind: 'slot', label: '可换同类', text: '只能换成作用相同的页面插件，换后要重新测试。' };
+    if (path.startsWith('ui/')) return { kind: 'optional', label: '可单独停用', text: '可以关闭这块页面，其他页面不会自动替代它。' };
+    return { kind: 'fixed', label: '不可直接替换', text: '不能和本组其他插件互换。要替换，只能找作用相同的插件并重新测试。' };
+  }
+
+  function extensionFlowPointMap(spec, rows) {
+    const points = { '$origin': { x: spec.points?.$origin?.[0] || 5, y: spec.points?.$origin?.[1] || 50 } };
+    rows.forEach((item, index) => {
+      const point = spec.points?.[item.title] || [42 + (index % 2) * 34, 18 + Math.floor(index / 2) * 27];
+      points[item.title] = { x: point[0], y: point[1] };
+    });
+    return points;
+  }
+
+  function renderExtensionFlowEdges(spec, points) {
+    const edges = (spec.edges || []).filter(([from, to]) => points[from] && points[to]);
+    return `<svg class="extension-flow-lines" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><defs><marker id="extension-flow-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z"></path></marker></defs>${edges.map(([from, to, kind]) => {
+      const source = points[from];
+      const target = points[to];
+      const bend = (source.x + target.x) / 2;
+      const arrow = kind === 'support' ? '' : ' marker-end="url(#extension-flow-arrow)"';
+      return `<path class="relation-${esc(kind)}" d="M ${source.x} ${source.y} C ${bend} ${source.y}, ${bend} ${target.y}, ${target.x} ${target.y}"${arrow}></path>`;
+    }).join('')}</svg>`;
+  }
+
+  function extensionFlowRelationText(item, spec, rows) {
+    const titleSet = new Set(rows.map((row) => row.title));
+    const edges = (spec.edges || []).filter(([from, to]) => (from === item.title || to === item.title));
+    const parts = [];
+    const incoming = edges.filter(([, to, kind]) => to === item.title && kind === 'sequence').map(([from]) => from === '$origin' ? spec.origin : from);
+    const outgoing = edges.filter(([from, , kind]) => from === item.title && kind === 'sequence').map(([, to]) => to);
+    const supports = edges.filter(([from, to, kind]) => kind === 'support' && (from === item.title || to === item.title)).map(([from, to]) => from === item.title ? `支撑“${to}”` : `由“${from}”支撑`);
+    const optional = edges.some(([, to, kind]) => kind === 'optional' && to === item.title);
+    const parallelSources = new Set(edges.filter(([, to, kind]) => to === item.title && kind === 'parallel').map(([from]) => from));
+    const parallelPeers = (spec.edges || []).filter(([from, to, kind]) => kind === 'parallel' && parallelSources.has(from) && to !== item.title && titleSet.has(to)).map(([, to]) => to);
+    if (incoming.length) parts.push(`先经过“${incoming.map(beginnerComponentName).join('、')}”`);
+    if (outgoing.length) parts.push(`之后进入“${outgoing.map(beginnerComponentName).join('、')}”`);
+    if (parallelPeers.length) parts.push(`与${parallelPeers.slice(0, 3).map((name) => `“${beginnerComponentName(name)}”`).join('、')}同时进行`);
+    if (supports.length) parts.push(beginnerUiCopy(supports.join('，')));
+    if (optional) parts.push('属于可选步骤');
+    return parts.length ? `${parts.join('；')}。` : '当前只确认它属于这一阶段，没有足够证据画出更细的调用关系。';
+  }
+
+  function renderExtensionFlowNode(item, path, spec, points, selected) {
+    const point = points[item.title];
+    const replacement = extensionReplacementMeta(item, path);
+    const classes = ['extension-flow-node', selected ? 'selected' : '', item.status === 'off' ? 'off' : '', item.status === 'error' ? 'error' : ''].filter(Boolean).join(' ');
+    const title = beginnerComponentName(item.title);
+    return `<button type="button" class="${classes}" style="--fx:${point.x}%;--fy:${point.y}%" data-extension-component="${esc(item.ref)}" data-relationship-ref="${esc(item.ref)}" onclick="focusRelationshipItem(${inlineJsString(item.ref)})" onkeydown="relationshipRoleCardKeydown(event,${inlineJsString(item.ref)})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(item.ref)})" ondragend="endContextDrag(event)" aria-pressed="${selected}" aria-label="${esc(title)}，${esc(item.extensionRole)}，${esc(replacement.label)}"><span><i>${esc(item.extensionRole)}</i><em>${esc(item.statusLabel)}</em></span><b>${esc(title)}</b><small class="replace-${replacement.kind}">${esc(replacement.label)}</small></button>`;
+  }
+
+  function renderExtensionFlowInspector(item, path, spec, rows) {
+    const replacement = extensionReplacementMeta(item, path);
+    return `<aside class="extension-flow-inspector" aria-live="polite"><header><span>${esc(item.extensionRole)}</span><h5>${esc(beginnerComponentName(item.title))}</h5><details class="inline-tech-name"><summary>技术名称</summary><small>${esc(item.tech || item.typeLabel)}</small></details></header><div><b>前后关系</b><p>${esc(beginnerUiCopy(extensionFlowRelationText(item, spec, rows)))}</p></div><div><b>能否替换</b><p>${esc(beginnerUiCopy(replacement.text))}</p></div><footer><span class="tag ${item.status === 'using' ? 'ok' : item.status === 'error' ? 'warn' : ''}">${esc(item.statusLabel)}</span><button type="button" onclick="openRelationshipItem(event,${inlineJsString(item.ref)})">打开配置</button><button type="button" class="primary" onclick="attachAssistantContext(${inlineJsString(item.ref)})">交给助手</button></footer></aside>`;
+  }
+
+  function renderExtensionFlowLeaf(path, plan, selected) {
+    const context = extensionLeafContext(path, plan);
+    if (!context) return '';
+    const { rows, label } = context;
+    const spec = extensionFlowSpec(path, rows);
+    const points = extensionFlowPointMap(spec, rows);
+    const selectedItem = rows.find((item) => item.ref === selected?.ref) || rows.find((item) => item.status === 'using') || rows[0];
+    const replacementCounts = rows.reduce((counts, item) => {
+      const kind = extensionReplacementMeta(item, path).kind;
+      counts[kind] = (counts[kind] || 0) + 1;
+      return counts;
+    }, {});
+    const replacementSummary = replacementCounts.slot
+      ? `${replacementCounts.slot} 个可换同类槽位 · 当前无备选`
+      : replacementCounts.optional
+        ? `${replacementCounts.optional} 个可直接停用 · 其余不可互换`
+        : '本组没有可直接互换项';
+    return `<section class="extension-flow-canvas leaf" data-extension-level-current tabindex="-1" aria-labelledby="extension-flow-leaf"><header class="extension-flow-canvas-head"><span>${esc(beginnerUiCopy(spec.summary))}</span><h4 id="extension-flow-leaf">${esc(label)}</h4><div><em>${rows.length} 个插件</em><em>${esc(replacementSummary)}</em></div></header><div class="extension-flow-leaf-body"><div class="extension-flow-graph"><div class="extension-flow-origin-node" style="--fx:${points.$origin.x}%;--fy:${points.$origin.y}%"><span>从这里来</span><b>${esc(beginnerUiCopy(spec.origin))}</b></div>${renderExtensionFlowEdges(spec, points)}${rows.map((item) => renderExtensionFlowNode(item, path, spec, points, item.ref === selectedItem?.ref)).join('')}</div>${selectedItem ? renderExtensionFlowInspector(selectedItem, path, spec, rows) : ''}</div></section>`;
+  }
+
+  function renderExtensionSystemMap(items) {
+    const plan = extensionSystemPlan(items);
+    const selected = items.find((item) => item.ref === state.relationshipFocusRef && item.kind !== 'community')
+      || null;
+    const validPaths = new Set(['root', 'skill', 'runtime', 'runtime/config', 'runtime/load', 'runtime/host', 'runtime/client', 'ui', 'ui/shell', 'ui/workspace', 'ui/manage', 'ui/observe', 'cross', 'unassigned']);
+    const path = validPaths.has(state.extensionPath) ? state.extensionPath : 'root';
+    const current = path === 'root'
+      ? renderExtensionFlowOverview(plan)
+      : path === 'runtime'
+        ? renderExtensionFlowRuntime(plan)
+        : path === 'ui'
+          ? renderExtensionFlowUi(plan)
+          : renderExtensionFlowLeaf(path, plan, selected);
+    const parent = extensionHierarchyParent(path);
+    return `<div class="extension-system-map flow"><div class="extension-flow-toolbar">${extensionHierarchyCrumbs(path, plan)}<div class="extension-flow-toolbar-right"><span>${plan.classifiedCount} 个真实组件</span><div class="extension-flow-modes" aria-label="关系来源"><b>典型路径</b><button type="button" disabled title="当前 DSH 没有逐次调用记录">本次实际运行 · 暂无记录</button></div>${parent ? `<button type="button" class="extension-level-back" onclick="openExtensionLevel(${inlineJsString(parent)})">← 返回</button>` : ''}</div></div>${current}<div class="extension-flow-legend" aria-label="关系线说明"><span><i class="sequence"></i>先后</span><span><i class="parallel"></i>同时</span><span><i class="support"></i>依赖</span><span><i class="optional"></i>可选步骤</span><em>基于当前配置</em></div></div>`;
+  }
+
+  function renderRelationshipExplorer(moduleKey, ability) {
+    const spec = relationshipSpec(moduleKey, ability.id);
+    const isExtensionSystem = moduleKey === 'tools' && ability.id === 'extensions';
+    if (isExtensionSystem) {
+      const allItems = relationshipAllItems(moduleKey, ability);
+      return `<section class="relationship-explorer extension-relationship-explorer kind-${spec.kind}" aria-label="${esc(ability.name)}的 ${ability.components.length} 项组件关系">${renderExtensionSystemMap(allItems)}</section>`;
+    }
+    const items = ability.components.length > 7 ? relationshipAllItems(moduleKey, ability) : relationshipItems(moduleKey, ability);
+    return `<section class="relationship-explorer kind-${spec.kind}" aria-label="${esc(ability.name)}的组件关系">${renderRelationshipStory(moduleKey, ability, spec, items)}</section>`;
   }
 
   function renderModuleRail(key) {
@@ -1612,9 +3021,36 @@
       if (!rows.length) return '';
       const meta = TYPE_META[type];
       return `<section class="component-group"><div class="cg-title"><span>${meta.label}</span><span>${meta.help}</span><span>${rows.length}</span></div>
-        ${rows.map(({ component, index }) => { const ref = componentContextRef(key, ability.id, component); return `<button type="button" class="component-row" data-component-ref="${key}-${ability.id}-${index}" onclick="openComponent('${key}','${ability.id}',${index})" draggable="true" ondragstart="startContextDrag(event,'${ref}')" ondragend="endContextDrag(event)"><span class="type-ico ${type}">${meta.short}</span><span><span class="cr-name">${esc(component.name)}</span><span class="cr-tech">${esc(component.tech)}</span></span><span class="cr-status ${component.status === 'off' ? 'off' : ''}">${esc(componentStatusLabel(component))} ›</span></button>`; }).join('')}
+        ${rows.map(({ component, index }) => { const ref = componentContextRef(key, ability.id, component); return `<button type="button" class="component-row" data-component-ref="${esc(ref)}" onclick="openComponent(${inlineJsString(key)},${inlineJsString(ability.id)},${index})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(ref)})" ondragend="endContextDrag(event)"><span class="type-ico ${type}">${meta.short}</span><span><span class="cr-name">${esc(beginnerComponentName(component.name))}</span><span class="cr-tech">${esc(component.tech)}</span></span><span class="cr-status ${component.status === 'off' ? 'off' : ''}">${esc(componentStatusLabel(component))} ›</span></button>`; }).join('')}
       </section>`;
     }).join('');
+  }
+
+  function renderCapabilityDetail(key, module, ability) {
+    const visible = ability.components.slice(0, state.componentLimit);
+    const remaining = Math.max(0, ability.components.length - visible.length);
+    const recommendation = recommendationFor(key, ability.id);
+    const community = communityFor(key, ability.id);
+    const contextRef = capabilityContextRef(key, ability.id);
+    const utilities = `${ability.id === 'model' ? '<button type="button" onclick="openLLM()">查看模型设置</button>' : ''}${ability.id === 'workflow' ? '<button type="button" onclick="openFlow()">查看工作流能力</button>' : ''}<button id="open-native-library" type="button" onclick="openLibrary('native')">搜索全部原生组件</button>`;
+    return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: `${module.name}模块`, fn: `openModule('${key}')` }, { t: ability.name }]) + `<section class="capability-focus-page" tabindex="-1" aria-labelledby="capability-focus-title">
+      <header class="capability-focus-head">
+        <div class="capability-focus-nav"><button type="button" onclick="closeCapabilityDetail()">← 返回${esc(module.name)}模块</button><span>${esc(module.name)} · ${esc(module.question)}</span></div>
+        <div class="capability-focus-title"><span class="capability-focus-icon" aria-hidden="true">${esc(module.icon)}</span><div><h1 id="capability-focus-title">${esc(ability.name)}</h1><p>${esc(ability.desc)}</p></div><div class="capability-focus-actions"><span>${ability.components.length} 个已发现组件</span><button type="button" data-assistant-source-ref="${esc(contextRef)}" onclick="attachAssistantContext(${inlineJsString(contextRef)})">交给助手分析</button></div></div>
+      </header>
+      <div class="capability-focus-body">
+        ${recommendation ? `<div class="ability-advice"><span class="confidence ${recommendation.level}">${esc(recommendation.confidence)}</span><div><b>${esc(recommendation.title)}</b><p>${esc(recommendation.summary)}</p><small>依据：${esc(recommendation.evidence)}</small></div><button type="button" onclick="askAssistant(${inlineJsString(recommendation.id)})">让 AI 解释</button></div>` : ''}
+        ${renderRelationshipExplorer(key, ability)}
+        <details class="relationship-all-components"><summary>${key === 'tools' && ability.id === 'extensions' ? `按原始清单复核 ${ability.components.length} 项` : `按列表查看全部 ${ability.components.length} 个当前组件`}</summary>
+          <div class="component-field"><div class="component-net">${visible.length ? visible.map((component, index) => { const ref = componentContextRef(key, ability.id, component); return `<button type="button" class="component-tile ${component.status === 'off' ? 'off' : component.status === 'error' ? 'error' : ''}" data-component-ref="${esc(ref)}" onclick="openComponent(${inlineJsString(key)},${inlineJsString(ability.id)},${index})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(ref)})" ondragend="endContextDrag(event)" aria-label="查看${esc(beginnerComponentName(component.name))}详情，${esc(componentStatusLabel(component))}，或拖入助手分析">
+            <span class="ct-top"><span class="ct-type">${esc(componentTypeLabel(component))}</span><span class="ct-state" aria-hidden="true"></span><span class="ct-status-label">${esc(componentStatusLabel(component))}</span></span><h3>${esc(beginnerComponentName(component.name))}</h3><p>${esc(shortSentence(beginnerComponentDescription(component)))}</p>
+          </button>`; }).join('') : '<div class="component-empty">当前快照没有发现对应组件。</div>'}</div>
+          ${remaining ? `<button type="button" class="component-more" onclick="showMoreComponents()">继续展开 ${remaining} 个组件 ↓</button>` : ''}
+          <div class="ability-utilities">${utilities}</div></div>
+        </details>
+        ${community.length ? `<div class="community-shelf"><div class="community-shelf-head"><div><span>社区目录</span><b>候选与本次安装回读分开显示</b></div><button id="open-community-library" type="button" onclick="openLibrary('community')">查看全部社区候选 →</button></div><div class="community-mini-grid">${community.map((item) => { const installed = state.verifiedInstalls[item.packageName]; const pendingInstall = hasRestoredPendingRefresh('pluginInstall', item.packageName); return `<button type="button" class="community-mini" data-community-ref="${esc(item.packageName)}" onclick="openCommunityDetail(${inlineJsString(item.id)},'module')" aria-label="查看${esc(item.name)}介绍与安装检查"><span>${pendingInstall ? '社区 · 安装状态待核验' : installed ? `社区 · 已安装并回读 v${esc(installed.version)}` : item.version !== item.latestVersion ? `社区 · 候选未实装 · 有新版 v${esc(item.latestVersion)}` : '社区 · 候选未实装'}</span><h3>${esc(item.name)}</h3><p>${esc(item.desc)}</p><small>查看介绍与安装检查 →</small></button>`; }).join('')}</div></div>` : ''}
+      </div>
+    </section>`;
   }
 
   function renderModule() {
@@ -1623,48 +3059,205 @@
     if (!fullConfigEvidenceAvailable()) return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: module.name }]) + renderPresetRefreshGate();
     const abilities = CAPABILITIES[key];
     const ability = activeCapability(key);
+    if (ability) {
+      return renderCapabilityDetail(key, module, ability)
+        + `${state.componentDetail ? renderComponentDrawer() : ''}${state.libraryOpen ? renderLibraryDrawer() : ''}${state.communityDetail ? renderCommunityDialog() : ''}`;
+    }
     const componentTotal = moduleComponents(key).length;
-    const dock = Object.entries(MODULES).map(([moduleKey, item]) => `<button type="button" class="${moduleKey === key ? 'on' : ''}" onclick="openModule('${moduleKey}')" aria-label="切换到${item.name}模块" ${moduleKey === key ? 'aria-current="page"' : ''} title="${item.name} · ${item.desc}"><span>${item.icon}</span><b>${item.name}</b></button>`).join('');
+    const dock = Object.entries(MODULES).map(([moduleKey, item]) => `<button type="button" class="${moduleKey === key ? 'on' : ''}" onclick="openModule('${moduleKey}')" aria-label="切换到${item.name}模块" ${moduleKey === key ? 'aria-current="page"' : ''} title="${item.name} · ${item.question}"><span>${item.icon}</span><b>${item.name}</b></button>`).join('');
     const abilityNodes = abilities.map((item, index) => {
       const point = orbitPoint(index, abilities.length);
-      const selected = ability?.id === item.id;
       const ref = capabilityContextRef(key, item.id);
-      return `<button type="button" class="ability-orbit-node ${selected ? 'on' : ''}" style="--x:${point.x.toFixed(2)}%;--y:${point.y.toFixed(2)}%" onclick="selectCapability('${item.id}')" draggable="true" ondragstart="startContextDrag(event,'${ref}')" ondragend="endContextDrag(event)" aria-pressed="${selected}" aria-label="${esc(item.name)}，点击查看，或拖入助手分析">
-        <b>${esc(item.name)}</b><span class="ao-count">${item.components.length}</span><p>${esc(item.desc)}</p>${selected ? '<span class="ao-state">正在查看</span>' : ''}
+      return `<button type="button" class="ability-orbit-node" data-capability-id="${esc(item.id)}" style="--x:${point.x.toFixed(2)}%;--y:${point.y.toFixed(2)}%" onclick="selectCapability(${inlineJsString(item.id)})" draggable="true" ondragstart="startContextDrag(event,${inlineJsString(ref)})" ondragend="endContextDrag(event)" aria-label="${esc(item.name)}，点击查看，或拖入助手分析">
+        <b>${esc(item.name)}</b><span class="ao-count">${item.components.length}</span><p>${esc(item.desc)}</p>
       </button>`;
     }).join('');
-    let unfold = `<section id="component-unfold" class="component-unfold" tabindex="-1" aria-live="polite"><div class="component-wait"><b>先选择一项能力</b>点击周围的能力，下面只展开与它有关的真实组件。</div></section>`;
-    if (ability) {
-      const visible = ability.components.slice(0, state.componentLimit);
-      const remaining = Math.max(0, ability.components.length - visible.length);
-      const recommendation = recommendationFor(key, ability.id);
-      const community = communityFor(key, ability.id);
-      const utilities = `${ability.id === 'model' ? '<button type="button" onclick="openLLM()">查看模型设置</button>' : ''}${ability.id === 'workflow' ? '<button type="button" onclick="openFlow()">查看工作流能力</button>' : ''}<button id="open-native-library" type="button" onclick="openLibrary('native')">搜索全部原生组件</button>`;
-      unfold = `<section id="component-unfold" class="component-unfold" tabindex="-1" aria-live="polite">
-        <div class="unfold-head"><span class="uh-mark">${esc(module.icon)}</span><div><h2>${esc(ability.name)}</h2><p>${esc(ability.desc)}</p></div><div class="unfold-head-actions"><span class="uh-count">${ability.components.length} 个已发现组件</span><button type="button" data-assistant-source-ref="${capabilityContextRef(key, ability.id)}" onclick="attachAssistantContext('${capabilityContextRef(key, ability.id)}')">交给助手分析</button></div></div>
-        ${recommendation ? `<div class="ability-advice"><span class="confidence ${recommendation.level}">${esc(recommendation.confidence)}</span><div><b>${esc(recommendation.title)}</b><p>${esc(recommendation.summary)}</p><small>依据：${esc(recommendation.evidence)}</small></div><button type="button" onclick="askAssistant('${esc(recommendation.id)}')">让 AI 解释</button></div>` : ''}
-        <div class="component-field"><div class="component-net">${visible.length ? visible.map((component, index) => { const ref = componentContextRef(key, ability.id, component); return `<button type="button" class="component-tile ${component.status === 'off' ? 'off' : component.status === 'error' ? 'error' : ''}" data-component-ref="${key}-${ability.id}-${index}" onclick="openComponent('${key}','${ability.id}',${index})" draggable="true" ondragstart="startContextDrag(event,'${ref}')" ondragend="endContextDrag(event)" aria-label="查看${esc(component.name)}详情，${esc(componentStatusLabel(component))}，或拖入助手分析">
-          <span class="ct-top"><span class="ct-type">${esc(componentTypeLabel(component))}</span><span class="ct-state" aria-hidden="true"></span><span class="ct-status-label">${esc(componentStatusLabel(component))}</span></span><h3>${esc(component.name)}</h3><p>${esc(shortSentence(component.desc))}</p>
-        </button>`; }).join('') : '<div class="component-empty">当前快照没有发现对应组件。</div>'}</div>
-        ${remaining ? `<button type="button" class="component-more" onclick="showMoreComponents()">继续展开 ${remaining} 个组件 ↓</button>` : ''}
-        <div class="ability-utilities">${utilities}</div></div>
-        ${community.length ? `<div class="community-shelf"><div class="community-shelf-head"><div><span>社区目录</span><b>候选与本次安装回读分开显示</b></div><button id="open-community-library" type="button" onclick="openLibrary('community')">查看全部社区候选 →</button></div><div class="community-mini-grid">${community.map((item) => { const installed = state.verifiedInstalls[item.packageName]; const pendingInstall = hasRestoredPendingRefresh('pluginInstall', item.packageName); return `<a href="${item.repo}" target="_blank" rel="noopener" class="community-mini"><span>${pendingInstall ? '社区 · 安装状态待核验' : installed ? `社区 · 已安装并回读 v${esc(installed.version)}` : '社区 · 未安装'}</span><h3>${esc(item.name)}</h3><p>${esc(item.desc)}</p></a>`; }).join('')}</div></div>` : ''}
-      </section>`;
-    }
     return bc([{ t: '能力配置', fn: 'goWorkshop()' }, { t: module.name }]) + `<div class="spatial-workbench">
-      <div class="spatial-head"><div class="page-head"><h1 class="page-title">${module.name}模块 <span class="tag cy">${module.en}</span></h1><div class="page-sub">选择一项能力，再查看它实际由哪些插件、Skill、工具和提示词组成。</div><button type="button" class="module-assistant-button" data-assistant-source-ref="${moduleContextRef(key)}" onclick="attachAssistantContext('${moduleContextRef(key)}')">把整个模块交给助手分析</button></div><nav class="module-dock" aria-label="切换能力模块">${dock}</nav></div>
+      <div class="spatial-head"><div class="page-head"><h1 class="page-title">${module.name}模块 <span class="tag cy">${module.en}</span></h1><div class="page-sub">选择一项能力，先看每个组件负责哪一步，再查看完整配置或交给助手分析。</div><button type="button" class="module-assistant-button" data-assistant-source-ref="${esc(moduleContextRef(key))}" onclick="attachAssistantContext(${inlineJsString(moduleContextRef(key))})">把整个模块交给助手分析</button></div><nav class="module-dock" aria-label="切换能力模块">${dock}</nav></div>
       <details class="term-guide"><summary>插件、Skill、工具、提示词分别是什么？</summary><div><span><b>插件</b>装进 DSH 的功能零件</span><span><b>Skill</b>AI 需要时读取的做事说明</span><span><b>工具</b>AI 可以实际调用的动作入口</span><span><b>提示词</b>告诉 AI 身份、规则和做事方式的文字</span></div></details>
-      <section class="capability-orbit" aria-label="${module.name}模块的能力分布"><div class="module-core"><span class="mc-icon">${module.icon}</span><h2>${module.name}</h2><p>${module.desc}</p><small>${abilities.length} 类能力 · ${componentTotal} 个组件</small></div><div class="orbit-nodes">${abilityNodes}</div><div class="orbit-hint">选择周围一项能力，展开它的真实组件</div></section>
-      ${unfold}
-    </div>${state.componentDetail ? renderComponentDrawer() : ''}${state.libraryOpen ? renderLibraryDrawer() : ''}`;
+      <section class="capability-orbit" aria-label="${module.name}模块的能力分布"><div class="module-core"><span class="mc-icon">${module.icon}</span><h2>${module.name}</h2><p>${module.question}：${module.desc}</p><small>${abilities.length} 类能力 · ${componentTotal} 个组件</small></div><div class="orbit-nodes">${abilityNodes}</div><div class="orbit-hint">选择周围一项能力，展开它的真实组件</div></section>
+    </div>${state.componentDetail ? renderComponentDrawer() : ''}${state.libraryOpen ? renderLibraryDrawer() : ''}${state.communityDetail ? renderCommunityDialog() : ''}`;
   }
 
   function findComponentDetail() {
-    if (!state.componentDetail) return null;
-    const [moduleKey, capabilityId, indexText] = state.componentDetail.split(':');
-    const ability = CAPABILITIES[moduleKey]?.find((item) => item.id === capabilityId);
-    const component = ability?.components[Number(indexText)];
-    return component ? { moduleKey, ability, component } : null;
+    return state.componentDetail ? componentLocationFromRef(state.componentDetail) : null;
+  }
+
+  function linkedPresetToolRow(entry) {
+    const prefix = 'include:agent-presets:';
+    if (!entry?.entryId?.startsWith(prefix)) return null;
+    const rowId = entry.entryId.slice(prefix.length);
+    return presetToolRows().find((row) => row.id === rowId && row.moduleName === entry.moduleName) || null;
+  }
+
+  function pluginEntryPresentation(entry) {
+    const presetRow = linkedPresetToolRow(entry);
+    const isPruner = /tool-result-pruner/.test(`${entry?.entryId} ${entry?.moduleName}`);
+    if (presetRow) {
+      return {
+        title: isPruner ? '当前 Agent 使用它来缩短结果' : '当前 Agent 使用这个工具',
+        scope: '当前 Agent 角色卡',
+        description: isPruner
+          ? `当前 Agent 用它缩短过长结果；现在${entry.enabled ? '已开启' : '已关闭'}。`
+          : `当前 Agent 可以从这里使用这项能力；现在${entry.enabled ? '已开启' : '已关闭'}。`,
+        presetRow,
+      };
+    }
+    if (entry?.entryId?.startsWith('include:')) {
+      return {
+        title: isPruner ? 'DSH 后台也会使用它' : 'DSH 后台使用这个插件',
+        scope: 'DSH 后台',
+        description: isPruner
+          ? `后台可以独立使用结果缩短能力；现在${entry.enabled ? '已开启' : '已关闭'}。`
+          : `后台会从这里启动插件；现在${entry.enabled ? '已开启' : '已关闭'}。`,
+        presetRow: null,
+      };
+    }
+    return {
+      title: '系统自动使用这个插件',
+      scope: '系统自动管理',
+      description: `由 DSH 自动启动；现在${entry?.enabled ? '已开启' : '已关闭'}。`,
+      presetRow: null,
+    };
+  }
+
+  function toolConfigLabel(key) {
+    return ({ thresholdChars: '开始裁剪长度', headChars: '保留开头', tailChars: '保留结尾' })[key] || key;
+  }
+
+  function toolConfigUnit(key, value) {
+    return typeof value === 'number' && /chars$/i.test(key) ? '字符' : '';
+  }
+
+  function pendingPresetEntryCandidate(rowId) {
+    const candidate = state.assistantTask?.candidate;
+    return candidate?.kind === 'preset-patch' && candidate.key === 'presetToolPatch' && candidate.expectedValue?.rowId === rowId && candidate.status === 'draft'
+      ? candidate
+      : null;
+  }
+
+  function isHostRootLoaderEntry(entry) {
+    return Boolean(entry?.entryId?.startsWith('include:')
+      && !entry.entryId.startsWith('include:agent-presets')
+      && entry.scope === 'Web Profile / Host');
+  }
+
+  function normalizeMutableLoaderEntries(rows) {
+    if (!Array.isArray(rows) || rows.length > 2_000) return [];
+    const seen = new Set();
+    return rows.map((row) => {
+      if (!row || typeof row !== 'object') return null;
+      const entryId = String(row.entryId || '').trim();
+      const moduleName = String(row.moduleName || '').trim();
+      if (!/^include:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(entryId) || !moduleName || moduleName.length > 300) return null;
+      const identity = `${entryId}\u0000${moduleName}`;
+      if (seen.has(identity)) return null;
+      seen.add(identity);
+      return { entryId, moduleName };
+    }).filter(Boolean);
+  }
+
+  function loaderEntryManagementReady(entry) {
+    if (!entry || state.pluginManagementCapability.status !== 'ready') return false;
+    return state.pluginManagementCapability.mutableEntries.some((row) => row.entryId === entry.entryId && row.moduleName === entry.moduleName);
+  }
+
+  function currentLoaderEntryAction(identity) {
+    return state.loaderEntryAction?.identity === identity ? state.loaderEntryAction : null;
+  }
+
+  function expectedLoaderTargetId(entryId) {
+    return `loader-entry:web:${encodeURIComponent(entryId)}`;
+  }
+
+  function normalizeLoaderBridgeValue(value, entry, requireActive = false) {
+    if (!value || typeof value !== 'object' || value.entryId !== entry.entryId || value.moduleName !== entry.moduleName || typeof value.enabled !== 'boolean') return null;
+    const fiberPhase = value.fiberPhase == null ? null : String(value.fiberPhase).slice(0, 40);
+    if (requireActive && value.enabled && fiberPhase !== 'active') return null;
+    return { entryId: value.entryId, moduleName: value.moduleName, enabled: value.enabled, fiberPhase };
+  }
+
+  function normalizeLoaderBridgeReceipt(raw, entry, phase, desiredEnabled) {
+    if (!raw || raw.ok !== true || raw.targetId !== expectedLoaderTargetId(entry.entryId) || !/^sha256:[a-f0-9]{64}$/i.test(String(raw.targetRevision || ''))) return null;
+    const canonicalValue = normalizeLoaderBridgeValue(raw.canonicalValue, entry, phase === 'apply' && desiredEnabled === true);
+    if (!canonicalValue) return null;
+    if (phase === 'preflight') {
+      if (raw.mutable !== true || raw.scope !== 'web-profile-root-loader-entry' || raw.desiredValue?.enabled !== desiredEnabled) return null;
+    } else {
+      const readbackValue = normalizeLoaderBridgeValue(raw.readback?.canonicalValue || raw.readback, entry, desiredEnabled === true);
+      if (raw.applied !== true || !String(raw.evidenceRef || '').trim() || !readbackValue || !canonicalValueEqual(readbackValue, canonicalValue) || canonicalValue.enabled !== desiredEnabled) return null;
+    }
+    return { targetId: raw.targetId, targetRevision: raw.targetRevision, canonicalValue, evidenceRef: String(raw.evidenceRef || '').slice(0, 240) };
+  }
+
+  function renderLoaderEntryAction(entry, identity, index) {
+    const action = currentLoaderEntryAction(identity);
+    const hostRoot = isHostRootLoaderEntry(entry);
+    const capability = state.pluginManagementCapability;
+    const enabledLabel = entry.enabled ? '停用' : '启用';
+    const anotherEntryApplying = state.loaderEntryAction?.status === 'applying' && state.loaderEntryAction.identity !== identity;
+    let control;
+    if (!hostRoot) {
+      control = `<button type="button" class="entry-state-action" disabled aria-describedby="loader-bridge-${index}">${enabledLabel}</button><span id="loader-bridge-${index}" class="entry-action-gate">这个位置由系统自动管理</span>`;
+    } else if (loaderEntryManagementReady(entry)) {
+      control = `<button type="button" class="entry-state-action" data-loader-command="request" data-loader-action-ref="${esc(identity)}" ${action?.status === 'applying' || anotherEntryApplying ? `disabled${action?.status === 'applying' ? ' aria-busy="true"' : ''}` : ''}>${action?.status === 'applying' ? '写入回读中…' : enabledLabel}</button>`;
+    } else {
+      const checking = capability.status === 'checking';
+      const protectedEntry = capability.status === 'ready';
+      const gate = checking ? '正在核对管理能力' : protectedEntry ? '当前只能查看，不能修改' : '尚未连接后台管理能力';
+      control = `<button type="button" class="entry-state-action" disabled aria-describedby="loader-bridge-${index}">${checking ? '检测中…' : enabledLabel}</button><span id="loader-bridge-${index}" class="entry-action-gate">${gate}</span>`;
+    }
+    const confirm = action?.status === 'confirm' ? `<div class="loader-entry-confirm"><div><b>确认${action.desiredEnabled ? '启用' : '停用'}这个使用位置？</b><span>只改变当前这一处；同一插件的其他使用位置不受影响。</span></div><div><button type="button" data-loader-command="cancel" data-loader-action-ref="${esc(identity)}">取消</button><button type="button" class="primary" data-loader-command="apply" data-loader-action-ref="${esc(identity)}">确认${action.desiredEnabled ? '启用' : '停用'}并回读</button></div></div>` : '';
+    const outcome = action && ['success', 'error', 'unknown'].includes(action.status)
+      ? `<div class="loader-entry-outcome ${action.status}" role="status" aria-live="polite" tabindex="-1"><b>${action.status === 'success' ? '已写入并回读' : action.status === 'unknown' ? '当前状态未知' : '未修改'}</b><span>${esc(action.message)}</span>${action.status === 'unknown' ? '<button type="button" data-loader-command="reload">刷新页面重新读取</button>' : ''}</div>`
+      : '';
+    return { control, confirm, outcome };
+  }
+
+  function renderPluginEntry(component, entry, index) {
+    const presentation = pluginEntryPresentation(entry);
+    const presetRow = presentation.presetRow;
+    const identity = entry.identity || loaderEntryIdentity(component.familyId || component.tech, entry);
+    const targetId = `loader-entry:web:${encodeURIComponent(entry.entryId)}`;
+    const candidate = presetRow ? pendingPresetEntryCandidate(presetRow.id) : null;
+    const loaderAction = presetRow ? null : renderLoaderEntryAction(entry, identity, index);
+    const presetWritable = Boolean(presetRow && presetCompositionMutationReady(presetCandidateTarget(`tools/${encodeURIComponent(presetRow.id)}`)));
+    const statusLabel = entry.enabled ? (entry.fiberPhase === 'active' ? '已启用 · 运行中' : '已启用 · 待运行') : '未启用';
+    const editableConfig = presetRow ? Object.entries(presetRow.config || {}).filter(([key]) => !isSensitiveToolConfigKey(key)) : [];
+    const draftConfig = presetRow ? (state.quickToolEdits[presetRow.id] || presetRow.config || {}) : {};
+    return `<article class="plugin-entry-card ${entry.enabled ? 'enabled' : ''}" data-loader-entry-ref="${esc(identity)}" data-loader-target="${esc(targetId)}">
+      <div class="plugin-entry-head"><span class="plugin-entry-index">${String(index + 1).padStart(2, '0')}</span><div><h3>${esc(presentation.title)}</h3><p>${esc(presentation.description)}</p></div><span class="tag ${entry.enabled ? (entry.fiberPhase === 'active' ? 'ok' : 'warn') : ''}">${esc(statusLabel)}</span></div>
+      <details class="plugin-entry-technical"><summary>查看技术信息</summary><dl class="plugin-entry-facts"><div><dt>作用范围</dt><dd>${esc(presentation.scope)}</dd></div><div><dt>技术入口</dt><dd class="mono">${esc(entry.entryId)}</dd></div><div><dt>实现模块</dt><dd class="mono">${esc(entry.moduleName)}</dd></div>${entry.fiberPhase ? `<div><dt>运行状态</dt><dd class="mono">${esc(entry.fiberPhase)}</dd></div>` : ''}</dl></details>
+      <div class="plugin-entry-actions">
+        <div><b>单独开关</b><small>${presetRow ? (presetWritable ? '只改变当前 Agent 的这个使用位置，不会卸载插件或影响其他位置。' : '这是当前 Agent 的真实使用位置，但本机暂未开放角色卡写入。') : loaderEntryManagementReady(entry) && isHostRootLoaderEntry(entry) ? '确认后只改变当前这一处，并重新读取结果。' : state.pluginManagementCapability.status === 'ready' && isHostRootLoaderEntry(entry) ? '这一处受系统保护，目前只能查看；可交给助手判断影响。' : '这一处由系统自动管理，目前只能查看。'}</small></div>
+        ${presetRow
+          ? `<button type="button" class="entry-state-action" onclick="preparePluginPresetState(${inlineJsString(presetRow.id)},${!presetRow.enabled})" ${presetWritable ? '' : 'disabled'}>${presetWritable ? (presetRow.enabled ? '停用' : '启用') : '当前只读'}</button>`
+          : loaderAction.control}
+      </div>
+      ${loaderAction?.confirm || ''}${loaderAction?.outcome || ''}
+      ${candidate ? `<div class="entry-candidate-note" role="status"><b>更改候选已就绪</b><span>${esc(candidate.title)}；当前状态还没有改变。</span><button type="button" onclick="openPluginCandidate()">查看测试与确认</button></div>` : ''}
+      ${editableConfig.length ? `<div class="plugin-entry-config"><div class="plugin-entry-config-head"><div><b>这个位置的参数</b><small>${presetWritable ? '参数只影响当前 Agent。' : '真实参数只读展示；本机暂未开放角色卡写入。'}</small></div><button type="button" onclick="preparePluginPresetConfig(${inlineJsString(presetRow.id)})" ${presetWritable ? '' : 'disabled'}>${presetWritable ? '保存参数候选' : '当前只读'}</button></div><div class="plugin-entry-config-grid">${editableConfig.map(([key, value]) => `<label><span>${esc(toolConfigLabel(key))}</span><span class="plugin-config-input"><input value="${esc(draftConfig[key] ?? value)}" inputmode="${typeof value === 'number' ? 'numeric' : 'text'}" oninput="updateQuickToolConfig(${inlineJsString(presetRow.id)},${inlineJsString(key)},this.value)" aria-label="${esc(presentation.title)} ${esc(toolConfigLabel(key))}" ${presetWritable ? '' : 'disabled'}>${toolConfigUnit(key, value) ? `<em>${esc(toolConfigUnit(key, value))}</em>` : ''}</span><small class="mono">${esc(key)}</small></label>`).join('')}</div></div>` : ''}
+    </article>`;
+  }
+
+  function renderNativePluginDialog(found) {
+    const { moduleKey, ability, component } = found;
+    const contextRef = componentContextRef(moduleKey, ability.id, component);
+    const runningCount = component.entries?.filter((entry) => entry.enabled && entry.fiberPhase === 'active').length || 0;
+    const entryCount = component.entries?.length || 0;
+    const displayName = beginnerComponentName(component.name);
+    const descriptionId = `plugin-dialog-desc-${stableContentHash(contextRef)}`;
+    return `<div class="plugin-dialog-layer" data-dialog-layer="component" onclick="closePluginDialogFromBackdrop(event,'component')"><section class="plugin-dialog native-plugin-dialog" role="dialog" aria-modal="true" aria-labelledby="plugin-dialog-title" aria-describedby="${descriptionId}" tabindex="-1">
+      <header class="plugin-dialog-head"><div class="plugin-dialog-title"><span class="type-ico plugin">P</span><div><span>原生插件</span><h2 id="plugin-dialog-title">${esc(displayName)}</h2><details class="inline-tech-name"><summary>技术名称</summary><p class="mono">${esc(component.tech)}</p></details></div></div><button type="button" class="plugin-dialog-close" onclick="closeComponent()" aria-label="关闭${esc(displayName)}详情">✕</button></header>
+      <div class="plugin-dialog-body">
+        <div class="plugin-package-summary"><div><b>1 个插件 · ${entryCount} 个使用位置</b><span>${component.enabledEntryCount || 0} 个已开启 · ${runningCount} 个正在运行</span></div><span class="tag ${runningCount ? 'ok' : component.enabledEntryCount ? 'warn' : ''}">${esc(componentStatusLabel(component))}</span></div>
+        <p id="${descriptionId}" class="plugin-package-explain">${esc(beginnerUiCopy(component.desc))}</p>
+        ${entryCount > 1 ? `<div class="plugin-entry-clarifier"><b>这是同一个插件。</b><span>下面是它的 ${entryCount} 个使用位置，可以分别开关。</span></div>` : ''}
+        <div class="plugin-entry-list" aria-label="${esc(displayName)}的使用位置">${(component.entries || []).map((entry, index) => renderPluginEntry(component, entry, index)).join('')}</div>
+        <div class="plugin-lifecycle-note"><b>三个状态</b><span>已安装、某个位置已开启、当前 Agent 正在使用，三者不同。</span></div>
+      </div>
+      <footer class="plugin-dialog-foot"><button type="button" class="secondary" data-assistant-source-ref="${esc(contextRef)}" onclick="attachAssistantContext(${inlineJsString(contextRef)})">交给助手分析</button><button type="button" class="primary" onclick="closeComponent()">完成</button></footer>
+    </section></div>`;
   }
 
   function renderTechnicalEntries(component) {
@@ -1672,7 +3265,7 @@
     const itemLabel = component.type === 'plugin' ? '加载记录' : '动作入口';
     return `<div class="detail-sec"><details class="technical-entries"><summary>查看 ${component.entries.length} 条${itemLabel}</summary><div class="technical-entry-list">${component.entries.map((entry) => {
       const config = Object.entries(entry.config || {});
-      return `<article class="technical-entry"><div class="te-head"><b>${esc(entry.entryId)}</b><span class="tag ${entry.enabled ? 'ok' : ''}">${entry.enabled ? '已启用' : '未启用'}</span></div><div class="mono">${esc(entry.moduleName)}</div><small>${esc(entry.scope || '未记录')}${entry.fiberPhase ? ` · Fiber ${esc(entry.fiberPhase)}` : ''}</small>${config.length ? `<div class="te-config">${config.map(([key, value]) => `<span>${esc(key)}=${esc(value)}</span>`).join('')}</div>` : ''}</article>`;
+      return `<article class="technical-entry"><div class="te-head"><b>${esc(entry.entryId)}</b><span class="tag ${entry.enabled ? 'ok' : ''}">${entry.enabled ? '已启用' : '未启用'}</span></div><div class="mono">${esc(entry.moduleName)}</div><small>${esc(beginnerUiCopy(entry.scope || '未记录'))}${entry.fiberPhase ? ` · 运行状态 ${esc(entry.fiberPhase)}` : ''}</small>${config.length ? `<div class="te-config">${config.map(([key, value]) => `<span>${esc(key)}=${esc(value)}</span>`).join('')}</div>` : ''}</article>`;
     }).join('')}</div></details></div>`;
   }
 
@@ -1680,27 +3273,85 @@
     const found = findComponentDetail();
     if (!found) return '';
     const { moduleKey, ability, component } = found;
+    if (component.type === 'plugin') return renderNativePluginDialog(found);
     const meta = TYPE_META[component.type];
     const contextRef = componentContextRef(moduleKey, ability.id, component);
     const configRows = Object.entries(component.config || {});
     return `<div class="drawer-mask" onclick="closeComponent()"></div><aside class="drawer" role="dialog" aria-modal="true" tabindex="-1" aria-label="组件详情"><button class="d-close" onclick="closeComponent()" aria-label="关闭">✕</button>
-      <h3><span class="type-ico ${component.type}">${meta.short}</span>${esc(component.name)}</h3>
+      <h3><span class="type-ico ${component.type}">${meta.short}</span>${esc(beginnerComponentName(component.name))}</h3>
       <div class="comp-drawer-path">${MODULES[moduleKey].name} → ${ability.name} → ${meta.label}</div>
-      <div class="plain-explain"><b>它负责什么：</b>${esc(component.desc)}</div>
+      <div class="plain-explain"><b>它负责什么：</b>${esc(beginnerUiCopy(component.desc))}</div>
       <div class="detail-sec"><h4>真实状态</h4>
         <div class="detail-line"><b>当前状态</b><span class="tag ${component.status === 'using' ? 'ok' : component.status === 'error' ? 'warn' : ''}">${esc(componentStatusLabel(component))}</span></div>
-        <div class="detail-line"><b>证据来源</b><span>${esc(component.evidence)}</span></div>
-        <div class="detail-line"><b>所在层</b><span>${esc(component.scope || '未记录')}</span></div>
+        <div class="detail-line"><b>信息来源</b><span>${esc(beginnerUiCopy(component.evidence))}</span></div>
+        <div class="detail-line"><b>使用位置</b><span>${esc(beginnerUiCopy(component.scope || '未记录'))}</span></div>
         <div class="detail-line"><b>技术名称</b><span class="mono">${esc(component.tech)}</span></div>
         ${component.entryId && !component.entries?.length ? `<div class="detail-line"><b>唯一标识</b><span class="mono">${esc(component.entryId)}</span></div>` : ''}
         ${component.provider ? `<div class="detail-line"><b>提供插件</b><span class="mono">${esc(component.provider)}</span></div>` : ''}
-        ${component.phase ? `<div class="detail-line"><b>Fiber 状态</b><span class="mono">${esc(component.phase)}</span></div>` : ''}
+        ${component.phase ? `<div class="detail-line"><b>运行状态</b><span class="mono">${esc(component.phase)}</span></div>` : ''}
       </div>
       ${renderTechnicalEntries(component)}
-      ${configRows.length ? `<div class="detail-sec"><h4>Preset 中的实际参数</h4>${configRows.map(([key, value]) => `<div class="detail-line"><b>${esc(key)}</b><span class="mono">${esc(value)}</span></div>`).join('')}</div>` : ''}
-      <button type="button" class="drawer-assistant-action" data-assistant-source-ref="${contextRef}" onclick="attachAssistantContext('${contextRef}')">交给助手分析</button>
-      <div class="note-bar">这里只展示回读结果，不会修改 DSH。刷新本机快照后可查看最新组件状态。</div>
+      ${configRows.length ? `<div class="detail-sec"><h4>当前角色卡中的参数</h4>${configRows.map(([key, value]) => `<div class="detail-line"><b>${esc(key)}</b><span class="mono">${esc(value)}</span></div>`).join('')}</div>` : ''}
+      <button type="button" class="drawer-assistant-action" data-assistant-source-ref="${esc(contextRef)}" onclick="attachAssistantContext(${inlineJsString(contextRef)})">交给助手分析</button>
+      <div class="note-bar">这里只查看当前状态，不会修改配置。</div>
     </aside>`;
+  }
+
+  function liveCommunityCandidate(packageName) {
+    return state.assistantTask?.pluginCandidates?.find((item) => item.packageName === packageName && item.liveVerified === true) || null;
+  }
+
+  function renderCommunityDialog() {
+    const item = COMMUNITY_COMPONENTS.find((candidate) => candidate.packageName === state.communityDetail);
+    if (!item) return '';
+    const installed = state.verifiedInstalls[item.packageName];
+    const pendingInstall = hasRestoredPendingRefresh('pluginInstall', item.packageName);
+    const installState = state.communityInstallState?.packageName === item.packageName ? state.communityInstallState : null;
+    const liveCandidate = liveCommunityCandidate(item.packageName);
+    const preparedCandidate = state.assistantTask?.candidate?.kind === 'plugin' && state.assistantTask.candidate.packageName === item.packageName
+      ? state.assistantTask.candidate
+      : null;
+    const checking = installState?.status === 'checking';
+    const metadataReady = communitySearchReady();
+    const packageCapability = state.packageInstallCapability;
+    const packageInstallReady = packageCapability.status === 'ready'
+      && Boolean(window.DS_HUB_PLUGIN_ADAPTER && typeof window.DS_HUB_PLUGIN_ADAPTER.capabilities === 'function');
+    const installPlanningReady = metadataReady && packageInstallReady;
+    let action = `<button type="button" class="primary community-install-cta" disabled aria-describedby="community-bridge-gate">检查后安装</button>`;
+    if (preparedCandidate) action = '<button type="button" class="primary community-install-cta" onclick="openCommunityInstallCandidate()">查看安装测试方案</button>';
+    else if (installed) action = '<button type="button" class="primary community-install-cta" disabled>已安装并回读</button>';
+    else if (pendingInstall) action = '<button type="button" class="primary community-install-cta" disabled>安装状态待核验</button>';
+    else if (checking) action = '<button type="button" class="primary community-install-cta" disabled aria-busy="true">正在核验来源…</button>';
+    else if (packageCapability.status === 'checking') action = '<button type="button" class="primary community-install-cta" disabled aria-busy="true" aria-describedby="community-bridge-gate">正在检查安装能力…</button>';
+    else if (installPlanningReady) action = `<button type="button" class="primary community-install-cta" onclick="installCommunityFromDialog(${inlineJsString(item.id)})">检查后安装</button>`;
+    const permissions = liveCandidate?.permissions || [];
+    const dataEgress = liveCandidate?.dataEgress || [];
+    const verifiedVersion = installed?.version || liveCandidate?.version || '';
+    const verifiedVersionKind = installed ? '安装回读版本' : '实时核验版本';
+    const installMessage = preparedCandidate
+      ? `安装方案 ${preparedCandidate.packageName}@${preparedCandidate.version} 已就绪；尚未下载、安装或启用。`
+      : installState?.message
+        || (packageCapability.status === 'checking'
+          ? '正在核对本机是否开放第三方包安装。'
+          : !metadataReady
+            ? '需连接社区核验服务，才能检查来源并准备安装方案。'
+            : !packageInstallReady
+              ? `${packageCapability.message || '本机桥尚未开放第三方包安装'}；可以查看审计信息，暂不能准备安装方案。`
+              : '点击“检查后安装”会先核验固定版本、源码、许可证、兼容性、权限和数据外发。');
+    return `<div class="plugin-dialog-layer" data-dialog-layer="community" onclick="closePluginDialogFromBackdrop(event,'community')"><section class="plugin-dialog community-plugin-dialog" role="dialog" aria-modal="true" aria-labelledby="community-dialog-title" aria-describedby="community-dialog-desc" tabindex="-1">
+      <header class="plugin-dialog-head"><div class="plugin-dialog-title"><span class="type-ico community-plugin-icon">G</span><div><span>社区插件</span><h2 id="community-dialog-title">${esc(item.name)}</h2><p class="mono">${esc(item.packageName)}</p></div></div><button type="button" class="plugin-dialog-close" onclick="closeCommunityDetail()" aria-label="关闭${esc(item.name)}详情">✕</button></header>
+      <div class="plugin-dialog-body">
+        <div class="community-dialog-status"><span class="source-badge community">社区开源</span><span class="install-state ${installed ? 'installed' : ''}">${pendingInstall ? '安装状态待核验' : installed ? '已安装并回读' : '候选未实装'}</span></div>
+        <p id="community-dialog-desc" class="community-dialog-desc">${esc(item.desc)}</p>
+        <dl class="community-dialog-facts"><div><dt>包名</dt><dd class="mono">${esc(item.packageName)}</dd></div>${verifiedVersion ? `<div><dt>${verifiedVersionKind}</dt><dd>v${esc(verifiedVersion)}</dd></div>` : ''}<div><dt>目录固定版本</dt><dd>v${esc(item.version)}</dd></div><div><dt>npm 最新版本</dt><dd>v${esc(item.latestVersion)}</dd></div><div><dt>版本状态</dt><dd>${esc(item.versionStatus)}</dd></div><div><dt>许可证</dt><dd>${esc(liveCandidate?.license || item.license)}</dd></div><div><dt>目录来源记录</dt><dd>${esc(item.provenanceReview)}</dd></div><div><dt>目录兼容性备注</dt><dd>${esc(item.localCompatibility)}</dd></div>${liveCandidate ? `<div><dt>实时兼容核验</dt><dd>${esc(liveCandidate.compatibility)}</dd></div>` : ''}<div><dt>目录更新时间</dt><dd>${esc(item.auditedAt)}</dd></div><div><dt>下载统计</dt><dd>2026-08-20 至 08-26 · ${formatNumber(item.downloads)} 次</dd></div><div><dt>所在能力</dt><dd>${esc(MODULES[item.moduleKey].name)} → ${esc(CAPABILITIES[item.moduleKey]?.find((ability) => ability.id === item.capabilityId)?.name || item.capabilityId)}</dd></div></dl>
+        <div class="community-dialog-section"><h3>它会做什么</h3><p>${esc(item.desc)}</p></div>
+        <div class="community-dialog-section risk"><h3>安装前注意</h3><p>${esc(liveCandidate?.risk || item.risk)}</p></div>
+        <div class="community-security-grid"><div><h3>权限</h3>${liveCandidate ? (permissions.length ? `<ul>${permissions.map((value) => `<li>${esc(value)}</li>`).join('')}</ul>` : '<p>实时声明：无额外权限。</p>') : '<p>目录未作安全声明；进入安装检查后再实时核验。</p>'}</div><div><h3>数据外发</h3>${liveCandidate ? (dataEgress.length ? `<ul>${dataEgress.map((value) => `<li>${esc(value)}</li>`).join('')}</ul>` : '<p>实时声明：无数据外发。</p>') : '<p>目录未作安全声明；核验不完整时不会创建安装方案。</p>'}</div></div>
+        <div class="community-source-links"><a href="https://www.npmjs.com/package/${encodeURIComponent(item.packageName)}" target="_blank" rel="noopener noreferrer">npm 包 ↗</a><a href="${esc(item.repo)}" target="_blank" rel="noopener noreferrer">源码仓库 ↗</a>${liveCandidate?.versionEvidenceUrl ? `<a href="${esc(liveCandidate.versionEvidenceUrl)}" target="_blank" rel="noopener noreferrer">版本证据 ↗</a>` : ''}${liveCandidate?.compatibilityEvidenceUrl ? `<a href="${esc(liveCandidate.compatibilityEvidenceUrl)}" target="_blank" rel="noopener noreferrer">兼容性证据 ↗</a>` : ''}</div>
+        <div id="community-bridge-gate" class="community-install-status ${installState?.status === 'error' ? 'error' : preparedCandidate ? 'ready' : ''}" role="status" aria-live="polite">${esc(installMessage)}</div>
+      </div>
+      <footer class="plugin-dialog-foot community-dialog-foot"><div><b>准备安装方案</b><span>安装能力开放后仍会先检查来源与兼容性；不会静默启用到当前 Agent。</span></div>${action}</footer>
+    </section></div>`;
   }
 
   function renderLibraryDrawer() {
@@ -1713,12 +3364,12 @@
     return `<div class="drawer-mask" onclick="closeLibrary()"></div><aside class="drawer wide-drawer" role="dialog" aria-modal="true" tabindex="-1" aria-label="全部组件">
       <button class="d-close" onclick="closeLibrary()" aria-label="关闭">✕</button><h3>组件库</h3>
       <div class="library-tabs" aria-label="组件来源"><button type="button" aria-pressed="${!isCommunity}" class="${!isCommunity ? 'on' : ''}" onclick="setLibraryTab('native')">当前 DSH <span>${ALL_COMPONENTS.length}</span></button><button type="button" aria-pressed="${isCommunity}" class="${isCommunity ? 'on' : ''}" onclick="setLibraryTab('community')">社区预置 <span>${COMMUNITY_COMPONENTS.length}</span></button></div>
-      ${!isCommunity ? `<div class="d-sub">${counts.plugin} 个插件包：快照含 ${PLUGIN_GROUPS.length} 个，${verifiedInstallCount ? `另有 ${verifiedInstallCount} 个来自本次安装双重回读；` : ''}DSH 快照含 ${SNAPSHOT.plugins.length} 条 Loader 加载记录。</div><div class="library-counts"><span>插件包 ${counts.plugin}</span><span>Skill ${counts.skill}</span><span>工具 ${counts.tool}</span><span>提示词来源 ${counts.prompt}</span></div>` : `<div class="d-sub">来自开源社区的候选目录；${verifiedInstallCount ? `${verifiedInstallCount} 个已在本次会话完成安装清单与活动 Inventory 双重回读，其余仍未安装。` : '当前均未安装，不能视为 Agent 能力。'}</div>`}
+      ${!isCommunity ? `<div class="d-sub">${counts.plugin} 个插件：当前共发现 ${SNAPSHOT.plugins.length} 个使用位置。${verifiedInstallCount ? `另有 ${verifiedInstallCount} 个来自本次安装回读。` : ''}</div><div class="library-counts"><span>插件 ${counts.plugin}</span><span>Skill ${counts.skill}</span><span>工具 ${counts.tool}</span><span>提示词来源 ${counts.prompt}</span></div>` : `<div class="d-sub">来自开源社区的候选目录；${verifiedInstallCount ? `${verifiedInstallCount} 个已在本次会话完成安装回读，其余仍未安装。` : '当前均未安装，不能视为 Agent 能力。'}</div>`}
       <input class="library-search" value="${esc(state.libraryQuery)}" oninput="filterLibrary(this.value,event)" oncompositionend="filterLibrary(this.value,event)" placeholder="${isCommunity ? '搜索社区插件或用途' : '搜索中文作用、技术名或 entryId'}" aria-label="搜索组件">
       <div class="library-result-note">找到 ${isCommunity ? communityRows.length : nativeRows.length} 个${isCommunity ? '社区候选' : '本机组件'}。</div>
       ${isCommunity
-        ? (communityRows.length ? `<div class="community-library">${communityRows.map((item) => { const installed = state.verifiedInstalls[item.packageName]; const pendingInstall = hasRestoredPendingRefresh('pluginInstall', item.packageName); return `<article class="community-card"><div class="community-card-top"><span class="source-badge community">社区开源</span><span class="install-state ${installed ? 'installed' : ''}">${pendingInstall ? '安装状态待核验' : installed ? '已安装并回读' : '未安装'}</span></div><h4>${esc(item.name)}</h4><p>${esc(item.desc)}</p><div class="community-meta"><span>${esc(item.packageName)}</span><span>${pendingInstall ? '当前版本未知' : `v${esc(installed?.version || item.version)}`}</span><span>${esc(item.license)}</span><span>近 7 天 ${formatNumber(item.downloads)} 次下载</span><span>${pendingInstall ? '浏览器标记不作为安装证明' : installed ? 'Manifest + Inventory 已核验' : 'DSH 可安装格式已核对'}</span></div><div class="community-risk"><b>接入前注意</b><span>${esc(item.risk)}</span></div><div class="community-actions"><a href="https://www.npmjs.com/package/${item.packageName}" target="_blank" rel="noopener">npm 包 ↗</a><a href="${item.repo}" target="_blank" rel="noopener">源码 ↗</a><button type="button" onclick="assessCommunity('${item.id}')">AI 评估</button></div></article>`; }).join('')}</div>` : '<div class="note-bar">没有找到匹配的社区候选。</div>')
-        : (nativeRows.length ? nativeRows.map(({ moduleKey, ability, component, index }) => `<button type="button" class="library-row" onclick="openLibraryComponent('${moduleKey}','${ability.id}',${index})"><span class="lr-top"><span class="type-ico ${component.type}">${TYPE_META[component.type].short}</span><span class="lr-name">${esc(component.name)}</span><span class="source-badge native">当前回读</span><span class="tag ${component.status === 'using' ? 'ok' : component.status === 'error' ? 'warn' : ''}">${esc(componentStatusLabel(component))}</span></span><span class="cr-tech" style="margin:6px 0 0 42px">${esc(component.tech)}${component.entryCount > 1 ? ` · ${component.entryCount} 条${component.type === 'plugin' ? '加载记录' : '入口'}` : (component.entryId ? ` · ${esc(component.entryId)}` : '')}</span><span class="lr-path" style="margin-left:42px">${MODULES[moduleKey].name} → ${ability.name} · ${esc(component.evidence)} · 点击查看详情</span></button>`).join('') : '<div class="note-bar">没有找到匹配组件。</div>')}
+        ? (communityRows.length ? `<div class="community-library">${communityRows.map((item) => { const installed = state.verifiedInstalls[item.packageName]; const pendingInstall = hasRestoredPendingRefresh('pluginInstall', item.packageName); return `<article class="community-card"><button type="button" class="community-card-open" data-community-ref="${esc(item.packageName)}" onclick="openCommunityDetail(${inlineJsString(item.id)},'library')" aria-label="查看${esc(item.name)}介绍与安装检查"><span class="community-card-top"><span class="source-badge community">社区开源</span><span class="install-state ${installed ? 'installed' : ''}">${pendingInstall ? '安装状态待核验' : installed ? '已安装并回读' : '候选未实装'}</span></span><span class="community-card-name">${esc(item.name)}</span><span class="community-card-desc">${esc(item.desc)}</span><span class="community-meta"><span>${esc(item.packageName)}</span><span>${pendingInstall ? '当前版本未知' : `固定 v${esc(installed?.version || item.version)}`}</span><span>${esc(item.versionStatus)}</span><span>${esc(item.license)}</span><span>08-20 至 08-26 · ${formatNumber(item.downloads)} 次下载</span></span><span class="community-risk"><b>接入前注意</b><span>${esc(item.risk)}</span></span><span class="community-card-cta">查看介绍与安装检查 →</span></button></article>`; }).join('')}</div>` : '<div class="note-bar">没有找到匹配的社区候选。</div>')
+        : (nativeRows.length ? nativeRows.map(({ moduleKey, ability, component, index }) => { const ref = componentContextRef(moduleKey, ability.id, component); return `<button type="button" class="library-row" data-component-ref="${esc(ref)}" onclick="openLibraryComponent('${moduleKey}','${ability.id}',${index})"><span class="lr-top"><span class="type-ico ${component.type}">${TYPE_META[component.type].short}</span><span class="lr-name">${esc(beginnerComponentName(component.name))}</span><span class="source-badge native">当前配置</span><span class="tag ${component.status === 'using' ? 'ok' : component.status === 'error' ? 'warn' : ''}">${esc(componentStatusLabel(component))}</span></span><span class="cr-tech" style="margin:6px 0 0 42px">${esc(component.tech)}${component.entryCount > 1 ? ` · ${component.entryCount} 个${component.type === 'plugin' ? '使用位置' : '入口'}` : (component.entryId ? ` · ${esc(component.entryId)}` : '')}</span><span class="lr-path" style="margin-left:42px">${MODULES[moduleKey].name} → ${ability.name} · 点击查看详情</span></button>`; }).join('') : '<div class="note-bar">没有找到匹配组件。</div>')}
       ${isCommunity ? '<div class="community-disclaimer">热度仅取 2026-08-20 至 08-26 的 npm 下载量；“预置”表示列入候选目录，不代表安全审查通过。安装前仍需检查源码、权限、版本兼容与组件标识冲突。</div>' : ''}
     </aside>`;
   }
@@ -1775,7 +3426,8 @@
     const suite = task.testSuite;
     const comparison = task.comparison;
     const comparisonVerified = Boolean(comparison?.status === 'completed' && comparison.verified && comparison.environmentAligned && comparison.targetAligned);
-    const canAdopt = adoptionReady(task);
+    const targetWritable = Boolean(candidate && configTargetMutationReady(candidate.targetId));
+    const canAdopt = adoptionReady(task) && targetWritable;
     const adoptionActions = state.adoptionConfirming
       ? `<div class="adoption-confirm"><p>把已通过测试的候选用于新任务。将修改“${esc(candidate?.target || candidate?.title || '当前配置')}”，当前正在运行的任务不会改变。确认采用并回读吗？</p><div class="adoption-confirm-actions"><button type="button" onclick="cancelAdoptionConfirm()">取消</button><button type="button" class="primary" onclick="adoptAssistantCandidate()">确认采用并回读</button></div></div>`
       : `<div class="adoption-actions"><button type="button" onclick="abandonAssistantCandidate()" ${!candidate || task.decision ? 'disabled' : ''}>放弃候选</button><button type="button" class="primary" onclick="prepareAdoption()" ${!canAdopt || task.decision ? 'disabled' : ''}>采用候选</button></div>`;
@@ -1794,7 +3446,63 @@
             : state.regressionConfirming ? `<div class="regression-confirm"><p>这会创建隔离会话并产生模型用量。当前与候选都将运行 ${suite?.cases.length || 0} 道题${candidate?.kind === 'plugin' ? `，并在隔离测试配置中准备 ${esc(candidate.packageName)}@${esc(candidate.version)}` : ''}。确认继续吗？</p><button type="button" onclick="cancelRegressionConfirm()">取消</button><button type="button" class="primary" onclick="runAssistantRegression()">确认运行</button></div>`
               : `<div class="trial-empty">${!candidate ? '缺少候选配置。' : !suite ? '缺少固定测试集。' : suite.status !== 'locked' ? '测试集尚未锁定。' : optimizationAdapterReady() && configTargetReaderReady() ? '已具备运行条件；开始前会分别锁定目标配置与模型环境。' : optimizationAdapterReady() ? '回归已连接，但目标配置读取接口尚未连接。' : '回归执行器尚未连接，不会生成虚假的测试结果。'}${candidate && suite?.status === 'locked' ? '<button type="button" onclick="prepareRegression()">准备运行回归</button>' : ''}</div>`}
       </section>
-      <section class="card adoption-section"><div class="adoption-copy"><span>采用决策</span><h2>${task.decision === 'adopted' ? (task.observation?.outcome === 'healthy' ? '已采用，线上观察正常' : task.observation?.outcome === 'degraded' ? '已采用，但线上发现退化' : '已采用，等待线上观察') : task.decision === 'abandoned' ? '已放弃候选' : task.decision === 'unknown' ? '写入状态未知，已停止继续操作' : '由你决定，不自动上线'}</h2><p>${task.decision === 'unknown' ? '写入请求已经发出，但配置版本回读没有确认；不要重复提交，可重新读取当前值辅助人工核对。' : task.decision === 'adopted' ? '回读一致只证明配置写入；必须绑定采用时的配置版本与新任务证据后，才能判断表现。' : canAdopt ? '回归证据满足采用门槛；采用仍会单独确认并在写入后回读。' : '测试集锁定、两边真实运行完成、环境一致且达到测试集通过标准后，才开放采用。'}</p></div>${task.decision ? decidedActions : adoptionActions}</section>`;
+      <section class="card adoption-section"><div class="adoption-copy"><span>采用决策</span><h2>${task.decision === 'adopted' ? (task.observation?.outcome === 'healthy' ? '已采用，线上观察正常' : task.observation?.outcome === 'degraded' ? '已采用，但线上发现退化' : '已采用，等待线上观察') : task.decision === 'abandoned' ? '已放弃候选' : task.decision === 'unknown' ? '写入状态未知，已停止继续操作' : '由你决定，不自动上线'}</h2><p>${task.decision === 'unknown' ? '写入请求已经发出，但配置版本回读没有确认；不要重复提交，可重新读取当前值辅助人工核对。' : task.decision === 'adopted' ? '回读一致只证明配置写入；必须绑定采用时的配置版本与新任务证据后，才能判断表现。' : candidate && state.configManagementCapability.status === 'checking' ? '正在核对本机 DSH 是否允许修改这里，核验完成前不会允许采用。' : candidate && !targetWritable ? '当前 DSH 不允许修改这里；候选可以保留讨论，但不会改变配置。' : canAdopt ? '回归证据满足采用门槛；采用仍会单独确认并在写入后回读。' : '测试集锁定、两边真实运行完成、环境一致且达到测试集通过标准后，才开放采用。'}</p></div>${task.decision ? decidedActions : adoptionActions}</section>`;
+  }
+
+  function renderAssistantInline(value) {
+    return String(value ?? '').split(/(`[^`\n]{1,240}`)/g).map((part) => {
+      if (part.startsWith('`') && part.endsWith('`')) return `<code>${esc(part.slice(1, -1))}</code>`;
+      return esc(part).replace(/\*\*([^*\n]{1,500})\*\*/g, '<strong>$1</strong>');
+    }).join('');
+  }
+
+  function renderAssistantMarkdown(value) {
+    const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n').slice(0, 400);
+    const html = [];
+    let paragraph = [];
+    let listType = '';
+    const flushParagraph = () => {
+      if (!paragraph.length) return;
+      html.push(`<p>${paragraph.map(renderAssistantInline).join('<br>')}</p>`);
+      paragraph = [];
+    };
+    const closeList = () => {
+      if (!listType) return;
+      html.push(`</${listType}>`);
+      listType = '';
+    };
+    for (const line of lines) {
+      if (!line.trim()) {
+        flushParagraph();
+        closeList();
+        continue;
+      }
+      const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+      const numbered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+      const heading = line.match(/^\s*#{1,3}\s+(.+)$/);
+      if (heading) {
+        flushParagraph();
+        closeList();
+        html.push(`<h4>${renderAssistantInline(heading[1])}</h4>`);
+        continue;
+      }
+      if (bullet || numbered) {
+        flushParagraph();
+        const nextType = bullet ? 'ul' : 'ol';
+        if (listType !== nextType) {
+          closeList();
+          html.push(`<${nextType}>`);
+          listType = nextType;
+        }
+        html.push(`<li>${renderAssistantInline((bullet || numbered)[1])}</li>`);
+        continue;
+      }
+      closeList();
+      paragraph.push(line.trim());
+    }
+    flushParagraph();
+    closeList();
+    return html.join('') || '<p>暂时没有可显示的回答。</p>';
   }
 
   function renderAssistantMessage(message, index) {
@@ -1802,7 +3510,8 @@
     const details = message.details?.length ? `<ul>${message.details.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>` : '';
     const focusItems = Array.isArray(message.focusItems) ? message.focusItems : [];
     const focus = focusItems.length ? `<div class="message-focus-items" aria-label="本次分析对象">${focusItems.map((item) => `<span>${esc(TYPE_META[item.kind]?.label || (item.kind === 'module' ? '模块' : item.kind === 'capability' ? '能力' : '对象'))} · ${esc(item.title)}</span>`).join('')}</div>` : '';
-    return `<div class="assistant-msg ${message.role}"><span class="am-avatar">${message.role === 'assistant' ? '<img src="assets/dsh-icon.svg" alt="">' : '你'}</span><div class="am-bubble">${focus}<p>${esc(message.text)}</p>${details}${action}</div></div>`;
+    const copy = message.role === 'assistant' ? renderAssistantMarkdown(message.text) : `<p>${esc(message.text)}</p>`;
+    return `<div class="assistant-msg ${message.role}"><span class="am-avatar">${message.role === 'assistant' ? '<img src="assets/dsh-icon.svg" alt="">' : '你'}</span><div class="am-bubble">${focus}<div class="assistant-copy">${copy}</div>${details}${action}</div></div>`;
   }
 
   function renderAssistantProposal() {
@@ -1831,12 +3540,60 @@
     return Boolean(adapter && typeof adapter.preflight === 'function' && typeof adapter.apply === 'function' && typeof adapter.readback === 'function');
   }
 
+  function normalizeConfigCapabilityTargets(rows) {
+    if (!Array.isArray(rows) || rows.length > 100) return [];
+    const known = new Set(Object.values(PENDING_REFRESH_META)
+      .map((item) => item.targetId)
+      .filter((targetId) => typeof targetId === 'string' && targetId.startsWith('settings:') && targetId !== PENDING_REFRESH_META.presetRoster.targetId));
+    return [...new Set(rows.map((item) => String(item || '').trim()).filter((targetId) => known.has(targetId)))];
+  }
+
+  function configTargetMutationReady(targetId) {
+    return state.configManagementCapability.status === 'ready'
+      && state.configManagementCapability.targets.includes(String(targetId || ''));
+  }
+
+  function presetCompositionMutationReady(targetId) {
+    return state.configManagementCapability.status === 'ready'
+      && state.configManagementCapability.targets.includes(String(targetId || ''));
+  }
+
+  async function checkConfigManagementCapability(options = {}) {
+    if (state.configManagementCapability.status === 'checking') return;
+    if (!options.force && ['ready', 'unavailable', 'error'].includes(state.configManagementCapability.status)) return;
+    const adapter = window.DS_HUB_CONFIG_ADAPTER;
+    if (!adapter || typeof adapter.capabilities !== 'function') {
+      state.configManagementCapability = { status: 'unavailable', message: '当前页面没有连接 DSH 配置能力目录', targets: [] };
+      if (state.view === 'quick' || state.assistantOpen || state.componentDetail || state.presetDrawer) {
+        render();
+        if (state.presetDrawer) afterRender(() => document.querySelector('.preset-dialog')?.focus?.({ preventScroll: true }));
+      }
+      return;
+    }
+    state.configManagementCapability = { status: 'checking', message: '正在核对 DSH 可修改项目', targets: [] };
+    if (state.view === 'quick' || state.assistantOpen || state.componentDetail || state.presetDrawer) render();
+    try {
+      const capabilities = await adapter.capabilities({});
+      const targets = normalizeConfigCapabilityTargets(capabilities?.configManagement?.targets);
+      state.configManagementCapability = capabilities?.configManagement?.settingsMutation === true && targets.length
+        ? { status: 'ready', message: `已核验 ${targets.length} 项 DSH 基础设置`, targets }
+        : { status: 'unavailable', message: '本机 DSH 没有开放受控配置写入', targets: [] };
+    } catch (_) {
+      state.configManagementCapability = { status: 'error', message: '无法核验 DSH 可修改项目', targets: [] };
+    }
+    if (state.view === 'quick' || state.assistantOpen || state.componentDetail || state.presetDrawer) {
+      render();
+      if (state.presetDrawer) afterRender(() => document.querySelector('.preset-dialog')?.focus?.({ preventScroll: true }));
+    }
+  }
+
   function configTargetReaderReady() {
     return Boolean(window.DS_HUB_CONFIG_ADAPTER && typeof window.DS_HUB_CONFIG_ADAPTER.preflight === 'function');
   }
 
   function configPresetHydratorReady() {
-    return Boolean(window.DS_HUB_CONFIG_ADAPTER && typeof window.DS_HUB_CONFIG_ADAPTER.hydratePreset === 'function');
+    return Boolean(window.DS_HUB_CONFIG_ADAPTER && typeof window.DS_HUB_CONFIG_ADAPTER.hydratePreset === 'function'
+      && presetCompositionMutationReady(presetCandidateTarget('persona')));
   }
 
   async function hydrateQuickPersona() {
@@ -1995,6 +3752,8 @@
     const defaultPresetRef = String(raw.defaultPresetRef || '').trim();
     const presetMappingId = String(raw.presetMappingId || '').trim();
     const snapshotIdentity = String(raw.snapshotIdentity || '').trim();
+    const candidatePresetRef = String(raw.candidatePresetRef || '').trim();
+    const candidatePresetDigest = String(raw.candidatePresetDigest || '').trim();
     const evidenceRef = String(raw.evidenceRef || '').trim();
     if (targetId !== PENDING_REFRESH_META.presetRoster.targetId || !validRevision(revision)
       || !validPresetRef(defaultPresetRef) || !validPresetMappingId(presetMappingId)
@@ -2002,7 +3761,11 @@
     if (expected.revision !== undefined && !sameRevision(revision, expected.revision)) return null;
     if (expected.defaultPresetRef && defaultPresetRef !== expected.defaultPresetRef) return null;
     if (expected.presetMappingId && presetMappingId !== expected.presetMappingId) return null;
-    return { targetId, revision, defaultPresetRef, presetMappingId, snapshotIdentity, evidenceRef };
+    if ((candidatePresetRef || candidatePresetDigest)
+      && (!validPresetRef(candidatePresetRef) || !/^sha256:[a-f0-9]{64}$/.test(candidatePresetDigest))) return null;
+    if (expected.candidatePresetRef && candidatePresetRef !== expected.candidatePresetRef) return null;
+    if (expected.candidatePresetDigest && candidatePresetDigest !== expected.candidatePresetDigest) return null;
+    return { targetId, revision, defaultPresetRef, presetMappingId, snapshotIdentity, candidatePresetRef, candidatePresetDigest, evidenceRef };
   }
 
   function samePresetRosterSnapshot(actual, expected) {
@@ -2011,7 +3774,9 @@
       && sameRevision(actual.revision, expected.revision)
       && actual.defaultPresetRef === expected.defaultPresetRef
       && actual.presetMappingId === expected.presetMappingId
-      && actual.snapshotIdentity === expected.snapshotIdentity);
+      && actual.snapshotIdentity === expected.snapshotIdentity
+      && actual.candidatePresetRef === expected.candidatePresetRef
+      && actual.candidatePresetDigest === expected.candidatePresetDigest);
   }
 
   function presetRefForId(id) {
@@ -2032,6 +3797,8 @@
       expectedDefaultPresetRef: String(raw.expectedDefaultPresetRef || '').trim(),
       expectedPresetMappingId: String(raw.expectedPresetMappingId || '').trim(),
       snapshotIdentity: String(raw.snapshotIdentity || '').trim(),
+      expectedCandidatePresetRef: String(raw.expectedCandidatePresetRef || '').trim(),
+      expectedCandidatePresetDigest: String(raw.expectedCandidatePresetDigest || '').trim(),
     };
     if (!receipt.id || !receipt.digest || !receipt.evidenceRef
       || receipt.candidateId !== proposal.id || receipt.idempotencyKey !== proposal.id
@@ -2040,9 +3807,12 @@
     if (rosterSnapshot && (!sameRevision(receipt.expectedRosterRevision, rosterSnapshot.revision)
       || receipt.expectedDefaultPresetRef !== rosterSnapshot.defaultPresetRef
       || receipt.expectedPresetMappingId !== rosterSnapshot.presetMappingId
+      || receipt.expectedCandidatePresetRef !== rosterSnapshot.candidatePresetRef
+      || receipt.expectedCandidatePresetDigest !== rosterSnapshot.candidatePresetDigest
       || receipt.snapshotIdentity !== SNAPSHOT_IDENTITY)) return null;
     if (!rosterSnapshot && (receipt.expectedRosterRevision != null || receipt.expectedDefaultPresetRef
-      || receipt.expectedPresetMappingId || receipt.snapshotIdentity)) return null;
+      || receipt.expectedPresetMappingId || receipt.snapshotIdentity
+      || receipt.expectedCandidatePresetRef || receipt.expectedCandidatePresetDigest)) return null;
     return receipt;
   }
 
@@ -2129,10 +3899,10 @@
     const selection = environment?.selection || SNAPSHOT.config.model;
     if (environment?.status === 'synced') return `跟随 DSH · ${selection.provider} / ${selection.model}`;
     if (environment?.status === 'mismatch') return '模型来源未核验，已拦截';
-    if (environment?.status === 'checking') return '正在核对 DSH Provider';
-    if (environment?.status === 'error') return 'DSH Provider 核验失败';
-    if (aiAdapterPresent() && !aiAdapterReady()) return 'Provider 无法核验';
-    if (aiAdapterReady()) return '发送前核对 DSH Provider';
+    if (environment?.status === 'checking') return '正在核对模型服务';
+    if (environment?.status === 'error') return '模型服务核验失败';
+    if (aiAdapterPresent() && !aiAdapterReady()) return '模型服务无法核验';
+    if (aiAdapterReady()) return '发送前核对模型服务';
     return `DSH 未连接 · 快照 ${selection.provider}`;
   }
 
@@ -2225,7 +3995,9 @@
     const rawWriteValue = raw.writeValue ?? raw.expectedValue ?? raw.newValue ?? '';
     const writeValue = policy.valueType === 'positive-integer' ? Number(rawWriteValue) : String(rawWriteValue);
     if (policy.valueType === 'positive-integer' && (!Number.isInteger(writeValue) || writeValue <= 0)) return null;
-    if (!policy.allowedValues.includes(writeValue)) return null;
+    if (raw.key === 'reasoningEffort') {
+      if (!modelSupportsReasoningEffort(effectiveModelCatalogEntry(), writeValue)) return null;
+    } else if (!policy.allowedValues.includes(writeValue)) return null;
     const currentValues = {
       permissionDefault: state.appliedOverrides.permissionDefault ?? SNAPSHOT.config.permission.defaultPreset ?? '未记录',
       reasoningEffort: state.appliedOverrides.reasoningEffort ?? SNAPSHOT.config.model.reasoningEffort ?? '未记录',
@@ -2408,7 +4180,7 @@
   }
 
   function renderAssistantQuickActions() {
-    return `<div class="assistant-quick" aria-label="助手可执行的工作"><button type="button" onclick="askAssistant('diagnose')">检查配置</button><button type="button" onclick="askAssistant('community')">搜索插件</button><button type="button" onclick="askAssistant('config')">生成候选</button><button type="button" onclick="askAssistant('testset')">建测试集</button><button type="button" onclick="askAssistant('regression')">跑回归</button></div>`;
+    return `<div class="assistant-quick" aria-label="助手可执行的工作"><button type="button" onclick="askAssistant('diagnose')">为什么不好用</button><button type="button" onclick="askAssistant('community')">找一个插件</button><button type="button" onclick="askAssistant('config')">改一项设置</button><button type="button" onclick="askAssistant('testset')">准备测试题</button><button type="button" onclick="askAssistant('regression')">比较新旧效果</button></div>`;
   }
 
   function openOptimizationWorkbench() {
@@ -2418,7 +4190,8 @@
 
   function renderAssistant() {
     if (!state.assistantOpen) {
-      return `<div class="assistant-chatbar" role="search" aria-label="DS Hub 助手对话，可放入分析对象" ondragover="assistantDragOver(event)" ondragleave="assistantDragLeave(event)" ondrop="assistantDrop(event)">
+      if (state.view === 'workshop') return '';
+      return `<div class="assistant-chatbar" role="group" aria-label="DS Hub 助手对话，可放入分析对象" ondragover="assistantDragOver(event)" ondragleave="assistantDragLeave(event)" ondrop="assistantDrop(event)">
         <button type="button" class="chatbar-brand" onclick="openAssistant()" aria-label="打开 DS Hub 助手"><span class="al-icon"><img src="assets/dsh-icon.svg" alt=""></span><span><b>DS Hub 助手</b><small>${esc(assistantEnvironmentLabel())}</small></span></button>
         <label class="chatbar-input-wrap"><span class="sr-only">输入给 DS Hub 助手的问题</span><input class="assistant-chatbar-input" value="${esc(state.assistantDraft)}" oninput="updateAssistantDraft(this.value)" onkeydown="assistantBarKeydown(event)" placeholder="诊断问题、找插件、改配置、建测试或跑回归" ${state.assistantApplying || state.assistantThinking || state.regressionRunning ? 'disabled' : ''}></label>
         <span class="chatbar-model" title="${esc(assistantEnvironmentLabel())}">${state.assistantEnvironment?.status === 'synced' ? 'DSH 已核验' : aiAdapterReady() ? '发送时核验' : '本地规则'}</span>
@@ -2426,7 +4199,11 @@
         <span class="sr-only" role="status" aria-live="polite">${esc(state.assistantAnnouncement)}</span>
       </div>`;
     }
-    const writeConnected = configAdapterReady();
+    const writableTargets = state.configManagementCapability.status === 'ready'
+      ? state.configManagementCapability.targets
+      : [];
+    const writeConnected = configAdapterReady() && writableTargets.length > 0;
+    const presetCompositionConnected = writableTargets.some((targetId) => targetId.startsWith('agent-preset-ref:'));
     const regressionEngineConnected = optimizationAdapterReady();
     const targetReadConnected = configTargetReaderReady();
     const regressionConnected = regressionEngineConnected && targetReadConnected;
@@ -2440,14 +4217,19 @@
           : state.assistantAIStatus === 'error' ? 'DSH 诊断接口最近一次请求失败。' : '发送前会读取并核对 DSH 当前 provider。';
     const starter = { role: 'assistant', text: state.restoredPendingRefresh
       ? `${aiStatusText}我检测到待刷新标记，当前快照可能不是最新状态，已停止使用受影响的旧值做诊断。请先重新同步本机 DSH；连接 sidecar 后仍可用 live readback 核对具体目标。`
-      : `${aiStatusText}我已读取当前项目的 ${SNAPSHOT.sessions.project.total} 个会话和本机配置快照。你可以问我为什么这样配、哪里可能有风险，或让我先生成一项候选修改。` };
+      : `${aiStatusText}告诉我你想实现的结果，或把模块、能力、插件拖进来。我会先解释现状，再准备修改候选和测试；未经你确认，不会改变 DSH 配置。` };
     const messages = state.assistantMessages.length ? state.assistantMessages : [starter];
+    const writeScope = writeConnected
+      ? `${writableTargets.length} 项基础设置可采用${presetCompositionConnected ? '，角色卡组成也已连接' : '；角色卡正文、上下文和工具组成暂只读'}`
+      : state.configManagementCapability.status === 'checking' || state.configManagementCapability.status === 'idle'
+        ? '正在核对可采用项目'
+        : '采用未连接';
     const loopStatus = regressionConnected && writeConnected
-      ? '回归与采用接口已配置；回读一致后才算采用'
+      ? `${writeScope}；回读一致后才算采用`
       : regressionConnected ? '回归已连接；采用未连接，只能保留对比结果'
         : regressionEngineConnected && !targetReadConnected ? '回归执行器已连接；目标配置读取未连接，暂不能运行'
-          : writeConnected ? '采用已连接；回归未连接，暂不能写入'
-            : '回归与采用未连接；只保存候选和测试集';
+          : writeConnected ? `${writeScope}；回归未连接，暂不能写入`
+            : `${writeScope}；回归未连接，只能讨论与检查`;
     return `${mobileSheet ? '<button type="button" class="assistant-scrim" onclick="closeAssistant()" aria-label="关闭 DS Hub 助手"></button>' : ''}<aside class="config-assistant" role="dialog" aria-modal="${mobileSheet}" tabindex="-1" aria-label="DS Hub 助手" ondragover="assistantDragOver(event)" ondragleave="assistantDragLeave(event)" ondrop="assistantDrop(event)"><header class="assistant-head"><div class="assistant-title"><span><img src="assets/dsh-icon.svg" alt=""></span><div><b>DS Hub 助手</b><small><i></i>诊断、候选配置与效果验证</small></div></div><button type="button" onclick="closeAssistant()" aria-label="关闭 DS Hub 助手">✕</button></header><div class="assistant-scroll-body">
       <div class="assistant-boundary ${environment?.status === 'synced' && writeConnected && regressionConnected ? 'connected' : ''}">${esc(assistantEnvironmentLabel())} · ${loopStatus}</div>
       ${renderAssistantQuickActions()}
@@ -2648,11 +4430,20 @@
     else setTimeout(callback, 0);
   }
 
+  function resolveDialogReturnTarget(descriptor) {
+    if (!descriptor) return null;
+    if (descriptor.kind === 'selector') return document.querySelector(descriptor.value);
+    const allowedAttributes = new Set(['data-component-ref', 'data-assistant-source-ref', 'data-community-ref', 'data-way-id']);
+    if (descriptor.kind !== 'data' || !allowedAttributes.has(descriptor.attribute)) return null;
+    return [...document.querySelectorAll(`[${descriptor.attribute}]`)]
+      .find((node) => node.getAttribute?.(descriptor.attribute) === descriptor.value) || null;
+  }
+
   function restoreDialogFocus(fallbackSelector) {
-    const selector = dialogReturnSelector;
-    dialogReturnSelector = null;
+    const returnTarget = dialogReturnTarget;
+    dialogReturnTarget = null;
     afterRender(() => {
-      const target = (selector && document.querySelector(selector))
+      const target = resolveDialogReturnTarget(returnTarget)
         || (fallbackSelector && document.querySelector(fallbackSelector))
         || document.querySelector('#view h1, #view h2')
         || document.querySelector('.logo');
@@ -2662,7 +4453,9 @@
   }
 
   function activeModal() {
-    return document.querySelector('.drawer[aria-modal="true"]') || document.querySelector('.config-assistant[aria-modal="true"]');
+    return document.querySelector('.plugin-dialog[aria-modal="true"]')
+      || document.querySelector('.drawer[aria-modal="true"]')
+      || document.querySelector('.config-assistant[aria-modal="true"]');
   }
 
   function syncModalState() {
@@ -2671,11 +4464,15 @@
     const view = document.getElementById('view');
     if (topbar) topbar.inert = Boolean(modal);
     if (view) {
-      view.inert = Boolean(modal?.classList?.contains('config-assistant'));
+      const assistantIsModal = Boolean(modal?.classList?.contains('config-assistant'));
+      view.inert = assistantIsModal;
       Array.from(view.children || []).forEach((child) => {
-        child.inert = Boolean(modal?.classList?.contains('drawer')) && !child.classList?.contains('drawer') && !child.classList?.contains('drawer-mask');
+        child.inert = Boolean(modal && !assistantIsModal && !child.contains?.(modal));
       });
     }
+    Array.from(document.querySelectorAll?.('.assistant-chatbar,.assistant-scrim,.config-assistant') || []).forEach((surface) => {
+      surface.inert = Boolean(modal && surface !== modal && !surface.contains?.(modal));
+    });
     document.body?.classList?.toggle?.('modal-open', Boolean(modal));
   }
 
@@ -2716,56 +4513,583 @@
       heading?.focus?.({ preventScroll: true });
     });
   }
-  function goQuick() { state.view = 'quick'; state.module = null; state.capability = null; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
-  function goWorkshop() { state.view = 'workshop'; state.module = null; state.capability = null; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
-  function goObserve() { state.view = 'observe'; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
-  function goTrial() { state.view = 'trial'; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
-  function openModule(key) { state.view = 'module'; state.module = key; state.capability = null; state.componentLimit = 12; state.componentDetail = null; state.libraryOpen = false; render(); focusViewHeading(); }
+  function openExtensionLevel(path) {
+    const allowed = new Set(['root', 'skill', 'runtime', 'runtime/config', 'runtime/load', 'runtime/host', 'runtime/client', 'ui', 'ui/shell', 'ui/workspace', 'ui/manage', 'ui/observe', 'cross', 'unassigned']);
+    if (!allowed.has(path)) return;
+    state.extensionPath = path;
+    state.relationshipFocusRef = null;
+    state.relationshipLensOpen = false;
+    render();
+    afterRender(() => document.querySelector('[data-extension-level-current]')?.focus?.({ preventScroll: true }));
+  }
+  function rotatableRelationshipItems() {
+    const items = currentRelationshipItems();
+    return state.relationshipFocusRef ? items.filter((item) => item.ref !== state.relationshipFocusRef) : items;
+  }
+  function relationshipItemByRef(ref) {
+    return currentRelationshipAllItems().find((item) => item.ref === ref) || null;
+  }
+  function focusRelationshipItem(ref) {
+    const item = relationshipItemByRef(ref);
+    if (!item) return;
+    state.relationshipFocusRef = item.ref;
+    state.relationshipLensOpen = false;
+    state.relationshipLensIndex = 0;
+    render();
+    afterRender(() => [...document.querySelectorAll('.relationship-role-card,.extension-system-node')]
+      .find((node) => node.getAttribute('data-relationship-ref') === item.ref)?.focus?.({ preventScroll: true }));
+  }
+  function openRelationshipStage(id) {
+    const moduleKey = state.module;
+    const ability = moduleKey ? activeCapability(moduleKey) : null;
+    if (!ability) return;
+    const plan = relationshipStagePlan(moduleKey, ability, relationshipAllItems(moduleKey, ability));
+    const stage = plan.stages.find((item) => item.id === id && item.items.some((row) => row.kind !== 'community'));
+    if (!stage) return;
+    state.relationshipStageId = stage.id;
+    state.relationshipFocusRef = stage.items.find((item) => item.kind !== 'community' && item.status === 'using')?.ref
+      || stage.items.find((item) => item.kind !== 'community')?.ref
+      || null;
+    render();
+    afterRender(() => document.querySelector('.relationship-depth-detail')?.focus?.({ preventScroll: true }));
+  }
+  function closeRelationshipStage() {
+    state.relationshipStageId = null;
+    state.relationshipFocusRef = null;
+    render();
+    afterRender(() => document.querySelector('.relationship-depth-map button')?.focus?.({ preventScroll: true }));
+  }
+  function relationshipRoleCardKeydown(event, ref) {
+    if (!['Enter', ' '].includes(event?.key)) return;
+    event.preventDefault?.();
+    focusRelationshipItem(ref);
+  }
+  function openRelationshipItem(event, ref) {
+    if (Date.now() < suppressRelationshipClickUntil) {
+      event?.preventDefault?.();
+      return;
+    }
+    const item = relationshipItemByRef(ref);
+    if (!item) return;
+    if (item.kind === 'community') {
+      openCommunityDetail(item.id, 'module');
+      return;
+    }
+    openComponent(item.moduleKey, item.capabilityId, item.index);
+  }
+  function clearRelationshipHold() {
+    if (relationshipHoldTimer) clearTimeout(relationshipHoldTimer);
+    relationshipHoldTimer = null;
+  }
+  function scheduleRelationshipLens(event) {
+    if (event?.button != null && event.button !== 0) return;
+    if (!event?.target?.closest?.('.relationship-map')) return;
+    if (event?.target?.closest?.('[data-no-relationship-gesture],summary,a')) return;
+    const items = rotatableRelationshipItems();
+    if (items.length < 2) return;
+    clearRelationshipHold();
+    relationshipGesture = {
+      pointerId: event.pointerId,
+      startX: Number(event.clientX) || 0,
+      baseIndex: Math.min(state.relationshipLensIndex, items.length - 1),
+      lastIndex: Math.min(state.relationshipLensIndex, items.length - 1),
+      active: false,
+    };
+    relationshipHoldTimer = setTimeout(() => {
+      if (!relationshipGesture || relationshipGesture.pointerId !== event.pointerId) return;
+      relationshipGesture.active = true;
+      state.relationshipLensOpen = true;
+      render();
+    }, 330);
+  }
+  function relationshipPointerMove(event) {
+    if (!relationshipGesture || relationshipGesture.pointerId !== event.pointerId) return;
+    const distance = (Number(event.clientX) || 0) - relationshipGesture.startX;
+    if (!relationshipGesture.active) {
+      if (Math.abs(distance) > 10) {
+        clearRelationshipHold();
+        relationshipGesture = null;
+      }
+      return;
+    }
+    event.preventDefault?.();
+    const items = rotatableRelationshipItems();
+    if (!items.length) return;
+    const step = Math.round(-distance / 64);
+    const index = ((relationshipGesture.baseIndex + step) % items.length + items.length) % items.length;
+    if (index === relationshipGesture.lastIndex) return;
+    relationshipGesture.lastIndex = index;
+    state.relationshipLensIndex = index;
+    render();
+  }
+  function applyRelationshipLensFocus() {
+    const items = rotatableRelationshipItems();
+    const item = items[Math.min(state.relationshipLensIndex, Math.max(0, items.length - 1))];
+    state.relationshipLensOpen = false;
+    if (item) state.relationshipFocusRef = item.ref;
+    state.relationshipLensIndex = 0;
+    render();
+    afterRender(() => document.querySelector('.relationship-explorer')?.focus?.({ preventScroll: true }));
+  }
+  function relationshipPointerUp(event) {
+    if (!relationshipGesture || relationshipGesture.pointerId !== event.pointerId) return;
+    const wasActive = relationshipGesture.active;
+    clearRelationshipHold();
+    relationshipGesture = null;
+    if (!wasActive) return;
+    suppressRelationshipClickUntil = Date.now() + 500;
+    applyRelationshipLensFocus();
+  }
+  function cancelRelationshipLens() {
+    clearRelationshipHold();
+    relationshipGesture = null;
+    if (!state.relationshipLensOpen) return;
+    state.relationshipLensOpen = false;
+    state.relationshipLensIndex = 0;
+    render();
+    afterRender(() => document.querySelector('.relationship-lens-toggle')?.focus?.({ preventScroll: true }));
+  }
+  function toggleRelationshipLens() {
+    const items = rotatableRelationshipItems();
+    if (items.length < 2) {
+      toast('当前没有足够的关系节点可旋转');
+      return;
+    }
+    if (state.relationshipLensOpen) {
+      applyRelationshipLensFocus();
+      return;
+    }
+    state.relationshipLensOpen = true;
+    state.relationshipLensIndex = Math.min(state.relationshipLensIndex, items.length - 1);
+    render();
+    afterRender(() => document.querySelector('.relationship-explorer')?.focus?.({ preventScroll: true }));
+  }
+  function cycleRelationshipLens(direction) {
+    const items = rotatableRelationshipItems();
+    if (!items.length) return;
+    state.relationshipLensOpen = true;
+    state.relationshipLensIndex = ((state.relationshipLensIndex + Number(direction || 0)) % items.length + items.length) % items.length;
+    render();
+    afterRender(() => document.querySelector('.relationship-explorer')?.focus?.({ preventScroll: true }));
+  }
+  function resetRelationshipFocus() {
+    state.relationshipFocusRef = null;
+    state.relationshipLensOpen = false;
+    state.relationshipLensIndex = 0;
+    render();
+    afterRender(() => document.querySelector('.relationship-explorer')?.focus?.({ preventScroll: true }));
+  }
+  function relationshipMapKeydown(event) {
+    if (!['ArrowLeft', 'ArrowRight', 'Enter', 'Escape'].includes(event.key)) return;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      cycleRelationshipLens(event.key === 'ArrowLeft' ? -1 : 1);
+      return;
+    }
+    if (event.key === 'Enter' && state.relationshipLensOpen) {
+      event.preventDefault();
+      applyRelationshipLensFocus();
+      return;
+    }
+    if (event.key === 'Escape' && state.relationshipLensOpen) {
+      event.preventDefault();
+      cancelRelationshipLens();
+    }
+  }
+  function clearRelationshipState() {
+    clearRelationshipHold();
+    relationshipGesture = null;
+    state.relationshipFocusRef = null;
+    state.relationshipStageId = null;
+    state.relationshipLensOpen = false;
+    state.relationshipLensIndex = 0;
+    state.extensionPath = 'root';
+  }
+  function clearPluginDialogs() { state.componentDetail = null; state.communityDetail = null; state.componentReturnToLibrary = false; state.communityReturnToLibrary = false; if (state.loaderEntryAction?.status === 'confirm') state.loaderEntryAction = null; }
+  function clearWaysDialogs() { state.waysDetail = null; state.impactPreview = null; }
+  function goWays() { state.view = 'ways'; state.module = null; state.capability = null; clearRelationshipState(); clearPluginDialogs(); clearWaysDialogs(); state.libraryOpen = false; render(); focusViewHeading(); }
+  function goQuick() { state.view = 'quick'; state.module = null; state.capability = null; clearRelationshipState(); clearPluginDialogs(); clearWaysDialogs(); state.libraryOpen = false; render(); focusViewHeading(); void checkConfigManagementCapability(); }
+  function goWorkshop() { state.view = 'workshop'; state.module = null; state.capability = null; clearRelationshipState(); clearPluginDialogs(); clearWaysDialogs(); state.libraryOpen = false; render(); focusViewHeading(); }
+  function goObserve() { state.view = 'observe'; clearPluginDialogs(); clearWaysDialogs(); state.libraryOpen = false; render(); focusViewHeading(); }
+  function goTrial() { state.view = 'trial'; clearPluginDialogs(); clearWaysDialogs(); state.libraryOpen = false; render(); focusViewHeading(); void checkConfigManagementCapability(); }
+  function selectWaysSection(section) {
+    if (!WORK_WAY_SECTIONS.some((item) => item.id === section)) return;
+    state.view = 'ways';
+    state.waysSection = section;
+    clearWaysDialogs();
+    render();
+    afterRender(() => document.querySelector('.ways-stage h2')?.focus?.({ preventScroll: true }));
+  }
+  function focusWaysMethod(id) {
+    const item = workWayObjectById(id);
+    if (!item || item.section !== 'vertical') return;
+    state.waysMethodFocus = id;
+    state.waysSection = 'vertical';
+    clearWaysDialogs();
+    render();
+    afterRender(() => document.querySelector('.ways-method-focus h3')?.focus?.({ preventScroll: true }));
+  }
+  function openWaysDetail(id) {
+    if (!workWayObjectById(id)) return;
+    dialogReturnTarget = { kind: 'data', attribute: 'data-way-id', value: id };
+    state.waysDetail = id;
+    state.impactPreview = null;
+    render();
+    afterRender(() => document.querySelector('.ways-dialog')?.focus?.());
+  }
+  function closeWaysDetail() {
+    const previousId = state.waysDetail;
+    state.waysDetail = null;
+    state.impactPreview = null;
+    render();
+    afterRender(() => document.querySelector(`[data-way-id="${previousId}"]`)?.focus?.({ preventScroll: true }));
+  }
+  function openImpactPreview(id) {
+    if (!workWayObjectById(id)) return;
+    state.waysDetail = id;
+    state.impactPreview = id;
+    render();
+    afterRender(() => document.querySelector('.impact-dialog')?.focus?.());
+  }
+  function closeImpactPreview() {
+    state.impactPreview = null;
+    render();
+    afterRender(() => document.querySelector('.ways-dialog')?.focus?.());
+  }
+  function closeWaysDialogFromBackdrop(event, kind) {
+    if (event.target !== event.currentTarget) return;
+    if (kind === 'impact') closeImpactPreview();
+    else closeWaysDetail();
+  }
+  function askWaysAssistant(id) {
+    const ref = `workway/${id}`;
+    state.waysDetail = null;
+    state.impactPreview = null;
+    attachAssistantContext(ref);
+  }
+  function draftWaysChange(id) {
+    const item = workWayObjectById(id);
+    if (!item) return;
+    const ref = `workway/${id}`;
+    if (!state.assistantContextRefs.includes(ref) && state.assistantContextRefs.length < ASSISTANT_CONTEXT_LIMIT) state.assistantContextRefs.push(ref);
+    state.assistantDraft = `请先分析“${item.title}”的当前配置和依赖，再给我一个最小修改候选。必须说明行为变化、影响范围、权限、测试和回退；不要直接应用。`;
+    state.waysDetail = null;
+    state.impactPreview = null;
+    state.assistantOpen = true;
+    state.libraryOpen = false;
+    render();
+    focusAssistantInput(true);
+    void checkConfigManagementCapability();
+  }
+  function openModule(key) { state.view = 'module'; state.module = key; state.capability = null; clearRelationshipState(); state.componentLimit = 12; clearPluginDialogs(); state.libraryOpen = false; render(); focusViewHeading(); }
   function selectCapability(id) {
     state.capability = id;
+    clearRelationshipState();
     state.componentLimit = 12;
-    state.componentDetail = null;
+    clearPluginDialogs();
     render();
     afterRender(() => {
-      const target = document.getElementById('component-unfold') || document.querySelector('#view h1');
+      const target = document.querySelector('.capability-focus-page') || document.querySelector('#view h1');
       if (!target) return;
-      const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
-      target.scrollIntoView?.({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
+      target.scrollIntoView?.({ behavior: 'auto', block: 'start' });
       target.focus?.({ preventScroll: true });
     });
   }
+  function closeCapabilityDetail() {
+    const previousId = state.capability;
+    state.capability = null;
+    clearRelationshipState();
+    state.componentLimit = 12;
+    clearPluginDialogs();
+    state.libraryOpen = false;
+    render();
+    afterRender(() => document.querySelector(`[data-capability-id="${previousId}"]`)?.focus?.({ preventScroll: true }));
+  }
   function showMoreComponents() { state.componentLimit += 12; render(); afterRender(() => (document.querySelector('.component-more') || document.querySelector('.component-tile:last-child'))?.focus?.({ preventScroll: true })); }
-  function jumpToCapability(moduleKey, capabilityId) { state.view = 'module'; state.module = moduleKey; state.capability = capabilityId; state.componentLimit = 12; state.componentDetail = null; state.libraryOpen = false; render(); afterRender(() => { const target = document.getElementById('component-unfold') || document.querySelector('#view h1'); target?.scrollIntoView?.({ block: 'start' }); target?.focus?.({ preventScroll: true }); }); }
-  function openComponent(moduleKey, capabilityId, index) { dialogReturnSelector = `[data-component-ref="${moduleKey}-${capabilityId}-${index}"]`; state.componentReturnToLibrary = false; state.componentDetail = `${moduleKey}:${capabilityId}:${index}`; state.libraryOpen = false; render(); afterRender(() => document.querySelector('.drawer')?.focus?.()); }
+  function jumpToCapability(moduleKey, capabilityId) { state.view = 'module'; state.module = moduleKey; state.capability = capabilityId; clearRelationshipState(); state.componentLimit = 12; clearPluginDialogs(); state.libraryOpen = false; render(); afterRender(() => { const target = document.querySelector('.capability-focus-page') || document.querySelector('#view h1'); target?.scrollIntoView?.({ block: 'start' }); target?.focus?.({ preventScroll: true }); }); }
+  function openComponent(moduleKey, capabilityId, index) {
+    const ability = CAPABILITIES[moduleKey]?.find((item) => item.id === capabilityId);
+    const component = ability?.components[Number(index)];
+    const ref = componentContextRef(moduleKey, capabilityId, component);
+    if (!ref) return;
+    dialogReturnTarget = { kind: 'data', attribute: 'data-component-ref', value: ref };
+    state.componentReturnToLibrary = false;
+    state.communityDetail = null;
+    state.componentDetail = ref;
+    state.libraryOpen = false;
+    render();
+    if (component.type === 'plugin' && component.entries?.some(isHostRootLoaderEntry) && state.pluginManagementCapability.status === 'idle') void checkPluginManagementCapability();
+    if (component.entries?.some((entry) => linkedPresetToolRow(entry)) && state.configManagementCapability.status === 'idle') void checkConfigManagementCapability();
+    afterRender(() => document.querySelector('.plugin-dialog,.drawer')?.focus?.());
+  }
   function closeComponent() {
     state.componentDetail = null;
+    if (state.loaderEntryAction?.status === 'confirm') state.loaderEntryAction = null;
     if (state.componentReturnToLibrary) {
       state.componentReturnToLibrary = false;
       state.libraryOpen = true;
       render();
-      afterRender(() => { const drawer = document.querySelector('.wide-drawer'); if (drawer) drawer.scrollTop = state.libraryScrollTop; document.querySelector('.library-search')?.focus?.(); });
+      afterRender(() => {
+        const drawer = document.querySelector('.wide-drawer');
+        if (drawer) drawer.scrollTop = state.libraryScrollTop;
+        const target = resolveDialogReturnTarget(dialogReturnTarget);
+        dialogReturnTarget = null;
+        (target || document.querySelector('.library-search'))?.focus?.({ preventScroll: true });
+      });
       return;
     }
     render();
-    restoreDialogFocus('#component-unfold');
+    restoreDialogFocus('.capability-focus-page');
   }
   function openLibrary(tab = 'native') {
     if (!fullConfigEvidenceAvailable()) {
-      state.view = 'workshop'; state.module = null; state.capability = null; state.componentDetail = null; state.libraryOpen = false; state.assistantOpen = false; render(); focusViewHeading();
+      state.view = 'workshop'; state.module = null; state.capability = null; clearPluginDialogs(); state.libraryOpen = false; state.assistantOpen = false; render(); focusViewHeading();
       toast('完整组件清单等待 DSH 快照刷新');
       return;
     }
-    dialogReturnSelector = tab === 'community' ? '#open-community-library' : '#open-native-library';
+    dialogReturnTarget = { kind: 'selector', value: tab === 'community' ? '#open-community-library' : '#open-native-library' };
     if (state.view !== 'module') { state.view = 'module'; state.module = 'tools'; state.capability = 'extensions'; }
-    state.componentDetail = null; state.libraryOpen = true; state.libraryTab = tab; state.libraryQuery = ''; state.assistantOpen = false; render();
+    clearPluginDialogs(); state.libraryOpen = true; state.libraryTab = tab; state.libraryQuery = ''; state.assistantOpen = false; render();
     afterRender(() => document.querySelector('.library-search')?.focus?.());
   }
   function closeLibrary() { const fallback = state.libraryTab === 'community' ? '#open-community-library' : '#open-native-library'; state.libraryOpen = false; state.libraryQuery = ''; state.libraryScrollTop = 0; render(); restoreDialogFocus(fallback); }
-  function openLibraryComponent(moduleKey, capabilityId, index) { state.view = 'module'; state.module = moduleKey; state.capability = capabilityId; state.libraryScrollTop = document.querySelector('.wide-drawer')?.scrollTop || 0; state.componentReturnToLibrary = true; state.libraryOpen = false; state.componentDetail = `${moduleKey}:${capabilityId}:${index}`; render(); afterRender(() => document.querySelector('.drawer')?.focus?.()); }
+  function openLibraryComponent(moduleKey, capabilityId, index) {
+    const ability = CAPABILITIES[moduleKey]?.find((item) => item.id === capabilityId);
+    const component = ability?.components[Number(index)];
+    const ref = componentContextRef(moduleKey, capabilityId, component);
+    if (!ref) return;
+    state.view = 'module'; state.module = moduleKey; state.capability = capabilityId;
+    state.libraryScrollTop = document.querySelector('.wide-drawer')?.scrollTop || 0;
+    state.componentReturnToLibrary = true;
+    state.communityDetail = null;
+    state.libraryOpen = false;
+    state.componentDetail = ref;
+    dialogReturnTarget = { kind: 'data', attribute: 'data-component-ref', value: ref };
+    render();
+    if (component.type === 'plugin' && component.entries?.some(isHostRootLoaderEntry) && state.pluginManagementCapability.status === 'idle') void checkPluginManagementCapability();
+    if (component.entries?.some((entry) => linkedPresetToolRow(entry)) && state.configManagementCapability.status === 'idle') void checkConfigManagementCapability();
+    afterRender(() => document.querySelector('.plugin-dialog,.drawer')?.focus?.());
+  }
+  function openCommunityDetail(id, origin = 'module') {
+    const item = COMMUNITY_COMPONENTS.find((candidate) => candidate.id === id || candidate.packageName === id);
+    if (!item) return;
+    dialogReturnTarget = { kind: 'data', attribute: 'data-community-ref', value: item.packageName };
+    state.communityReturnToLibrary = origin === 'library';
+    if (state.communityReturnToLibrary) state.libraryScrollTop = document.querySelector('.wide-drawer')?.scrollTop || 0;
+    state.componentDetail = null;
+    state.componentReturnToLibrary = false;
+    state.libraryOpen = false;
+    state.communityDetail = item.packageName;
+    render();
+    if (state.packageInstallCapability.status === 'idle') void checkCommunityPackageInstallCapability();
+    afterRender(() => document.querySelector('.community-plugin-dialog')?.focus?.());
+  }
+  function closeCommunityDetail() {
+    state.communityDetail = null;
+    if (state.communityReturnToLibrary) {
+      state.communityReturnToLibrary = false;
+      state.libraryOpen = true;
+      state.libraryTab = 'community';
+      render();
+      afterRender(() => {
+        const drawer = document.querySelector('.wide-drawer');
+        if (drawer) drawer.scrollTop = state.libraryScrollTop;
+        const target = resolveDialogReturnTarget(dialogReturnTarget);
+        dialogReturnTarget = null;
+        (target || document.querySelector('.library-search'))?.focus?.({ preventScroll: true });
+      });
+      return;
+    }
+    render();
+    restoreDialogFocus('#open-community-library');
+  }
+  function closePluginDialogFromBackdrop(event, kind) {
+    if (!event || event.target !== event.currentTarget) return;
+    if (kind === 'community') closeCommunityDetail();
+    else closeComponent();
+  }
+  function reloadPluginState() { window.location?.reload?.(); }
+  function loaderActionButton(identity) {
+    return [...(document.querySelectorAll?.('[data-loader-action-ref]') || [])]
+      .find((element) => element.getAttribute?.('data-loader-action-ref') === identity) || null;
+  }
+  function handleLoaderEntryCommand(event) {
+    const trigger = event?.target?.closest?.('[data-loader-command]');
+    if (!trigger || trigger.disabled) return;
+    const command = trigger.getAttribute?.('data-loader-command');
+    const identity = trigger.getAttribute?.('data-loader-action-ref') || '';
+    if (command === 'request') requestLoaderEntryToggle(identity);
+    else if (command === 'cancel') cancelLoaderEntryToggle(identity);
+    else if (command === 'apply') void applyLoaderEntryToggle(identity);
+    else if (command === 'reload') reloadPluginState();
+  }
+  function loaderEntryByIdentity(identity) {
+    for (const group of PLUGIN_GROUPS) {
+      const entry = group.entries.find((item) => item.identity === identity);
+      if (entry) return entry;
+    }
+    return null;
+  }
+  async function checkPluginManagementCapability(options = {}) {
+    if (state.pluginManagementCapability.status === 'checking') return;
+    if (!options.force && ['ready', 'unavailable'].includes(state.pluginManagementCapability.status)) return;
+    const adapter = window.DS_HUB_PLUGIN_ADAPTER;
+    if (!adapter || typeof adapter.capabilities !== 'function' || typeof adapter.preflight !== 'function' || typeof adapter.setEnabled !== 'function') {
+      state.pluginManagementCapability = { status: 'unavailable', message: '需本机 Loader 管理桥', mutableEntries: [] };
+      if (state.componentDetail) render();
+      return;
+    }
+    state.pluginManagementCapability = { status: 'checking', message: '正在核对本机 Loader 管理能力', mutableEntries: [] };
+    if (state.componentDetail) render();
+    try {
+      const capabilities = await adapter.capabilities({});
+      const mutableEntries = normalizeMutableLoaderEntries(capabilities?.pluginManagement?.mutableEntries);
+      state.pluginManagementCapability = capabilities?.pluginManagement?.loaderMutation === true
+        ? { status: 'ready', message: '已连接 Host Loader 单条管理', mutableEntries }
+        : { status: 'unavailable', message: '本机桥未开放 Loader 写入能力', mutableEntries: [] };
+    } catch (_) {
+      state.pluginManagementCapability = { status: 'error', message: '无法核验本机 Loader 管理能力', mutableEntries: [] };
+    }
+    if (state.componentDetail) {
+      render();
+      afterRender(() => document.querySelector('.native-plugin-dialog')?.focus?.({ preventScroll: true }));
+    }
+  }
+  async function checkCommunityPackageInstallCapability(options = {}) {
+    if (state.packageInstallCapability.status === 'checking') return;
+    if (!options.force && ['ready', 'unavailable'].includes(state.packageInstallCapability.status)) return;
+    const adapter = window.DS_HUB_PLUGIN_ADAPTER;
+    if (!adapter || typeof adapter.capabilities !== 'function') {
+      state.packageInstallCapability = { status: 'unavailable', message: '本机桥尚未开放第三方包安装' };
+      if (state.communityDetail) render();
+      return;
+    }
+    state.packageInstallCapability = { status: 'checking', message: '正在核对本机安装能力' };
+    if (state.communityDetail) render();
+    try {
+      const capabilities = await adapter.capabilities({});
+      state.packageInstallCapability = capabilities?.pluginManagement?.packageInstall === true
+        ? { status: 'ready', message: '已连接第三方包安装能力' }
+        : { status: 'unavailable', message: '本机桥尚未开放第三方包安装' };
+    } catch (_) {
+      state.packageInstallCapability = { status: 'error', message: '无法核验本机安装能力' };
+    }
+    if (state.communityDetail) {
+      render();
+      afterRender(() => document.querySelector('.community-plugin-dialog')?.focus?.({ preventScroll: true }));
+    }
+  }
+  function requestLoaderEntryToggle(identity) {
+    const entry = loaderEntryByIdentity(identity);
+    if (!entry || !isHostRootLoaderEntry(entry) || !loaderEntryManagementReady(entry)) return;
+    if (state.loaderEntryAction?.status === 'applying') { toast('另一条 Loader 入口正在写入并回读'); return; }
+    state.loaderEntryAction = { identity, entryId: entry.entryId, moduleName: entry.moduleName, desiredEnabled: !entry.enabled, status: 'confirm', message: '' };
+    render();
+    afterRender(() => document.querySelector('.loader-entry-confirm .primary')?.focus?.({ preventScroll: true }));
+  }
+  function cancelLoaderEntryToggle(identity) {
+    if (state.loaderEntryAction?.identity !== identity || state.loaderEntryAction.status === 'applying') return;
+    state.loaderEntryAction = null;
+    render();
+    afterRender(() => loaderActionButton(identity)?.focus?.({ preventScroll: true }));
+  }
+  async function applyLoaderEntryToggle(identity) {
+    const action = state.loaderEntryAction;
+    const entry = loaderEntryByIdentity(identity);
+    const adapter = window.DS_HUB_PLUGIN_ADAPTER;
+    if (!action || action.identity !== identity || action.status !== 'confirm' || !entry || !isHostRootLoaderEntry(entry) || !loaderEntryManagementReady(entry)
+      || !adapter || typeof adapter.preflight !== 'function' || typeof adapter.setEnabled !== 'function') return;
+    const requestId = ++loaderEntryRequestCounter;
+    let writeAttempted = false;
+    state.loaderEntryAction = { ...action, requestId, status: 'applying', message: '正在核对当前版本并写入单条入口…' };
+    render();
+    try {
+      const preflightRaw = await adapter.preflight({ entryId: entry.entryId, moduleName: entry.moduleName, desiredEnabled: action.desiredEnabled });
+      if (state.loaderEntryAction?.requestId !== requestId) return;
+      const preflight = normalizeLoaderBridgeReceipt(preflightRaw, entry, 'preflight', action.desiredEnabled);
+      if (!preflight) throw Object.assign(new Error('预检回执不完整'), { code: 'invalid-preflight' });
+      if (preflight.canonicalValue.enabled !== entry.enabled || (entry.enabled && preflight.canonicalValue.fiberPhase !== entry.fiberPhase)) {
+        state.loaderEntryReadbacks[identity] = { ...preflight.canonicalValue, targetRevision: preflight.targetRevision, evidenceRef: preflight.evidenceRef || '' };
+        refreshPluginInventoryPresentation();
+        state.loaderEntryAction = { ...action, status: 'error', message: '入口状态在确认前已变化，页面已按预检结果刷新；请重新选择。' };
+        render();
+        return;
+      }
+      writeAttempted = true;
+      const applyRaw = await adapter.setEnabled({
+        entryId: entry.entryId,
+        moduleName: entry.moduleName,
+        enabled: action.desiredEnabled,
+        expectedRevision: preflight.targetRevision,
+        expectedEnabled: preflight.canonicalValue.enabled,
+        idempotencyKey: `loader-entry-toggle:${stableContentHash({ entryId: entry.entryId, moduleName: entry.moduleName, revision: preflight.targetRevision, enabled: action.desiredEnabled })}`,
+      });
+      if (state.loaderEntryAction?.requestId !== requestId) return;
+      const receipt = normalizeLoaderBridgeReceipt(applyRaw, entry, 'apply', action.desiredEnabled);
+      if (!receipt) throw Object.assign(new Error('写入回执不完整'), { code: 'invalid-readback' });
+      state.loaderEntryReadbacks[identity] = { ...receipt.canonicalValue, targetRevision: receipt.targetRevision, evidenceRef: receipt.evidenceRef };
+      state.lastReadbackAt = new Date().toISOString();
+      refreshPluginInventoryPresentation();
+      state.loaderEntryAction = { ...action, status: 'success', message: `已${action.desiredEnabled ? '启用' : '停用'}这个使用位置；其他位置不受影响，重新读取的结果一致。`, targetRevision: receipt.targetRevision, evidenceRef: receipt.evidenceRef };
+    } catch (error) {
+      if (state.loaderEntryAction?.requestId !== requestId) return;
+      const code = String(error?.code || 'loader-write-failed');
+      if (code === 'state-unknown') {
+        state.loaderEntryAction = { ...action, status: 'unknown', message: '已尝试写入，但回读和回滚都无法确认。不把它当作成功，请刷新 DSH 快照。' };
+      } else if (code === 'revision-conflict') {
+        state.loaderEntryAction = { ...action, status: 'error', message: '目标版本已变化，本次安全未写入。请重新检测后再操作。' };
+      } else if (code === 'state-conflict') {
+        state.loaderEntryAction = { ...action, status: 'error', message: 'Loader 入口状态在预检后已变化，本次安全未写入。请刷新后重新选择。' };
+      } else if (code === 'apply-not-observed') {
+        state.loaderEntryAction = { ...action, status: 'error', message: '写入未被精确回读，本机桥已恢复原状态；页面不宣称成功。' };
+      } else if (writeAttempted) {
+        state.loaderEntryAction = { ...action, status: 'unknown', message: '写入请求已发出，但完整回执无法确认。不把它当作成功，请刷新 DSH 快照。' };
+      } else {
+        state.loaderEntryAction = { ...action, status: 'error', message: '单条 Loader 入口没有完成写入与回读，当前页面状态保持不变。' };
+      }
+    }
+    render();
+    afterRender(() => document.querySelector('.loader-entry-outcome')?.focus?.({ preventScroll: true }) || document.querySelector('.native-plugin-dialog')?.focus?.({ preventScroll: true }));
+  }
+  function preparePluginPresetState(rowId, enabled) {
+    prepareToolStateCandidate(rowId, enabled, { openAssistant: false });
+    afterRender(() => document.querySelector('.native-plugin-dialog')?.focus?.({ preventScroll: true }));
+  }
+  function preparePluginPresetConfig(rowId) {
+    const row = presetToolRows().find((item) => item.id === rowId);
+    if (row && !state.quickToolEdits[rowId]) state.quickToolEdits[rowId] = { ...(row.config || {}) };
+    prepareToolConfigCandidate(rowId, { openAssistant: false });
+    afterRender(() => document.querySelector('.native-plugin-dialog')?.focus?.({ preventScroll: true }));
+  }
+  function openPluginCandidate() {
+    state.componentDetail = null;
+    state.communityDetail = null;
+    state.assistantOpen = true;
+    render();
+    focusAssistantInput();
+  }
+  function openCommunityInstallCandidate() {
+    state.communityDetail = null;
+    state.communityReturnToLibrary = false;
+    state.assistantOpen = true;
+    render();
+    focusAssistantInput();
+  }
   function setLibraryTab(tab) { state.libraryTab = tab === 'community' ? 'community' : 'native'; state.libraryQuery = ''; render(); afterRender(() => document.querySelector('.library-tabs button[aria-pressed="true"]')?.focus?.({ preventScroll: true })); }
   function filterLibrary(value, event) { state.libraryQuery = value; if (event?.isComposing) return; render(); const input = document.querySelector('.library-search'); if (input) { input.focus(); input.setSelectionRange(value.length, value.length); } }
-  function openPresetDrawer() { dialogReturnSelector = '.attire button'; state.presetDrawer = true; render(); afterRender(() => document.querySelector('.drawer')?.focus?.()); }
+  function openPresetDrawer() { dialogReturnTarget = { kind: 'selector', value: '.attire button' }; state.presetDrawer = true; render(); afterRender(() => document.querySelector('.preset-dialog')?.focus?.()); void checkConfigManagementCapability(); }
   function closePresetDrawer() { state.presetDrawer = false; render(); restoreDialogFocus('.attire button'); }
+  function closePresetDialogFromBackdrop(event) { if (event?.target === event?.currentTarget) closePresetDrawer(); }
+  function preparePresetSelection(presetId) {
+    if (!SNAPSHOT.config.presets.some((item) => item.id === presetId)) return;
+    state.quickDrafts.defaultPresetId = presetId;
+    state.presetDrawer = false;
+    prepareQuickCandidate('defaultPresetId');
+  }
+  function startPresetCreation() {
+    state.presetDrawer = false;
+    sendAssistantMessage('我想创建一张新的 Agent 角色卡。请先问清目标、使用场景和约束，再帮我整理提示词、工具组成与测试标准；不要直接修改当前配置。');
+  }
   function openLLM() { state.view = 'llm'; render(); focusViewHeading(); }
   function openFlow() { state.view = 'flow'; render(); focusViewHeading(); }
   function toggleRecommendations() { state.recommendationsOpen = !state.recommendationsOpen; render(); afterRender(() => document.querySelector('.recommend-head button,.recommend-summary button')?.focus?.({ preventScroll: true })); }
@@ -2819,9 +5143,32 @@
       if (scrollBody) scrollBody.scrollTop = scrollBody.scrollHeight;
     });
   }
-  function openAssistant() { dialogReturnSelector = '.assistant-chatbar-input'; state.assistantOpen = true; state.libraryOpen = false; render(); focusAssistantInput(true); }
+  function openAssistant() { dialogReturnTarget = { kind: 'selector', value: '.assistant-chatbar-input' }; state.assistantOpen = true; state.libraryOpen = false; render(); focusAssistantInput(true); void checkConfigManagementCapability(); }
   function closeAssistant() { state.assistantOpen = false; render(); restoreDialogFocus('.assistant-chatbar-input'); }
   function updateAssistantDraft(value) { state.assistantDraft = value; }
+  function startHomeGoal() {
+    if (!String(state.assistantDraft || '').trim()) {
+      toast('先说说你想让这个 Agent 做什么');
+      afterRender(() => document.getElementById('home-goal-input')?.focus?.());
+      return;
+    }
+    sendAssistantMessage();
+  }
+  function homeGoalKeydown(event) { if (!event.isComposing && event.key === 'Enter') { event.preventDefault(); startHomeGoal(); } }
+  function startHomeScenario(kind) {
+    const drafts = {
+      ability: '我想让这个 Agent 学会：',
+      problem: '它现在没有按预期完成这件事：',
+    };
+    if (!drafts[kind]) return;
+    state.assistantDraft = drafts[kind];
+    render();
+    afterRender(() => {
+      const input = document.getElementById('home-goal-input');
+      input?.focus?.();
+      input?.setSelectionRange?.(state.assistantDraft.length, state.assistantDraft.length);
+    });
+  }
   function assistantKeydown(event) { if (!event.isComposing && event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendAssistantMessage(); } }
   function assistantBarKeydown(event) { if (!event.isComposing && event.key === 'Enter') { event.preventDefault(); sendAssistantMessage(); } }
 
@@ -2832,13 +5179,18 @@
     const pending = (key) => hasRestoredPendingRefresh(key);
     const valuesWithheld = state.restoredPendingRefresh;
     const focusItems = Array.isArray(options.focusItems) ? options.focusItems : currentAssistantFocusItems();
+    const currentDefaultRoleCard = pending('defaultPresetId') ? null : effectiveDefaultPreset();
     return {
       selected: { view: state.view, module: state.module, capability: state.capability },
       focusItems,
       config: {
         snapshotStatus: state.restoredPendingRefresh ? 'pending-refresh-values-withheld' : 'current-session-view',
         pendingRefresh: valuesWithheld ? state.pendingRefreshRecords.filter(markerBlocksSnapshot).map(({ key, packageName }) => ({ key, markerTrust: 'untrusted_browser_hint', ...(packageName ? { packageName } : {}) })) : [],
-        preset: pending('defaultPresetId') ? null : effectiveDefaultPreset().id,
+        currentDefaultRoleCard: currentDefaultRoleCard ? {
+          name: currentDefaultRoleCard.name,
+          source: currentDefaultRoleCard.trust === 'system' ? 'DSH 系统随附' : '用户创建',
+          isDefault: true,
+        } : null,
         provider: liveSelection.provider,
         model: liveSelection.model,
         reasoningEffort: pending('reasoningEffort') ? null : (state.appliedOverrides.reasoningEffort ?? liveSelection.reasoningEffort ?? SNAPSHOT.config.model.reasoningEffort),
@@ -2859,6 +5211,7 @@
       recommendations: state.restoredPendingRefresh ? [] : RECOMMENDATIONS,
       methodology: ['核对实际输入', '定位机制与证据', '检查提示词一致性', '形成单项可回退候选', '固定测试集隔离对比', '用户确认采用后写入并回读', '只用采用后的新任务判断线上表现'],
       evidence: {
+        roleCardComponentsMeaning: '这些是当前角色卡内部的提示词、工具和策略组件，不是角色卡名称，也不能替代 config.currentDefaultRoleCard。',
         promptSources: state.restoredPendingRefresh ? [] : ALL_COMPONENTS.filter((item) => item.component.type === 'prompt').slice(0, 24).map((item) => ({
           name: item.component.name,
           tech: item.component.tech,
@@ -3201,6 +5554,12 @@
     return Boolean(window.DS_HUB_OPTIMIZATION_ADAPTER && typeof window.DS_HUB_OPTIMIZATION_ADAPTER.searchCommunity === 'function');
   }
 
+  function communityInstallPlanningReady() {
+    return communitySearchReady()
+      && state.packageInstallCapability.status === 'ready'
+      && Boolean(window.DS_HUB_PLUGIN_ADAPTER && typeof window.DS_HUB_PLUGIN_ADAPTER.capabilities === 'function');
+  }
+
   async function searchCommunityPlugins(message) {
     if (!communitySearchReady() || state.assistantThinking || state.assistantApplying || state.regressionRunning) return;
     const text = String(message || '搜索适合当前能力缺口的开源 DSH 插件').trim();
@@ -3268,6 +5627,65 @@
       render();
       focusAssistantInput();
     }
+  }
+
+  async function installCommunityFromDialog(id) {
+    const item = COMMUNITY_COMPONENTS.find((candidate) => candidate.id === id || candidate.packageName === id);
+    if (!item || state.assistantApplying || state.regressionRunning) return;
+    await checkCommunityPackageInstallCapability({ force: true });
+    if (!communityInstallPlanningReady()) {
+      state.communityInstallState = {
+        packageName: item.packageName,
+        status: 'error',
+        message: state.packageInstallCapability.status !== 'ready'
+          ? '本机桥尚未开放第三方包安装；没有下载、安装或创建安装方案。'
+          : '需连接社区核验服务；没有下载、安装或创建安装方案。',
+      };
+      render();
+      return;
+    }
+    const requestId = ++communityInstallRequestCounter;
+    state.communityInstallState = { packageName: item.packageName, requestId, status: 'checking', message: `正在实时核验 ${item.packageName} 的固定版本与安全声明…` };
+    render();
+    afterRender(() => document.querySelector('.community-plugin-dialog')?.focus?.({ preventScroll: true }));
+    try {
+      const installedPackages = [...new Set([...PLUGIN_GROUPS.map((plugin) => plugin.packageName), ...Object.keys(state.verifiedInstalls)])];
+      const pendingPluginPackages = state.pendingRefreshRecords
+        .filter((marker) => markerBlocksSnapshot(marker) && marker.key === 'pluginInstall')
+        .map((marker) => marker.packageName);
+      const raw = await window.DS_HUB_OPTIMIZATION_ADAPTER.searchCommunity({
+        query: `精确核验并准备安装 ${item.packageName}`,
+        requestedPackageName: item.packageName,
+        catalogVersion: item.version,
+        capabilityGap: `${MODULES[item.moduleKey].name} → ${CAPABILITIES[item.moduleKey]?.find((ability) => ability.id === item.capabilityId)?.name || item.capabilityId}`,
+        focusItems: [],
+        contextRefs: [],
+        snapshotIdentity: SNAPSHOT_IDENTITY,
+        messageDigest: stableContentHash({ action: 'prepare-community-install', packageName: item.packageName, snapshotIdentity: SNAPSHOT_IDENTITY }),
+        installedPackages,
+        unknownStatePackages: pendingPluginPackages,
+        limit: 3,
+      });
+      if (state.communityInstallState?.requestId !== requestId) return;
+      const candidates = normalizePluginCandidates(Array.isArray(raw) ? raw : raw?.candidates, { strict: true, installedPackages });
+      const exact = candidates.find((candidate) => candidate.packageName === item.packageName);
+      if (!exact) throw new Error('没有找到该精确包名的完整实时证据');
+      const task = startAssistantTask('community', { forceNew: true, configArea: 'plugins', targetModule: item.moduleKey, targetCapability: item.capabilityId });
+      task.pluginCandidates = [exact];
+      task.pluginSearchSource = 'live_verified';
+      task.diagnosis = { summary: `已核对 ${exact.packageName}@${exact.version} 的版本、源码、许可证、兼容性、权限和数据外发声明。`, evidenceCount: 2 };
+      task.evidenceRefs = [exact.versionEvidenceUrl, exact.compatibilityEvidenceUrl].filter(Boolean);
+      state.communityInstallState = { packageName: item.packageName, requestId, status: 'candidate', message: `已核验 ${exact.packageName}@${exact.version}，正在准备隔离安装测试方案。` };
+      preparePluginCandidate(0);
+      if (!task.candidate || task.candidate.packageName !== item.packageName) throw new Error('安装测试方案没有通过当前配置边界校验');
+      state.communityInstallState = { packageName: item.packageName, requestId, status: 'candidate', message: `安装方案 ${exact.packageName}@${exact.version} 已就绪；尚未下载、安装或启用。` };
+      render();
+    } catch (error) {
+      if (state.communityInstallState?.requestId !== requestId) return;
+      state.communityInstallState = { packageName: item.packageName, requestId, status: 'error', message: `没有安装：${error?.message || '实时核验失败'}。` };
+      render();
+    }
+    afterRender(() => document.querySelector('.community-plugin-dialog')?.focus?.({ preventScroll: true }));
   }
   function cancelAssistantRequest(reason = '已由用户停止') {
     if (!assistantRequestControl) return;
@@ -3340,8 +5758,14 @@
 
   function updateQuickDraft(key, value) {
     if (key === 'modelSelection') {
-      if (!availableModelCatalog().some((item) => `${item.provider}::${item.id}` === String(value))) return;
+      const model = availableModelCatalog().find((item) => `${item.provider}::${item.id}` === String(value));
+      if (!model) return;
       state.quickDrafts.modelSelection = String(value);
+      const efforts = modelReasoningEfforts(model);
+      if (!efforts.some((item) => item.id === state.quickDrafts.reasoningEffort)) {
+        const preferred = String(model.defaultReasoningEffort || '');
+        state.quickDrafts.reasoningEffort = efforts.find((item) => item.id === preferred)?.id || efforts[0]?.id || '';
+      }
       render();
       afterRender(() => document.getElementById('quick-model-selection')?.focus?.({ preventScroll: true }));
       return;
@@ -3359,7 +5783,9 @@
     const policy = PROPOSAL_POLICIES[key];
     const normalized = policy?.valueType === 'positive-integer' ? Number(value) : String(value);
     if (policy?.valueType === 'positive-integer' && (!Number.isInteger(normalized) || normalized <= 0)) return;
-    if (!policy?.allowedValues.includes(normalized)) return;
+    if (key === 'reasoningEffort') {
+      if (!modelSupportsReasoningEffort(selectedDraftModel(), normalized)) return;
+    } else if (!policy?.allowedValues.includes(normalized)) return;
     state.quickDrafts[key] = normalized;
   }
 
@@ -3439,7 +5865,7 @@
     return validPresetRef(presetRef) ? `agent-preset-ref:${presetRef}#/${suffix}` : '';
   }
 
-  function saveStructuredQuickCandidate(candidate) {
+  function saveStructuredQuickCandidate(candidate, options = {}) {
     if (state.assistantApplying || state.regressionRunning) {
       toast(state.assistantApplying ? '配置正在写入并回读，暂时不能更换候选' : '回归运行中，暂时不能更换候选');
       return;
@@ -3474,14 +5900,18 @@
     state.assistantProposal = null;
     state.assistantPlans.push({ ...safeCandidate });
     state.assistantMessages.push({ role: 'assistant', text: `候选“${safeCandidate.title}”已保存。当前 DSH 配置没有变化；下一步先检查并锁定对应测试集。` });
-    state.assistantOpen = true;
+    state.assistantOpen = options.openAssistant !== false;
     render();
-    focusAssistantInput();
+    if (options.openAssistant !== false) focusAssistantInput();
   }
 
   function prepareModelSelectionCandidate() {
     const model = selectedDraftModel();
     if (!model) return;
+    if (!modelSupportsReasoningEffort(model, state.quickDrafts.reasoningEffort)) {
+      toast('所选模型没有声明这个推理档位，请重新选择');
+      return;
+    }
     const oldValue = {
       provider: SNAPSHOT.config.model.provider,
       model: SNAPSHOT.config.model.model,
@@ -3497,7 +5927,7 @@
       newValue: candidateValueDisplay('modelSelection', expectedValue), newValueDisplay: candidateValueDisplay('modelSelection', expectedValue),
       writeValue: expectedValue, expectedValue,
       impact: '只影响采用后的新建 Agent；既有会话保持原选择。回归时允许候选侧模型三元组按此次选择变化。',
-      checks: ['Provider 与模型组合来自 DSH live 目录', '新建隔离 Agent 回读 session selection', '核对请求头与响应模型来源', '既有会话不被静默切换'],
+      checks: ['模型服务与模型组合来自当前 DSH 目录', '新建隔离 Agent 并重新读取模型选择', '核对请求与响应的模型来源', '既有会话不被静默切换'],
       configArea: 'model', targetModule: 'mind', targetCapability: 'model',
     });
   }
@@ -3563,7 +5993,7 @@
     };
   }
 
-  function prepareToolStateCandidate(rowId, enabled) {
+  function prepareToolStateCandidate(rowId, enabled, options = {}) {
     const row = presetToolRows().find((item) => item.id === rowId);
     if (!row) return;
     const preset = effectiveDefaultPreset();
@@ -3582,10 +6012,10 @@
       impact: `${enabled ? '把现有已部署工具入口加入当前 Agent' : '只从当前 Agent 角色卡停用这个工具入口'}；不会${enabled ? '安装社区插件' : '卸载插件或影响其他角色卡'}。`,
       checks: ['核对目标入口来自当前 Preset 与活动 Inventory', '不把角色卡停用冒充插件卸载', '验证目标工具可用性', '其他工具保持不变'],
       configArea: 'tools', targetModule: classifyTool(row)[0], targetCapability: classifyTool(row)[1],
-    });
+    }, options);
   }
 
-  function prepareToolConfigCandidate(rowId) {
+  function prepareToolConfigCandidate(rowId, options = {}) {
     const row = presetToolRows().find((item) => item.id === rowId);
     if (!row) return;
     const preset = effectiveDefaultPreset();
@@ -3607,7 +6037,7 @@
       impact: '只调整当前 Agent 角色卡中这个工具入口的已知参数；未知字段不会进入候选，敏感凭据仍由 DSH Web 管理。',
       checks: ['只允许当前 Preset 已存在的参数字段', '校验字段类型和组件 schema', '目标工具完成一组隔离测试', '其他工具参数保持不变'],
       configArea: 'tools', targetModule: classifyTool(row)[0], targetCapability: classifyTool(row)[1],
-    });
+    }, options);
   }
 
   function prepareQuickCandidate(key) {
@@ -3626,7 +6056,10 @@
       toast('这个值不是有效的正整数');
       return;
     }
-    if (!policy?.allowedValues.includes(writeValue)) {
+    const allowed = key === 'reasoningEffort'
+      ? modelSupportsReasoningEffort(effectiveModelCatalogEntry(), writeValue)
+      : policy?.allowedValues.includes(writeValue);
+    if (!allowed) {
       toast('这个值不在当前 DSH 的可用范围内');
       return;
     }
@@ -3813,7 +6246,8 @@
       const expected = candidate.expectedValue;
       const oldValue = candidate.expectedOldValue;
       const catalogMatch = availableModelCatalog().some((item) => item.provider === expected?.provider && item.id === expected?.model);
-      const allowedEffort = PROPOSAL_POLICIES.reasoningEffort.allowedValues.includes(expected?.reasoningEffort);
+      const model = availableModelCatalog().find((item) => item.provider === expected?.provider && item.id === expected?.model);
+      const allowedEffort = modelSupportsReasoningEffort(model, expected?.reasoningEffort);
       if (candidate.key !== 'modelSelection' || candidate.targetId !== 'settings:agent-default-model#/selection' || !catalogMatch || !allowedEffort
         || !oldValue?.provider || !oldValue?.model || !canonicalValueEqual(candidate.writeValue, expected)) return null;
       return { ...candidate, target: PENDING_REFRESH_META.modelSelection.target, checks: Array.isArray(candidate.checks) ? candidate.checks.slice(0, 8) : [] };
@@ -4006,6 +6440,10 @@
       toast('还没有满足采用条件');
       return;
     }
+    if (!configTargetMutationReady(task.candidate?.targetId)) {
+      toast('当前 DSH 不允许修改这里，不能采用');
+      return;
+    }
     state.adoptionConfirming = true;
     render();
   }
@@ -4039,6 +6477,24 @@
     if (Object.prototype.hasOwnProperty.call(state.quickDrafts, proposal.key)) state.quickDrafts[proposal.key] = readbackValue;
   }
 
+  function settleDefiniteUnchangedWriteFailure(proposal, task, error, writeStarted, appliedWrite) {
+    if (!writeStarted || appliedWrite || String(error?.state || '') !== 'unchanged') return false;
+    proposal.status = 'candidate';
+    task.decision = null;
+    task.adoption = null;
+    clearUnknownWriteMarker(proposal);
+    clearPresetRosterUnknownMarker(proposal);
+    const planIndex = state.assistantPlans.findIndex((plan) => plan.id === proposal.id);
+    if (planIndex >= 0) state.assistantPlans[planIndex] = { ...proposal };
+    else state.assistantPlans.push({ ...proposal });
+    persistOptimizationState();
+    state.assistantMessages.push({
+      role: 'assistant',
+      text: `Host 在写入前拒绝了这次采用：${error?.message || '预检未通过'}。当前配置未写入；候选仍保留，可修正后重新测试。`,
+    });
+    return true;
+  }
+
   async function adoptAssistantCandidate() {
     const task = state.assistantTask;
     const proposal = task?.candidate;
@@ -4065,9 +6521,14 @@
     }
     Object.assign(proposal, safeProposal);
     const adapter = window.DS_HUB_CONFIG_ADAPTER;
-    if (!configAdapterReady()) {
+    if (!configAdapterReady() || !configTargetMutationReady(proposal.targetId)) {
       state.adoptionConfirming = false;
-      state.assistantMessages.push({ role: 'assistant', text: '采用接口尚未连接，当前 DSH 配置没有变化。回归结果与候选仍会保留。' });
+      state.assistantMessages.push({
+        role: 'assistant',
+        text: proposal.kind === 'preset-patch'
+          ? '当前 DSH 暂未开放角色卡写入，这个候选不能采用；配置没有变化。'
+          : '这项配置不在本机 DSH 已核验的可写目标中，当前配置没有变化。回归结果与候选仍会保留。',
+      });
       state.assistantOpen = true;
       render();
       focusAssistantInput();
@@ -4365,8 +6826,9 @@
         state.assistantMessages.push({ role: 'assistant', text: '写入请求已返回，但回读值或 revision 没有与写入结果一致。真实状态未知，请先核对设置，不要重复提交。' });
       }
     } catch (error) {
-      proposal.status = writeStarted ? 'submitted-unverified' : 'candidate';
-      if (writeStarted) {
+      const definitelyUnchanged = settleDefiniteUnchangedWriteFailure(proposal, task, error, writeStarted, appliedWrite);
+      if (!definitelyUnchanged) proposal.status = writeStarted ? 'submitted-unverified' : 'candidate';
+      if (writeStarted && !definitelyUnchanged) {
         task.decision = 'unknown';
         task.status = 'blocked';
         task.adoption = {
@@ -4385,9 +6847,11 @@
         if (planIndex >= 0) state.assistantPlans[planIndex] = { ...proposal };
         else state.assistantPlans.push({ ...proposal });
       }
-      state.assistantMessages.push({ role: 'assistant', text: writeStarted
-        ? `写入已发起，但没有拿到可信回读：${error?.message || '未知错误'}。真实状态未知，请先核对设置，不要重复提交。`
-        : `应用前检查或写入未完成：${error?.message || '未知错误'}。没有证据表明配置已改变。` });
+      if (!definitelyUnchanged) {
+        state.assistantMessages.push({ role: 'assistant', text: writeStarted
+          ? `写入已发起，但没有拿到可信回读：${error?.message || '未知错误'}。真实状态未知，请先核对设置，不要重复提交。`
+          : `应用前检查或写入未完成：${error?.message || '未知错误'}。没有证据表明配置已改变。` });
+      }
     } finally {
       state.assistantApplying = false;
       state.adoptionConfirming = false;
@@ -4954,6 +7418,11 @@
           presetMappingId: task.candidate.presetMappingId,
         });
         if (!rosterCapture) throw new Error('目标读取没有返回与当前默认角色卡绑定的 roster revision');
+        if (task.candidate.kind === 'preset-selection'
+          && (rosterCapture.candidatePresetRef !== String(task.candidate.expectedValue || '')
+            || !/^sha256:[a-f0-9]{64}$/.test(rosterCapture.candidatePresetDigest))) {
+          throw new Error('候选角色卡内容缺少可核验 digest');
+        }
         if (task.candidate.basePresetRoster && !samePresetRosterSnapshot(task.candidate.basePresetRoster, rosterCapture)) {
           task.candidate.status = 'invalidated';
           throw new Error('角色卡清单或默认指向已经变化，请重新生成候选');
@@ -5054,15 +7523,20 @@
   function globalKeydown(event) {
     if (trapModalTab(event)) return;
     if (event.key !== 'Escape') return;
-    if (state.libraryOpen) { closeLibrary(); return; }
+    if (state.impactPreview) { closeImpactPreview(); return; }
+    if (state.waysDetail) { closeWaysDetail(); return; }
+    if (state.communityDetail) { closeCommunityDetail(); return; }
     if (state.componentDetail) { closeComponent(); return; }
+    if (state.libraryOpen) { closeLibrary(); return; }
     if (state.presetDrawer) { closePresetDrawer(); return; }
+    if (state.relationshipLensOpen) { cancelRelationshipLens(); return; }
     if (state.assistantOpen) closeAssistant();
   }
 
   function render() {
     let body = '';
     if (state.view === 'quick') body = renderQuickConfig();
+    else if (state.view === 'ways') body = renderWays();
     else if (state.view === 'workshop') body = renderWorkshop();
     else if (state.view === 'module') body = renderModule();
     else if (state.view === 'llm') body = renderLLM();
@@ -5092,27 +7566,48 @@
       upsertPendingRefreshRecord,
       upsertPresetRosterPendingMarker,
       presetRosterMarkerProposal,
+      loaderEntryIdentity,
+      pluginInventoryRows,
+      groupPluginRows,
+      pluginEntryPresentation,
+      componentLocationFromRef,
+      isHostRootLoaderEntry,
+      normalizeLoaderBridgeReceipt,
+      settleDefiniteUnchangedWriteFailure,
+      relationshipSpec,
+      relationshipAllItems,
+      relationshipItems,
+      relationshipStagePlan,
+      extensionSystemPlan,
+      communityComponents: COMMUNITY_COMPONENTS,
     });
   }
 
   Object.assign(window, {
-    render, goQuick, goWorkshop, goObserve, goTrial, openModule, selectCapability, showMoreComponents,
-    jumpToCapability, openComponent, closeComponent, openLibrary, closeLibrary, openLibraryComponent, setLibraryTab,
-    filterLibrary, openPresetDrawer, closePresetDrawer, openLLM, openFlow, toggleRecommendations,
+    render, goWays, goQuick, goWorkshop, goObserve, goTrial, openModule, selectCapability, closeCapabilityDetail, showMoreComponents,
+    selectWaysSection, focusWaysMethod, openWaysDetail, closeWaysDetail, openImpactPreview, closeImpactPreview, closeWaysDialogFromBackdrop, askWaysAssistant, draftWaysChange,
+    openExtensionLevel, openRelationshipStage, closeRelationshipStage, focusRelationshipItem, relationshipRoleCardKeydown, openRelationshipItem, scheduleRelationshipLens, toggleRelationshipLens, cycleRelationshipLens, resetRelationshipFocus, relationshipMapKeydown,
+    jumpToCapability, openComponent, closeComponent, openLibrary, closeLibrary, openLibraryComponent, openCommunityDetail, closeCommunityDetail, closePluginDialogFromBackdrop, setLibraryTab,
+    checkPluginManagementCapability, checkCommunityPackageInstallCapability, requestLoaderEntryToggle, cancelLoaderEntryToggle, applyLoaderEntryToggle, reloadPluginState,
+    filterLibrary, openPresetDrawer, closePresetDrawer, closePresetDialogFromBackdrop, preparePresetSelection, startPresetCreation, openLLM, openFlow, toggleRecommendations,
     startAgentRename, agentNameClick, saveAgentName, cancelAgentRename, agentNameInputKeydown,
     toggleAvatar, avatarClick, avatarPointerUp, openAssistant, closeAssistant,
-    updateAssistantDraft, assistantKeydown, assistantBarKeydown, sendAssistantMessage, askAssistant, quickConfigAsk, updateQuickDraft, prepareQuickCandidate, searchCommunityPlugins,
+    updateAssistantDraft, startHomeGoal, homeGoalKeydown, startHomeScenario, assistantKeydown, assistantBarKeydown, sendAssistantMessage, askAssistant, quickConfigAsk, updateQuickDraft, prepareQuickCandidate, searchCommunityPlugins,
     selectQuickSection, setQuickContextMode, filterQuickTools, toggleQuickToolEditor, updateQuickToolConfig, hydrateQuickPersona,
-    prepareModelSelectionCandidate, prepareContextPolicyCandidate, preparePersonaCandidate, prepareToolStateCandidate, prepareToolConfigCandidate,
+    prepareModelSelectionCandidate, prepareContextPolicyCandidate, preparePersonaCandidate, prepareToolStateCandidate, prepareToolConfigCandidate, preparePluginPresetState, preparePluginPresetConfig, openPluginCandidate,
     attachAssistantContext, removeAssistantContext, startContextDrag, endContextDrag, assistantDragOver, assistantDragLeave, assistantDrop,
     runAssistantMessageAction, cancelAssistantRequest,
     prepareAssistantProposal, cancelAssistantConfirm, dismissAssistantProposal,
     applyAssistantProposal, preparePluginCandidate, prepareAdoption, cancelAdoptionConfirm, adoptAssistantCandidate, lockAssistantTestSuite, prepareRegression, cancelRegressionConfirm,
-    runAssistantRegression, abandonAssistantCandidate, openOptimizationWorkbench, assessCommunity,
+    runAssistantRegression, abandonAssistantCandidate, openOptimizationWorkbench, assessCommunity, installCommunityFromDialog, openCommunityInstallCandidate,
     runPostAdoptionObservation, prepareRollbackCandidate, recheckUnknownAdoption, unknownRecheckDisposition, toast,
   });
 
   document.addEventListener?.('keydown', globalKeydown);
+  document.addEventListener?.('click', handleLoaderEntryCommand);
+  document.addEventListener?.('pointermove', relationshipPointerMove);
+  document.addEventListener?.('pointerup', relationshipPointerUp);
+  document.addEventListener?.('pointercancel', relationshipPointerUp);
   window.addEventListener?.('resize', () => {
     if (!state.assistantOpen) return;
     const mobileSheet = isMobileSheet();
@@ -5126,6 +7621,7 @@
   }
   else if (['sense', 'memory', 'mind', 'tools', 'action'].includes(route)) openModule(route);
   else if (route === 'quick') goQuick();
+  else if (route === 'ways' || route === 'methods' || route === 'work') goWays();
   else if (route === 'config' || route === 'full' || route === 'workshop') goWorkshop();
   else if (route === 'observe') goObserve();
   else if (route === 'trial' || route === 'try' || route === 'tune') goTrial();

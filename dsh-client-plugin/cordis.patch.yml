@@ -1,0 +1,7 @@
+# Installed as a DSH bundle layer. The host half owns /ds-hub and
+# /ds-hub-api; the client half contributes the sidebar action and overlay.
+- insert:
+    - id: ui-ds-hub
+      name: 'dsh-ds-hub'
+      config:
+        assistantPreset: ds-hub-assistant

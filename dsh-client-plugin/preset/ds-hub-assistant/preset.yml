@@ -1,0 +1,3 @@
+name: DS Hub 诊断助手
+description: 只分析 DS Hub 页面提供的配置与组件数据，不挂载 Shell、文件或其他动作工具。
+order: 50

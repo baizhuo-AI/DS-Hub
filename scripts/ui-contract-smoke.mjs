@@ -8,7 +8,7 @@ const root = new URL('../', import.meta.url);
 const snapshotSource = await readFile(new URL('dsh-snapshot.js', root), 'utf8');
 const appSource = await readFile(new URL('app.js', root), 'utf8');
 
-function boot(hash = '') {
+function boot(hash = '', globals = {}) {
   const appRoot = { innerHTML: '' };
   const toastRoot = { appendChild() {} };
   const inertNode = {
@@ -33,6 +33,7 @@ function boot(hash = '') {
     },
   };
   context.window = context;
+  Object.assign(context, globals);
   context.DS_HUB_ENABLE_TEST_HOOKS = true;
   context.localStorage = {
     getItem(key) { return storage.get(key) || null; },
@@ -44,41 +45,438 @@ function boot(hash = '') {
   return { context, appRoot, storage };
 }
 
+const SETTINGS_CAPABILITY_TARGETS = Object.freeze([
+  'settings:agent-default-model#/selection',
+  'settings:agent-default-model#/reasoningEffort',
+  'settings:ui-conversation#/busyEnter',
+  'settings:agent-presets#/default',
+  'settings:web-search-deepseek#/maxUses',
+  'settings:permission#/defaultPreset',
+]);
+
+function settingsCapabilityAdapter(targets = SETTINGS_CAPABILITY_TARGETS) {
+  return {
+    async capabilities() {
+      return { ok: true, configManagement: { settingsMutation: true, targets: [...targets] } };
+    },
+    async preflight() { throw new Error('not used by UI capability smoke'); },
+    async apply() { throw new Error('not used by UI capability smoke'); },
+    async readback() { throw new Error('not used by UI capability smoke'); },
+  };
+}
+
+function buttonTag(html, onclick) {
+  const escaped = onclick.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = html.match(new RegExp(`<button\\b[^>]*onclick="${escaped}"[^>]*>[^<]*<\\/button>`));
+  assert.ok(match, `missing button: ${onclick}`);
+  return match[0];
+}
+
 const defaultPage = boot();
-assert.match(defaultPage.appRoot.innerHTML, /dsh-core-logo/);
+assert.match(defaultPage.appRoot.innerHTML, /<h1>工作方式<\/h1>/);
+assert.match(defaultPage.appRoot.innerHTML, /工具决定“能做什么”，这里决定“什么时候、按什么方法去做”/);
+assert.match(defaultPage.appRoot.innerHTML, /横向处理链/);
+assert.match(defaultPage.appRoot.innerHTML, /纵向任务方法/);
+assert.match(defaultPage.appRoot.innerHTML, /自动动作/);
+assert.match(defaultPage.appRoot.innerHTML, /常驻规则/);
+assert.equal((defaultPage.appRoot.innerHTML.match(/class="ways-flow-step"/g) || []).length, 6, 'the horizontal axis must expose six understandable message-lifecycle actions');
+assert.match(defaultPage.appRoot.innerHTML, /收到消息/);
+assert.match(defaultPage.appRoot.innerHTML, /分析消息/);
+assert.match(defaultPage.appRoot.innerHTML, /选择处理方法/);
+assert.match(defaultPage.appRoot.innerHTML, /发送结果/);
+assert.match(defaultPage.appRoot.innerHTML, /诊断式对话/);
+assert.match(defaultPage.appRoot.innerHTML, /了解现状/);
+assert.match(defaultPage.appRoot.innerHTML, /分析具体原因/);
+assert.match(defaultPage.appRoot.innerHTML, /给出行动建议/);
+assert.match(defaultPage.appRoot.innerHTML, /完成后回到横轴/);
 assert.match(defaultPage.appRoot.innerHTML, /class="quick-entry /);
-assert.match(defaultPage.appRoot.innerHTML, /onclick="goWorkshop\(\)">Agent 配置/);
+assert.match(defaultPage.appRoot.innerHTML, /onclick="goWays\(\)">工作方式/);
+assert.match(defaultPage.appRoot.innerHTML, /onclick="goWorkshop\(\)">能力仓库/);
 assert.doesNotMatch(defaultPage.appRoot.innerHTML, /quick-workbench/);
+assert.match(defaultPage.appRoot.innerHTML, /class="assistant-chatbar"/, 'the assistant bar must remain reachable from the work-method surface');
+assert.match(
+  defaultPage.appRoot.innerHTML,
+  /<button\b[^>]*class="logo"[^>]*onclick="goWays\(\)"[^>]*aria-label="返回 DS Hub 首页"/,
+  'the DS Hub logo must be a focusable home button',
+);
+
+defaultPage.context.selectWaysSection('vertical');
+assert.equal((defaultPage.appRoot.innerHTML.match(/class="ways-method-workbench"/g) || []).length, 1, 'the vertical-method workbench must be reachable');
+assert.equal((defaultPage.appRoot.innerHTML.match(/class="ways-method-workbench"[\s\S]*?<nav/g) || []).length, 1);
+assert.equal((defaultPage.appRoot.innerHTML.match(/class="ways-vertical-step-wrap"/g) || []).length, 3, 'diagnostic conversation must show its three-step reasoning method');
+assert.match(defaultPage.appRoot.innerHTML, /产品方法模板/);
+defaultPage.context.focusWaysMethod('plan-method');
+assert.match(defaultPage.appRoot.innerHTML, /确认目标/);
+assert.match(defaultPage.appRoot.innerHTML, /制定计划/);
+assert.match(defaultPage.appRoot.innerHTML, /执行动作/);
+assert.match(defaultPage.appRoot.innerHTML, /验收结果/);
+defaultPage.context.selectWaysSection('hook');
+assert.equal((defaultPage.appRoot.innerHTML.match(/class="ways-hook-stop"/g) || []).length, 3, 'automatic actions must be separated from the main flow');
+defaultPage.context.selectWaysSection('rule');
+assert.equal((defaultPage.appRoot.innerHTML.match(/class="ways-rule-band"/g) || []).length, 5, 'standing rules must remain visible without becoming flow steps');
+defaultPage.context.openWaysDetail('permission-rule');
+assert.match(defaultPage.appRoot.innerHTML, /换掉它会怎样/);
+assert.match(defaultPage.appRoot.innerHTML, /danger-full-access/);
+defaultPage.context.openImpactPreview('permission-rule');
+assert.match(defaultPage.appRoot.innerHTML, /根据当前配置判断/);
+assert.match(defaultPage.appRoot.innerHTML, /尚未运行验证/);
+assert.match(defaultPage.appRoot.innerHTML, /权限会不会变/);
+defaultPage.context.closeImpactPreview();
+defaultPage.context.closeWaysDetail();
 
 const configRoute = boot('#config');
 assert.match(configRoute.appRoot.innerHTML, /dsh-core-logo/);
 assert.doesNotMatch(configRoute.appRoot.innerHTML, /quick-workbench/);
+assert.equal((configRoute.appRoot.innerHTML.match(/id="home-goal-input"/g) || []).length, 1, 'the capability repository keeps exactly one primary goal input');
+assert.match(configRoute.appRoot.innerHTML, /你想让这个 Agent 做什么？/);
+for (const [moduleName, question] of [
+  ['感知', '能看到什么'],
+  ['记忆', '能记住什么'],
+  ['心智', '怎么想'],
+  ['工具', '能做什么'],
+  ['行动', '怎么做'],
+]) {
+  assert.match(
+    configRoute.appRoot.innerHTML,
+    new RegExp(`<div class="mod-name">${moduleName}<\\/div><div class="mod-question">${question}<\\/div>`),
+    `${moduleName} module must use the agreed novice-facing question`,
+  );
+}
 
-const presetDrawer = boot();
+const relationshipRoute = boot();
+relationshipRoute.context.openModule('memory');
+assert.match(relationshipRoute.appRoot.innerHTML, /class="capability-orbit"/, 'module overview must show the capability choices');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /class="capability-focus-page"/, 'module overview must not preload a capability detail below itself');
+relationshipRoute.context.selectCapability('context');
+assert.match(relationshipRoute.appRoot.innerHTML, /class="capability-focus-page"/);
+assert.match(relationshipRoute.appRoot.innerHTML, /返回记忆模块/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /class="spatial-workbench"/, 'capability detail must replace the module overview');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /class="capability-orbit"/, 'capability choices must leave the visual surface while one capability is open');
+assert.match(relationshipRoute.appRoot.innerHTML, /relationship-explorer kind-collaboration/);
+assert.match(relationshipRoute.appRoot.innerHTML, /先判断上下文是否过长，再压缩对话，最后裁掉过大的工具结果/);
+assert.match(relationshipRoute.appRoot.innerHTML, /发现快要超长/);
+assert.match(relationshipRoute.appRoot.innerHTML, /压缩对话内容/);
+assert.match(relationshipRoute.appRoot.innerHTML, /裁剪工具结果/);
+assert.match(relationshipRoute.appRoot.innerHTML, /它和谁有关/);
+assert.match(relationshipRoute.appRoot.innerHTML, /关掉后会怎样/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /插件关系 ·/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /是怎么拼出来的/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /先看每个组件负责哪一步，再决定是否查看详情、停用或替换/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /职责链来自当前配置身份，不是运行轨迹/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /空间浏览/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /relationship-orbit-details/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /relationship-legend/);
+assert.match(relationshipRoute.appRoot.innerHTML, /按列表查看全部/);
+assert.ok((relationshipRoute.appRoot.innerHTML.match(/class="relationship-role-card(?: |")/g) || []).length <= 7, 'relationship story must show only a small focus set');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /后一环节是“社区增强方案”/, 'uninstalled candidates must not be presented as the next current stage');
+
+relationshipRoute.context.openModule('sense');
+relationshipRoute.context.selectCapability('input');
+assert.match(relationshipRoute.appRoot.innerHTML, /relationship-explorer kind-mixed/);
+assert.match(relationshipRoute.appRoot.innerHTML, /材料先进入会话，再变成 Agent 能定位的引用/);
+assert.match(relationshipRoute.appRoot.innerHTML, /接住材料/);
+assert.match(relationshipRoute.appRoot.innerHTML, /让 Agent 找得到/);
+assert.match(relationshipRoute.appRoot.innerHTML, /理解图片内容/);
+assert.match(relationshipRoute.appRoot.innerHTML, /视觉理解 ModLens/);
+assert.match(relationshipRoute.appRoot.innerHTML, /视觉路由与像素工具/);
+assert.match(relationshipRoute.appRoot.innerHTML, /候选未安装/);
+const relationshipRefs = [...relationshipRoute.appRoot.innerHTML.matchAll(/data-relationship-ref="([^"]+)"/g)].map((match) => match[1]);
+const firstRelationshipRef = relationshipRefs[0];
+assert.ok(firstRelationshipRef, 'relationship story needs a focusable component');
+let relationshipKeyPrevented = false;
+relationshipRoute.context.relationshipRoleCardKeydown({ key: 'Enter', preventDefault() { relationshipKeyPrevented = true; } }, relationshipRefs[1]);
+assert.equal(relationshipKeyPrevented, true);
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.state.relationshipFocusRef, relationshipRefs[1], 'Enter must select the relationship card');
+relationshipRoute.context.focusRelationshipItem(firstRelationshipRef);
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.state.relationshipFocusRef, firstRelationshipRef);
+assert.match(relationshipRoute.appRoot.innerHTML, /aria-pressed="true"/);
+relationshipRoute.context.resetRelationshipFocus();
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.state.relationshipFocusRef, null);
+
+relationshipRoute.context.closeCapabilityDetail();
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.state.capability, null);
+assert.match(relationshipRoute.appRoot.innerHTML, /class="capability-orbit"/, 'back must restore the parent module overview');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /class="capability-focus-page"/);
+
+relationshipRoute.context.openModule('mind');
+relationshipRoute.context.selectCapability('model');
+assert.match(relationshipRoute.appRoot.innerHTML, /id="capability-focus-title">选择与调用模型</);
+assert.match(relationshipRoute.appRoot.innerHTML, /模型服务负责把请求发出去/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /Provider 负责|Provider 适配器/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /插件关系 · 模型调用链/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /选择与调用模型是怎么拼出来的/);
+
+relationshipRoute.context.openModule('mind');
+relationshipRoute.context.selectCapability('plan');
+assert.match(relationshipRoute.appRoot.innerHTML, /15\/15/);
+assert.match(relationshipRoute.appRoot.innerHTML, /全部组件都能继续查看/);
+assert.match(relationshipRoute.appRoot.innerHTML, /Agent 工具和用户命令从两条入口/);
+assert.equal((relationshipRoute.appRoot.innerHTML.match(/class="relationship-depth-stage"/g) || []).length, 5, 'the 15 planning components must first resolve into five understandable groups');
+assert.equal((relationshipRoute.appRoot.innerHTML.match(/class="relationship-role-card(?: |")/g) || []).length, 0, 'the group overview must not dump plugin cards onto the first level');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML.split('<details class="relationship-all-components">')[0], /让能力在 DSH 中成立|运行支持/);
+let reachablePlanningComponents = 0;
+for (const [stageId, expectedCount] of [['mode', 2], ['state', 2], ['commands', 4], ['agent-tools', 4], ['pages', 3]]) {
+  relationshipRoute.context.openRelationshipStage(stageId);
+  const count = (relationshipRoute.appRoot.innerHTML.match(/class="relationship-role-card(?: |")/g) || []).length;
+  assert.equal(count, expectedCount, `${stageId} must expose every real component in that group`);
+  assert.match(relationshipRoute.appRoot.innerHTML, /全部 15 个组件/);
+  reachablePlanningComponents += count;
+  relationshipRoute.context.closeRelationshipStage();
+}
+assert.equal(reachablePlanningComponents, 15, 'all 15 planning components must be reachable through the hierarchy');
+relationshipRoute.context.openRelationshipStage('agent-tools');
+assert.match(relationshipRoute.appRoot.innerHTML, /启用目标能力/);
+assert.match(relationshipRoute.appRoot.innerHTML, /Agent 可以读取或更新长期目标/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /客户端|Loader|Host/);
+
+relationshipRoute.context.openModule('tools');
+relationshipRoute.context.selectCapability('extensions');
+assert.match(relationshipRoute.appRoot.innerHTML, /典型路径/);
+assert.match(relationshipRoute.appRoot.innerHTML, /本次实际运行 · 暂无记录/);
+assert.match(relationshipRoute.appRoot.innerHTML, /Agent 做任务时/);
+assert.match(relationshipRoute.appRoot.innerHTML, /DSH 启动时/);
+assert.match(relationshipRoute.appRoot.innerHTML, /用户打开网页时/);
+assert.match(relationshipRoute.appRoot.innerHTML, /工具结果太长时/);
+assert.equal((relationshipRoute.appRoot.innerHTML.match(/class="extension-flow-branch(?: |")/g) || []).length, 4, 'root must branch into four lifecycle paths');
+assert.equal((relationshipRoute.appRoot.innerHTML.match(/class="extension-flow-node(?: |")/g) || []).length, 0, 'root must not expose leaf plugins before the user drills down');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /@deepseek-ai\/dsh-client-ui-layout/, 'technical plugin identities belong at the leaf level');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /空间浏览（次要视图）/, '38 components must use the grouped system map instead of an unreadable orbit');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /38 项 · 逐层理解/, 'the canvas must not narrate its own progressive-disclosure design');
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /一条 Agent 主线，三类支撑/, 'the old equal-card mental model must be removed');
+
+relationshipRoute.context.openExtensionLevel('runtime');
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.state.extensionPath, 'runtime');
+assert.match(relationshipRoute.appRoot.innerHTML, /DSH 怎样让插件可用/);
+assert.match(relationshipRoute.appRoot.innerHTML, /读取启动设置/);
+assert.match(relationshipRoute.appRoot.innerHTML, /准备并启动插件/);
+assert.match(relationshipRoute.appRoot.innerHTML, /启动后台服务/);
+assert.match(relationshipRoute.appRoot.innerHTML, /连接网页/);
+assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, />loader<|>Host<|>client</);
+assert.equal((relationshipRoute.appRoot.innerHTML.match(/class="extension-flow-stage-node(?: |")/g) || []).length, 4, 'startup view must show four human-readable phases');
+assert.equal((relationshipRoute.appRoot.innerHTML.match(/class="extension-flow-node(?: |")/g) || []).length, 0);
+
+relationshipRoute.context.openExtensionLevel('ui');
+assert.match(relationshipRoute.appRoot.innerHTML, /先画出页面，再同时加上功能/);
+assert.match(relationshipRoute.appRoot.innerHTML, /提供工作区域/);
+assert.match(relationshipRoute.appRoot.innerHTML, /提供配置页面/);
+assert.match(relationshipRoute.appRoot.innerHTML, /显示运行反馈/);
+assert.equal((relationshipRoute.appRoot.innerHTML.match(/class="extension-flow-stage-node(?: |")/g) || []).length, 4, 'UI view must show shell first and three parallel areas');
+
+const extensionLeafPaths = [
+  ['skill', 5],
+  ['runtime/config', 1],
+  ['runtime/load', 4],
+  ['runtime/host', 5],
+  ['runtime/client', 6],
+  ['ui/shell', 4],
+  ['ui/workspace', 4],
+  ['ui/manage', 6],
+  ['ui/observe', 2],
+  ['cross', 1],
+];
+let reachableExtensionComponents = 0;
+for (const [path, expectedCount] of extensionLeafPaths) {
+  relationshipRoute.context.openExtensionLevel(path);
+  const count = (relationshipRoute.appRoot.innerHTML.match(/class="extension-flow-node(?: |")/g) || []).length;
+  assert.equal(count, expectedCount, `${path} must expose exactly its real leaf components`);
+  assert.match(relationshipRoute.appRoot.innerHTML, /extension-hierarchy-crumbs/);
+  if (path === 'runtime/load') {
+    assert.match(relationshipRoute.appRoot.innerHTML, /插件启动入口/);
+    assert.match(relationshipRoute.appRoot.innerHTML, /登记插件信息/);
+    assert.match(relationshipRoute.appRoot.innerHTML, /创建插件实例/);
+    assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /<b>Cordis加载入口<\/b>|<b>类型系统加载器<\/b>/);
+  }
+  if (path === 'runtime/host') {
+    assert.match(relationshipRoute.appRoot.innerHTML, /启动后台插件/);
+    assert.match(relationshipRoute.appRoot.innerHTML, /接收所有请求/);
+    assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /<b>Host|<b>API网关<\/b>/);
+  }
+  if (path === 'runtime/client') {
+    assert.match(relationshipRoute.appRoot.innerHTML, /启动网页功能/);
+    assert.match(relationshipRoute.appRoot.innerHTML, /连接网页与后台/);
+    assert.doesNotMatch(relationshipRoute.appRoot.innerHTML, /<b>客户端|<b>Cordis/);
+  }
+  reachableExtensionComponents += count;
+}
+assert.equal(reachableExtensionComponents, 38, 'all 38 synced extension components must be reachable through the hierarchy');
+assert.match(relationshipRoute.appRoot.innerHTML, /缩短过长的工具结果/);
+assert.match(relationshipRoute.appRoot.innerHTML, /不可直接替换/);
+const extensionRefs = [...relationshipRoute.appRoot.innerHTML.matchAll(/data-extension-component="([^"]+)"/g)].map((match) => match[1]);
+relationshipRoute.context.focusRelationshipItem(extensionRefs[0]);
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.state.relationshipFocusRef, extensionRefs[0], 'every leaf component must remain selectable');
+assert.match(relationshipRoute.appRoot.innerHTML, /工具结果超过上下文需要/);
+
+relationshipRoute.context.openExtensionLevel('runtime/load');
+assert.match(relationshipRoute.appRoot.innerHTML, /可直接停用/);
+assert.match(relationshipRoute.appRoot.innerHTML, /不可直接替换/);
+relationshipRoute.context.openExtensionLevel('ui/shell');
+assert.match(relationshipRoute.appRoot.innerHTML, /可换同类/);
+assert.match(relationshipRoute.appRoot.innerHTML, /当前无备选/);
+
+relationshipRoute.context.openModule('action');
+relationshipRoute.context.selectCapability('permission');
+assert.match(relationshipRoute.appRoot.innerHTML, /relationship-explorer kind-constraint/);
+assert.match(relationshipRoute.appRoot.innerHTML, /权限方案先划定默认范围/);
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.relationshipSpec('tools', 'files').kind, 'toolbox');
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.relationshipSpec('mind', 'identity').kind, 'layers');
+assert.equal(relationshipRoute.context.DS_HUB_TEST_HOOKS.relationshipSpec('mind', 'model').kind, 'collaboration');
+
+const presetDrawer = boot('#config');
 presetDrawer.context.openPresetDrawer();
-assert.match(presetDrawer.appRoot.innerHTML, /本次快照已安全映射/);
-assert.doesNotMatch(presetDrawer.appRoot.innerHTML, /preset-ref-[a-f0-9]{32}/, 'opaque refs should stay out of ordinary product copy');
+assert.match(presetDrawer.appRoot.innerHTML, /<section class="plugin-dialog preset-dialog"[^>]*role="dialog"[^>]*aria-modal="true"/);
+assert.doesNotMatch(presetDrawer.appRoot.innerHTML, /<aside class="drawer"[^>]*aria-label="角色卡/);
+assert.match(presetDrawer.appRoot.innerHTML, /DSH 0\.1\.1-rc\.2 随附说明/);
+assert.doesNotMatch(presetDrawer.appRoot.innerHTML.replace(/<[^>]+>/g, ' '), /preset-ref-[a-f0-9]{32}/, 'opaque refs should stay out of visible product copy');
+
+const presetCandidate = boot('#config', { DS_HUB_CONFIG_ADAPTER: settingsCapabilityAdapter() });
+presetCandidate.context.openPresetDrawer();
+await new Promise((resolve) => setTimeout(resolve, 0));
+const nextPreset = presetCandidate.context.DSH_SNAPSHOT.config.presets.find(
+  (item) => item.id !== presetCandidate.context.DSH_SNAPSHOT.config.defaultPresetId,
+);
+assert.ok(nextPreset, 'the synced DSH roster must include a non-default role card for switching');
+assert.match(presetCandidate.appRoot.innerHTML, /生成切换候选/);
+presetCandidate.context.preparePresetSelection(nextPreset.id);
+assert.equal(presetCandidate.context.DS_HUB_TEST_HOOKS.state.assistantTask?.candidate?.key, 'defaultPresetId');
+assert.equal(presetCandidate.context.DS_HUB_TEST_HOOKS.state.assistantTask?.candidate?.status, 'draft');
+assert.equal(presetCandidate.context.DS_HUB_TEST_HOOKS.state.assistantTask?.candidate?.expectedValue, nextPreset.id);
+assert.match(presetCandidate.appRoot.innerHTML, /当前 DSH 配置没有变化/);
 
 const quickRoute = boot('#quick');
 assert.match(quickRoute.appRoot.innerHTML, /quick-workbench/);
 assert.match(quickRoute.appRoot.innerHTML, /DeepSeek-V4-Pro/);
+assert.match(quickRoute.appRoot.innerHTML, /仅查看/);
 quickRoute.context.selectQuickSection('context');
 assert.match(quickRoute.appRoot.innerHTML, /上下文处理方式/);
 assert.doesNotMatch(quickRoute.appRoot.innerHTML, /快速调整忙时消息/);
+assert.match(buttonTag(quickRoute.appRoot.innerHTML, 'prepareContextPolicyCandidate()'), /disabled/);
+assert.match(buttonTag(quickRoute.appRoot.innerHTML, 'prepareContextPolicyCandidate()'), />当前只读<\/button>$/);
 quickRoute.context.selectQuickSection('prompt');
 assert.match(quickRoute.appRoot.innerHTML, /You are a coding agent powered by the/);
 assert.match(quickRoute.appRoot.innerHTML, /不写入 localStorage/);
+assert.match(quickRoute.appRoot.innerHTML, /<textarea[^>]*disabled[^>]*>/);
+assert.match(quickRoute.appRoot.innerHTML, /Persona<\/b>当前只读/);
 quickRoute.context.selectQuickSection('tools');
-assert.match(quickRoute.appRoot.innerHTML, /增删改工具/);
-assert.match(quickRoute.appRoot.innerHTML, /从 Agent 移除/);
+assert.match(quickRoute.appRoot.innerHTML, /查看工具组成/);
 assert.match(quickRoute.appRoot.innerHTML, /可加入/);
+assert.match(quickRoute.appRoot.innerHTML, /当前只能查看工具组成，暂不能修改/);
 const actualToolRowCount = quickRoute.context.DSH_SNAPSHOT.config.presetRows.filter((row) => row.id.startsWith('tool-')).length;
-assert.equal((quickRoute.appRoot.innerHTML.match(/prepareToolStateCandidate\('/g) || []).length, actualToolRowCount);
+assert.equal((quickRoute.appRoot.innerHTML.match(/prepareToolStateCandidate\(/g) || []).length, actualToolRowCount);
+const readOnlyToolActions = [...quickRoute.appRoot.innerHTML.matchAll(/<button\b[^>]*onclick="prepareToolStateCandidate\([^>]+>[^<]*<\/button>/g)].map((match) => match[0]);
+assert.equal(readOnlyToolActions.length, actualToolRowCount);
+assert.equal(readOnlyToolActions.every((tag) => /disabled/.test(tag) && />当前只读<\/button>$/.test(tag)), true);
 const beforeCompositionHtml = quickRoute.appRoot.innerHTML;
 quickRoute.context.filterQuickTools('zidingyi', { isComposing: true });
 assert.equal(quickRoute.appRoot.innerHTML, beforeCompositionHtml, 'IME composition should not rebuild the tool list');
 quickRoute.context.filterQuickTools('子 Agent', { isComposing: false });
 assert.match(quickRoute.appRoot.innerHTML, /子 Agent/);
+
+// The live Host currently exposes six settings targets. This must unlock the
+// exact model controls without turning real Preset/context/tool data into fake
+// writable controls.
+const settingsOnlyRoute = boot('#quick', { DS_HUB_CONFIG_ADAPTER: settingsCapabilityAdapter() });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(settingsOnlyRoute.context.DS_HUB_TEST_HOOKS.state.configManagementCapability.status, 'ready');
+assert.deepEqual(
+  Array.from(settingsOnlyRoute.context.DS_HUB_TEST_HOOKS.state.configManagementCapability.targets),
+  Array.from(SETTINGS_CAPABILITY_TARGETS),
+);
+const modelSelect = settingsOnlyRoute.appRoot.innerHTML.match(/<select id="quick-model-selection"[^>]*>/)?.[0] || '';
+assert.ok(modelSelect, 'settings-only capability must keep the real DSH model selector visible');
+assert.doesNotMatch(modelSelect, /disabled/);
+assert.doesNotMatch(buttonTag(settingsOnlyRoute.appRoot.innerHTML, 'prepareModelSelectionCandidate()'), /disabled/);
+assert.match(buttonTag(settingsOnlyRoute.appRoot.innerHTML, 'prepareModelSelectionCandidate()'), />保存为候选<\/button>$/);
+
+settingsOnlyRoute.context.selectQuickSection('context');
+assert.match(settingsOnlyRoute.appRoot.innerHTML, /上下文处理方式/);
+const contextModeTags = [...settingsOnlyRoute.appRoot.innerHTML.matchAll(/<button\b[^>]*data-context-mode="[^"]+"[^>]*>/g)].map((match) => match[0]);
+assert.equal(contextModeTags.length, 3);
+assert.equal(contextModeTags.every((tag) => /disabled/.test(tag)), true, 'context values stay visible but read-only');
+assert.match(buttonTag(settingsOnlyRoute.appRoot.innerHTML, 'prepareContextPolicyCandidate()'), /disabled/);
+settingsOnlyRoute.context.selectQuickSection('prompt');
+assert.match(settingsOnlyRoute.appRoot.innerHTML, /You are a coding agent powered by the/);
+assert.match(settingsOnlyRoute.appRoot.innerHTML, /<textarea[^>]*disabled[^>]*>/);
+assert.match(settingsOnlyRoute.appRoot.innerHTML, /当前 DSH 暂未开放角色卡写入/);
+settingsOnlyRoute.context.selectQuickSection('tools');
+const settingsOnlyToolActions = [...settingsOnlyRoute.appRoot.innerHTML.matchAll(/<button\b[^>]*onclick="prepareToolStateCandidate\([^>]+>[^<]*<\/button>/g)].map((match) => match[0]);
+assert.equal(settingsOnlyToolActions.length, actualToolRowCount);
+assert.equal(settingsOnlyToolActions.every((tag) => /disabled/.test(tag) && />当前只读<\/button>$/.test(tag)), true);
+
+function readyAdoptionTask(targetId) {
+  const candidateId = 'candidate-capability-boundary';
+  const suiteId = 'suite-capability-boundary';
+  const baseTarget = { targetId, revision: 'target-revision-1', value: { mode: 'auto' }, evidenceRef: 'target-proof-1' };
+  const baseModelEnvironment = {
+    targetId: 'settings:agent-default-model#/selection',
+    revision: 'model-revision-1',
+    selection: {
+      provider: settingsOnlyRoute.context.DSH_SNAPSHOT.config.model.provider,
+      model: settingsOnlyRoute.context.DSH_SNAPSHOT.config.model.model,
+      reasoningEffort: settingsOnlyRoute.context.DSH_SNAPSHOT.config.model.reasoningEffort,
+    },
+    evidenceRef: 'model-proof-1',
+  };
+  return {
+    id: 'optimization-capability-boundary',
+    title: '配置能力边界',
+    goal: '只采用 Host 明确开放的目标',
+    status: 'active',
+    configArea: 'context',
+    decision: null,
+    candidate: {
+      id: candidateId,
+      kind: 'preset-patch',
+      key: 'contextPolicy',
+      targetId,
+      target: '当前角色卡上下文策略',
+      title: '调整上下文处理方式',
+      impact: '仅用于验证采用按钮的精确目标能力边界。',
+      oldValue: { mode: 'auto' },
+      expectedValue: { mode: 'manual' },
+      configArea: 'context',
+      status: 'draft',
+      baseTarget,
+      baseModelEnvironment,
+    },
+    testSuite: {
+      id: suiteId,
+      version: 1,
+      name: '能力边界测试集',
+      status: 'locked',
+      contentHash: 'suite-hash-1',
+      configArea: 'context',
+      candidateId,
+      cases: [],
+    },
+    comparison: {
+      status: 'completed',
+      verified: true,
+      acceptanceMet: true,
+      environmentAligned: true,
+      targetAligned: true,
+      candidateId,
+      testSuiteId: suiteId,
+      testSuiteVersion: 1,
+      testSuiteHash: 'suite-hash-1',
+      baseTarget: { ...baseTarget },
+      modelEnvironment: { ...baseModelEnvironment, selection: { ...baseModelEnvironment.selection } },
+      summary: { total: 0, improved: 0, regressed: 0, criticalFailures: 0 },
+      caseResults: [],
+    },
+  };
+}
+
+const presetTarget = `agent-preset-ref:${settingsOnlyRoute.context.DSH_SNAPSHOT.config.defaultPresetRef}#/context-policy`;
+settingsOnlyRoute.context.DS_HUB_TEST_HOOKS.state.assistantTask = readyAdoptionTask(presetTarget);
+settingsOnlyRoute.context.goTrial();
+assert.match(buttonTag(settingsOnlyRoute.appRoot.innerHTML, 'prepareAdoption()'), /disabled/);
+assert.match(settingsOnlyRoute.appRoot.innerHTML, /当前 DSH 不允许修改这里/);
+
+// Keep every regression fact identical and change only candidate.targetId. The
+// exact settings target is writable, so the adoption control can open.
+settingsOnlyRoute.context.DS_HUB_TEST_HOOKS.state.assistantTask = readyAdoptionTask('settings:agent-default-model#/selection');
+settingsOnlyRoute.context.goTrial();
+assert.doesNotMatch(buttonTag(settingsOnlyRoute.appRoot.innerHTML, 'prepareAdoption()'), /disabled/);
 
 const contextCandidate = boot('#quick');
 const compaction = contextCandidate.context.DSH_SNAPSHOT.config.presetRows.find((row) => row.id === 'compaction-basic');
@@ -99,7 +497,7 @@ assert.match(promptCandidate.appRoot.innerHTML, /当前 DSH 配置没有变化/)
 
 const toolCandidate = boot('#quick');
 toolCandidate.context.selectQuickSection('tools');
-const toolAction = toolCandidate.appRoot.innerHTML.match(/prepareToolStateCandidate\('([^']+)',(true|false)\)/);
+const toolAction = toolCandidate.appRoot.innerHTML.match(/prepareToolStateCandidate\(&quot;([^&]+)&quot;,(true|false)\)/);
 assert.ok(toolAction, 'quick tool editor should expose at least one real Preset tool action');
 toolCandidate.context.prepareToolStateCandidate(toolAction[1], toolAction[2] === 'true');
 assert.match(toolCandidate.appRoot.innerHTML, /(?:加入|移除)工具：/);
@@ -115,6 +513,13 @@ assert.match(toolConfigCandidate.appRoot.innerHTML, /maxRounds=32/);
 assert.doesNotMatch(toolConfigCandidate.appRoot.innerHTML, /当前参数.*参数候选/);
 
 const assistant = boot();
+assistant.context.DS_HUB_TEST_HOOKS.state.assistantMessages = [{
+  role: 'assistant',
+  text: '第一段\n\n- **重点** <img src=x onerror=alert(1)>\n- 第二项',
+}];
+assistant.context.openAssistant();
+assert.match(assistant.appRoot.innerHTML, /<div class="assistant-copy"><p>第一段<\/p><ul><li><strong>重点<\/strong> &lt;img src=x onerror=alert\(1\)&gt;<\/li><li>第二项<\/li><\/ul><\/div>/);
+assert.doesNotMatch(assistant.appRoot.innerHTML, /<img src=x onerror=/, 'assistant HTML must remain escaped before Markdown formatting');
 assistant.context.attachAssistantContext('module/tools');
 assert.match(assistant.appRoot.innerHTML, /下一条消息将分析/);
 assert.match(assistant.appRoot.innerHTML, /工具模块/);
@@ -147,6 +552,7 @@ assert.match(focusedDiagnose.appRoot.innerHTML, /当前最值得先核对/);
 assert.match(focusedDiagnose.appRoot.innerHTML, /本次附加范围：记忆模块/);
 
 const digests = [];
+const assistantContexts = [];
 let environmentRead = 0;
 assistant.context.DS_HUB_AI_ADAPTER = {
   async describeEnvironment() {
@@ -161,6 +567,7 @@ assistant.context.DS_HUB_AI_ADAPTER = {
   },
   async ask(request) {
     digests.push(request.messageDigest);
+    assistantContexts.push(request.context);
     return { text: 'proof intentionally incomplete', environment: {} };
   },
 };
@@ -170,6 +577,9 @@ assistant.context.attachAssistantContext('module/memory');
 await assistant.context.sendAssistantMessage('比较这个对象');
 assert.equal(digests.length, 2);
 assert.notEqual(digests[0], digests[1]);
+assert.equal(assistantContexts[0].config.currentDefaultRoleCard.name, assistant.context.DSH_SNAPSHOT.config.activePreset.name);
+assert.equal(assistantContexts[0].config.currentDefaultRoleCard.isDefault, true);
+assert.match(assistantContexts[0].evidence.roleCardComponentsMeaning, /不是角色卡名称/);
 
 const forgedTransfer = {
   files: [],

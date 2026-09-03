@@ -49,6 +49,7 @@ function createRuntime({ storedState, mutateSnapshot, withAI = false } = {}) {
     matchMedia: () => ({ matches: false }),
   };
   context.window = context;
+  context.DS_HUB_ENABLE_TEST_HOOKS = true;
   context.window.addEventListener = () => {};
   context.window.localStorage = {
     getItem(key) { return storage.get(key) ?? null; },
@@ -112,6 +113,35 @@ const storedUnknown = {
     readbackValue: 'SMOKE_READBACK_VALUE',
   }],
 };
+
+// A trusted Host `state: unchanged` rejection clears the pre-write safety
+// marker and keeps the candidate retryable instead of misreporting an unknown write.
+const unchangedRuntime = createRuntime();
+const unchangedProposal = {
+  id: 'candidate-definitely-unchanged',
+  key: 'reasoningEffort',
+  title: '调整新任务的推理强度',
+  target: '默认模型的推理强度',
+  targetId: 'settings:agent-default-model#/reasoningEffort',
+  baseTarget: { targetId: 'settings:agent-default-model#/reasoningEffort' },
+  status: 'applying',
+};
+const unchangedTask = { decision: null, adoption: null, status: 'complete' };
+assert.equal(unchangedRuntime.context.DS_HUB_TEST_HOOKS.upsertUnknownWriteMarker(unchangedProposal, attemptedAt), true);
+assert.equal(unchangedRuntime.context.DS_HUB_TEST_HOOKS.state.pendingRefreshRecords.length, 1);
+assert.equal(unchangedRuntime.context.DS_HUB_TEST_HOOKS.settleDefiniteUnchangedWriteFailure(
+  unchangedProposal,
+  unchangedTask,
+  { code: 'revision-conflict', state: 'unchanged', message: '目标版本已变化' },
+  true,
+  null,
+), true);
+assert.equal(unchangedProposal.status, 'candidate');
+assert.notEqual(unchangedTask.status, 'blocked');
+assert.equal(unchangedTask.adoption, null);
+assert.deepEqual(JSON.parse(JSON.stringify(unchangedRuntime.context.DS_HUB_TEST_HOOKS.state.pendingRefreshRecords)), []);
+assert.deepEqual(JSON.parse(unchangedRuntime.storage.get(storageKey)).pendingRefreshRecords, []);
+assert.match(unchangedRuntime.context.DS_HUB_TEST_HOOKS.state.assistantMessages.at(-1).text, /当前配置未写入/);
 
 // The marker is established and persisted before the adapter write boundary.
 const applyBoundary = appSource.indexOf('const applyResult = await adapter.apply(writeRequest)');

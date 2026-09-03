@@ -11,6 +11,7 @@ const outputPath = path.resolve(scriptDir, '../dsh-snapshot.js');
 const repositoryPath = path.resolve(scriptDir, '..');
 const privateDirectoryPath = path.resolve(process.env.DS_HUB_PRIVATE_DIR || path.join(homedir(), '.dsh', 'ds-hub', 'private'));
 const privatePresetMappingPath = path.join(privateDirectoryPath, 'preset-mapping.json');
+const INTERNAL_ASSISTANT_PRESET = 'ds-hub-assistant';
 const cliArgs = process.argv.slice(2);
 const includeSkillCopy = cliArgs.includes('--include-skill-copy');
 const includeUserPresetNames = cliArgs.includes('--include-user-preset-names');
@@ -104,6 +105,12 @@ function modelDirectoryOf(catalog, namespaces, providerDirectory) {
       const contextWindow = spec.contextWindow ?? spec.context?.contextWindow ?? settings.defaultContextWindow;
       const maxTokens = spec.maxTokens ?? spec.defaultMaxTokens ?? settings.defaultMaxTokens ?? settings.maxTokens;
       const inputModalities = Array.isArray(spec.inputModalities) ? [...spec.inputModalities] : [];
+      const reasoningEfforts = Array.isArray(advertised?.reasoning?.efforts)
+        ? advertised.reasoning.efforts.map((effort) => ({
+          id: String(effort?.id || ''),
+          label: String(effort?.name || effort?.id || ''),
+        })).filter((effort) => effort.id)
+        : [];
       const next = {
         provider,
         id,
@@ -112,6 +119,10 @@ function modelDirectoryOf(catalog, namespaces, providerDirectory) {
         inputModalities,
         maxTokens: Number.isInteger(maxTokens) && maxTokens > 0 ? maxTokens : null,
         metadataNamespace: metadata.namespace,
+        reasoningEfforts,
+        defaultReasoningEffort: reasoningEfforts.some((effort) => effort.id === advertised?.reasoning?.defaultEffort)
+          ? String(advertised.reasoning.defaultEffort)
+          : null,
       };
       const key = `${provider}\u0000${id}`;
       const previous = byRoute.get(key);
@@ -127,6 +138,8 @@ function modelDirectoryOf(catalog, namespaces, providerDirectory) {
         inputModalities: previous.inputModalities.length ? previous.inputModalities : next.inputModalities,
         maxTokens: previous.maxTokens ?? next.maxTokens,
         metadataNamespace: previous.metadataNamespace ?? next.metadataNamespace,
+        reasoningEfforts: previous.reasoningEfforts.length ? previous.reasoningEfforts : next.reasoningEfforts,
+        defaultReasoningEffort: previous.defaultReasoningEffort ?? next.defaultReasoningEffort,
       });
     }
   }
@@ -514,10 +527,14 @@ const [host, presetList, settingsView, sessionsView, pluginInventory, providerDi
 const namespaces = settingsView.namespaces || [];
 const defaultPresetId = valueOf(namespaces, 'agent-presets').default
   || presetList.presets.find((preset) => preset.isDefault)?.id;
+if (defaultPresetId === INTERNAL_ASSISTANT_PRESET) {
+  throw new Error('DS Hub internal assistant preset cannot be the DSH default preset.');
+}
 const presetRead = await call('agentPreset.read', { agentPreset: defaultPresetId });
-const sessions = sessionsView.items || [];
+const publicPresets = (presetList.presets || []).filter((preset) => String(preset?.id || '') !== INTERNAL_ASSISTANT_PRESET);
+const sessions = (sessionsView.items || []).filter((session) => String(session?.agentPreset || '') !== INTERNAL_ASSISTANT_PRESET);
 const observedPresetIds = new Set([
-  ...(presetList.presets || []).map((preset) => String(preset?.id || '')),
+  ...publicPresets.map((preset) => String(preset?.id || '')),
   String(defaultPresetId || ''),
   String(presetRead.agentPreset || ''),
   ...sessions.map((item) => String(item?.agentPreset || '')),
@@ -531,7 +548,7 @@ const publicPresetRef = (presetId) => {
   if (!ref) throw new Error('Observed preset identity is missing from the private mapping.');
   return ref;
 };
-const publicPresetRoster = presetList.presets.map((preset) => publicPreset(preset, presetRefMap));
+const publicPresetRoster = publicPresets.map((preset) => publicPreset(preset, presetRefMap));
 const rosterRevision = presetRosterRevision(publicPresetRoster, presetMappingId);
 const presetRows = parsePresetRows(presetRead.content, {
   includePersonaCopy: presetRead.trust === 'system' || includeUserPromptCopy,
@@ -667,7 +684,7 @@ assertPublicSnapshot(snapshot);
 const privatePresetMapping = privatePresetMappingOf({
   presetMappingId,
   snapshot,
-  presets: presetList.presets,
+  presets: publicPresets,
   presetRefMap,
 });
 assertPresetMappingInvariant(privatePresetMapping, snapshot);
